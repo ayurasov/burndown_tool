@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Диаграммы сгорания (burndown)</title>
+<link rel="icon" type="image/svg+xml" href="/static/img/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600,700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="login-page">
+  <button class="theme-toggle-login" id="themeToggle" aria-label="Переключить тему"></button>
+  <div class="login-card">
+    <div class="login-brand">
+      <svg viewBox="0 0 32 32" fill="none" aria-label="Логотип">
+        <rect x="4" y="18" width="5" height="10" rx="1" fill="currentColor" opacity="0.5"/>
+        <rect x="13.5" y="10" width="5" height="18" rx="1" fill="currentColor" opacity="0.75"/>
+        <rect x="23" y="4" width="5" height="24" rx="1" fill="currentColor"/>
+      </svg>
+      <div>
+        <div class="login-brand-title">Burndown</div>
+        <div class="login-brand-sub">Трекер сгорания работ</div>
+      </div>
+    </div>
+    <form class="login-form" id="loginForm" autocomplete="off">
+      <div class="login-field">
+        <label for="username">Логин</label>
+        <input type="text" id="username" name="username" autocomplete="off" required>
+      </div>
+      <div class="login-field">
+        <label for="password">Пароль</label>
+        <input type="password" id="password" name="password" autocomplete="new-password" required>
+      </div>
+      <div class="login-error" id="loginError"></div>
+      <button type="submit" class="btn btn-primary login-btn">Войти</button>
+    </form>
+  </div>
+</div>
+<script>
+(function(){
+  var root = document.documentElement;
+  var stored = localStorage.getItem('burndown-theme');
+  var themeMode = stored || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  root.setAttribute('data-theme', themeMode);
+  var tt = document.getElementById('themeToggle');
+  function setIcon(m){
+    tt.innerHTML = m === 'dark'
+      ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>'
+      : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+  }
+  setIcon(themeMode);
+  tt.addEventListener('click', function(){
+    themeMode = themeMode === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', themeMode);
+    localStorage.setItem('burndown-theme', themeMode);
+    setIcon(themeMode);
+  });
+
+  var form = document.getElementById('loginForm');
+  var errEl = document.getElementById('loginError');
+  form.addEventListener('submit', function(e){
+    e.preventDefault();
+    errEl.textContent = '';
+    var username = document.getElementById('username').value.trim();
+    var password = document.getElementById('password').value;
+    if(!username || !password){ errEl.textContent = 'Введите логин и пароль'; return; }
+    var btn = form.querySelector('.login-btn');
+    btn.disabled = true;
+    btn.textContent = 'Вход...';
+    fetch('/api/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: username, password: password})
+    }).then(function(r){ return r.json(); }).then(function(data){
+      if(data.success){ window.location.href = '/'; }
+      else { errEl.textContent = data.error || 'Ошибка входа'; btn.disabled = false; btn.textContent = 'Войти'; }
+    }).catch(function(){
+      errEl.textContent = 'Ошибка соединения с сервером'; btn.disabled = false; btn.textContent = 'Войти';
+    });
+  });
+})();
+</script>
+</body>
+</html>
