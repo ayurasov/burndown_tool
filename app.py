@@ -9,6 +9,7 @@
 """
 
 import os
+import re
 import sqlite3
 import json
 from functools import wraps
@@ -23,6 +24,25 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.secret_key = os.environ.get('SECRET_KEY', 'burndown-secret-key-change-in-production')
 DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'burndown.db'))
+
+
+def migrate_db():
+    """Дополняет таблицу services полями is_done и stage_group для старых баз."""
+    if not os.path.exists(DB_PATH):
+        return
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cols = [r[1] for r in conn.execute('PRAGMA table_info(services)')]
+        if 'is_done' not in cols:
+            conn.execute('ALTER TABLE services ADD COLUMN is_done INTEGER DEFAULT 0')
+        if 'stage_group' not in cols:
+            conn.execute('ALTER TABLE services ADD COLUMN stage_group TEXT')
+        conn.commit()
+    finally:
+        conn.close()
+
+
+migrate_db()
 
 
 # ─── Database helpers ───────────────────────────────────────────
@@ -40,6 +60,19 @@ def close_db(error):
     db = g.pop('db', None)
     if db is not None:
         db.close()
+
+
+def stage_key(s):
+    """Ключ группировки для «Свода по этапам»: явная группа эпика или этап без подсетапа."""
+    try:
+        sg = (s['stage_group'] or '').strip()
+    except (KeyError, IndexError):
+        sg = ''
+    if sg:
+        return sg
+    etap = s['etap'] or ''
+    m = re.match(r'^(Этап\s+\d+)(\.\d+)?$', etap, re.IGNORECASE)
+    return m.group(1) if m else etap
 
 
 def row_to_dict(row):
@@ -308,7 +341,8 @@ def api_get_project_data(pid):
         svc_list.append({
             'id': s['id'], 'project_id': s['project_id'],
             'etap': s['etap'], 'name': s['name'],
-            'targetDate': s['target_date'], 'sortOrder': s['sort_order'] if s['sort_order'] is not None else 0
+            'targetDate': s['target_date'], 'sortOrder': s['sort_order'] if s['sort_order'] is not None else 0,
+            'isDone': bool(s['is_done']), 'stageGroup': s['stage_group'] or ''
         })
     ent_list = []
     for e in entries:
@@ -344,8 +378,9 @@ def api_create_service(pid):
     db = get_db()
     max_order = db.execute('SELECT COALESCE(MAX(sort_order), 0) FROM services WHERE project_id = ?', (pid,)).fetchone()[0]
     cur = db.execute(
-        'INSERT INTO services (project_id, etap, name, target_date, sort_order) VALUES (?, ?, ?, ?, ?)',
-        (pid, data.get('etap', ''), data.get('name', ''), data.get('targetDate', ''), max_order + 1)
+        'INSERT INTO services (project_id, etap, name, target_date, sort_order, is_done, stage_group) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        (pid, data.get('etap', ''), data.get('name', ''), data.get('targetDate', ''), max_order + 1,
+         1 if data.get('isDone') else 0, data.get('stageGroup', ''))
     )
     db.commit()
     return jsonify({'id': cur.lastrowid})
@@ -361,6 +396,8 @@ def api_update_service(sid):
     if not can_edit_project(session['user_id'], svc['project_id']):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     data = request.get_json() or {}
+    is_done = 1 if data.get('isDone', bool(svc['is_done'])) else 0
+    stage_group = data.get('stageGroup', svc['stage_group'])
     changes = []
     if data.get('etap', svc['etap']) != svc['etap']:
         changes.append({'field': 'etap', 'old': svc['etap'], 'new': data.get('etap')})
@@ -368,10 +405,14 @@ def api_update_service(sid):
         changes.append({'field': 'name', 'old': svc['name'], 'new': data.get('name')})
     if data.get('targetDate', svc['target_date']) != svc['target_date']:
         changes.append({'field': 'targetDate', 'old': svc['target_date'], 'new': data.get('targetDate')})
+    if is_done != (1 if svc['is_done'] else 0):
+        changes.append({'field': 'isDone', 'old': bool(svc['is_done']), 'new': bool(is_done)})
+    if stage_group != svc['stage_group']:
+        changes.append({'field': 'stageGroup', 'old': svc['stage_group'], 'new': stage_group})
     db.execute(
-        'UPDATE services SET etap = ?, name = ?, target_date = ? WHERE id = ?',
+        'UPDATE services SET etap = ?, name = ?, target_date = ?, is_done = ?, stage_group = ? WHERE id = ?',
         (data.get('etap', svc['etap']), data.get('name', svc['name']),
-         data.get('targetDate', svc['target_date']), sid)
+         data.get('targetDate', svc['target_date']), is_done, stage_group, sid)
     )
     db.commit()
     if changes:
@@ -761,7 +802,8 @@ def api_export_project(pid):
         svc_list.append({
             'id': s['id'], 'project_id': s['project_id'],
             'etap': s['etap'], 'name': s['name'],
-            'targetDate': s['target_date'], 'sortOrder': s['sort_order'] if s['sort_order'] is not None else 0
+            'targetDate': s['target_date'], 'sortOrder': s['sort_order'] if s['sort_order'] is not None else 0,
+            'isDone': bool(s['is_done']), 'stageGroup': s['stage_group'] or ''
         })
     ent_list = []
     for e in entries:
@@ -778,13 +820,17 @@ def api_export_project(pid):
             'burnrateMethod': settings['burnrate_method'],
             'burnrateWindowDays': settings['burnrate_window_days'],
         }
-    return jsonify({
+    payload = json.dumps({
         'project': {'name': project['name'], 'description': project['description']},
         'services': svc_list,
         'entries': ent_list,
         'stageTargets': {r['stage_name']: r['target_date'] for r in stage_targets},
         'settings': settings_dict,
-    })
+    }, ensure_ascii=False, indent=2)
+    filename = f"Burndown_export_{datetime.now().strftime('%Y-%m-%d_%H%M')}.json"
+    from urllib.parse import quote
+    return Response(payload, mimetype='application/json',
+                    headers={'Content-Disposition': f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename)}"})
 
 
 # ─── API: Audit log (admin only) ─────────────────────────────────
@@ -897,7 +943,7 @@ def api_export_pdf(pid):
     # Build stage groups
     stage_groups = {}
     for s in services:
-        stage_groups.setdefault(s['etap'], []).append(s)
+        stage_groups.setdefault(stage_key(s), []).append(s)
 
     if page_type == 'dashboard':
         # KPIs
@@ -1006,7 +1052,7 @@ def api_export_pdf(pid):
     # Build stage groups
     stage_groups_pdf = {}
     for s in services:
-        stage_groups_pdf.setdefault(s['etap'], []).append(s)
+        stage_groups_pdf.setdefault(stage_key(s), []).append(s)
 
     if page_type == 'dashboard':
         # KPIs

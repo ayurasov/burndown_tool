@@ -86,6 +86,16 @@
 
     <!-- DASHBOARD -->
     <section class="view active" id="view-dashboard">
+      <div class="panel quick-filter">
+        <div class="quick-filter-row">
+          <label class="quick-filter-item" title="Сданные эпики не будут учитываться в списках, графиках и расчётах дашборда"><input type="checkbox" id="dashHideDone"> Скрыть сданные</label>
+          <span class="quick-filter-sep"></span>
+          <span class="small" style="text-transform:uppercase;letter-spacing:0.03em;">Эпики на дашборде:</span>
+          <div class="epic-checks" id="dashEpicChecks"></div>
+          <button class="btn btn-ghost btn-sm" id="dashEpicAll">Все</button>
+          <button class="btn btn-ghost btn-sm" id="dashEpicNone">Снять все</button>
+        </div>
+      </div>
       <div class="kpi-grid" id="kpiGrid"></div>
       <div class="panel">
         <div class="panel-head">
@@ -163,6 +173,11 @@
 
     <!-- STAGES -->
     <section class="view" id="view-stages">
+      <div class="panel quick-filter">
+        <div class="quick-filter-row">
+          <label class="quick-filter-item" title="По умолчанию сданные эпики не учитываются в своде по этапам"><input type="checkbox" id="stageShowDone"> Показывать сданные эпики в своде</label>
+        </div>
+      </div>
       <div class="kpi-grid" id="stageKpiGrid"></div>
       <div id="stageChartsContainer"></div>
       <div class="panel">

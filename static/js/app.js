@@ -15,6 +15,9 @@ var stageBurnRangeOverride = null;
 var selectedAdminUser = null;
 var TODAY = new Date().toISOString().slice(0,10);
 
+var dashboardFilter = { hideDone:false, epics:null }; /* epics: {id:bool} выбор эпиков для дашборда; null = видны все */
+var stageShowDone = false; /* показывать сданные эпики в своде по этапам */
+
 var DEFAULT_SETTINGS = { forecastMethod:'linear', riskBufferDays:3, burnrateMethod:'all', burnrateWindowDays:14 };
 var charts = {};
 
@@ -199,33 +202,49 @@ document.getElementById('btnLogout').addEventListener('click', function(){
    Data helpers (adapted from original)
 ════════════════════════════════════════════════════════════════ */
 function serviceById(id){ return STATE.services.find(function(s){ return s.id === id; }); }
+function isSvcDone(s){ return !!(s && s.isDone); }
+function visibleDashboardServices(){
+  /* Эпики, видимые на дашборде: с учётом «Скрыть сданные» и галочек выбора эпиков */
+  return STATE.services.filter(function(s){
+    if(dashboardFilter.hideDone && isSvcDone(s)) return false;
+    if(dashboardFilter.epics && dashboardFilter.epics[s.id] === false) return false;
+    return true;
+  });
+}
+function stageScopeServices(){
+  /* Сданные эпики не считаются в рамках этапа, пока не включён показ сданных */
+  return STATE.services.filter(function(s){ return stageShowDone || !isSvcDone(s); });
+}
 function entriesForService(id){
   return STATE.entries.filter(function(e){ return e.service_id === id; }).slice().sort(function(a,b){
     return a.date < b.date ? -1 : a.date > b.date ? 1 : 0;
   });
 }
 
+function stageKeyOf(s){
+  /* Ключ группы в «Своде по этапам»: явная группа эпика, иначе этап без подсетапа */
+  var sg = (s.stageGroup || '').trim();
+  if(sg) return sg;
+  var etap = s.etap || '';
+  var match = etap.match(/^(Этап\s+\d+)(\.\d+)?$/i);
+  return match ? match[1] : etap;
+}
+
 function computeStageGroups(){
+  /* groups[имя группы] = [id эпиков]; сданные эпики не считаются, пока не включён их показ */
   var groups = {};
-  STATE.services.forEach(function(s){
-    var etap = s.etap || '';
-    var match = etap.match(/^(Этап\s+\d+)(\.\d+)?$/i);
-    if(match){
-      var g = match[1];
-      if(!groups[g]) groups[g] = [];
-      if(groups[g].indexOf(etap) === -1) groups[g].push(etap);
-    } else {
-      if(!groups[etap]) groups[etap] = [];
-      if(groups[etap].indexOf(etap) === -1) groups[etap].push(etap);
-    }
+  stageScopeServices().forEach(function(s){
+    var key = stageKeyOf(s);
+    if(!groups[key]) groups[key] = [];
+    if(groups[key].indexOf(s.id) === -1) groups[key].push(s.id);
   });
   return groups;
 }
 
 function servicesInStage(stageName, stageGroups){
   var sg = stageGroups || computeStageGroups();
-  var etaps = sg[stageName] || [stageName];
-  return STATE.services.filter(function(s){ return etaps.includes(s.etap); });
+  var ids = sg[stageName] || [];
+  return STATE.services.filter(function(s){ return ids.indexOf(s.id) !== -1; });
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -566,7 +585,7 @@ function renderEpicEstimateChart(){
 
 function renderAllEpicsCharts(){
   destroyChart('allRemaining');
-  var ids = STATE.services.map(function(s){ return s.id; });
+  var ids = visibleDashboardServices().map(function(s){ return s.id; });
   var datasets = buildDatasetsForMetric('remaining', ids);
   renderLegend('legendRemainingAll', datasets);
   charts.allRemaining = new Chart(document.getElementById('chartRemainingAll'), {type:'line', data:{datasets:datasets}, options: baseChartOptions('Часы (Ост.время)')});
@@ -597,13 +616,14 @@ function refreshCharts(){
 ════════════════════════════════════════════════════════════════ */
 function renderKpis(){
   var grid = document.getElementById('kpiGrid');
-  var total = STATE.services.length;
+  var vis = visibleDashboardServices();
+  var total = vis.length;
   var okCount=0, riskCount=0, dangerCount=0;
-  STATE.services.forEach(function(s){
+  vis.forEach(function(s){
     var st = computeServiceStatus(s.id).status;
     if(st==='ok') okCount++; else if(st==='risk') riskCount++; else if(st==='danger') dangerCount++;
   });
-  var totalRemaining = STATE.services.reduce(function(sum,s){
+  var totalRemaining = vis.reduce(function(sum,s){
     var stat = computeServiceStatus(s.id);
     return sum + (stat.lastRemaining || 0);
   }, 0);
@@ -628,7 +648,7 @@ function renderSummaryTable(){
     '</tr></thead><tbody>';
   var totalRemaining = 0, totalBurnRate = 0, hasRemaining=false, hasBurn=false;
   var _rows = [];
-  STATE.services.forEach(function(s){
+  visibleDashboardServices().forEach(function(s){
     var stat = computeServiceStatus(s.id);
     _rows.push({etap:s.etap, name:s.name, remaining:stat.lastRemaining, burnRate:stat.burnRate, targetDate:s.targetDate||'', forecastZero:stat.forecastZeroDate||'', status:stat.status});
     if(stat.lastRemaining !== null && stat.lastRemaining !== undefined){ totalRemaining += stat.lastRemaining; hasRemaining = true; }
@@ -670,7 +690,8 @@ function renderBurnRateTable(){
   }
   var html = '<thead><tr><th>Бизнес-процесс</th>' + dates.map(function(d){ return '<th class="mono">'+d.slice(5).split('-').reverse().join('.')+'</th>'; }).join('') + '</tr></thead><tbody>';
   var perServiceRates = {};
-  STATE.services.forEach(function(s){
+  var visServices = visibleDashboardServices();
+  visServices.forEach(function(s){
     var rows = entriesForService(s.id);
     var byDate = {};
     rows.forEach(function(r){ byDate[r.date] = r.remaining; });
@@ -692,7 +713,7 @@ function renderBurnRateTable(){
   });
   var totalRates = dates.map(function(d,i){
     var sum = 0, has = false;
-    STATE.services.forEach(function(s){ var r = perServiceRates[s.id][i]; if(r !== null && r !== undefined){ sum += r; has = true; } });
+    visServices.forEach(function(s){ var r = perServiceRates[s.id][i]; if(r !== null && r !== undefined){ sum += r; has = true; } });
     return has ? sum : null;
   });
   html += '<tr class="total-row"><td><b>Итого по проекту</b></td>' + totalRates.map(function(r){ return '<td class="mono"><b>'+(r===null?'—':fmtNum(r))+'</b></td>'; }).join('') + '</tr>';
@@ -845,9 +866,9 @@ function buildStagePanelsSkeleton(){
   var stageGroups = computeStageGroups();
   var stageNames = Object.keys(stageGroups);
   if(!stageNames.length){ container.innerHTML = ''; return; }
-  container.innerHTML = stageNames.map(function(name){
-    var safeId = name.replace(/[^a-zA-Z0-9]/g,'');
-    return '<div class="panel" style="margin-bottom:var(--space-6);"><div class="panel-head"><div><div class="panel-title">'+escapeHtml(name)+'</div><div class="section-note">Сумма остатка по эпикам этапа. При наведении на фактические значения показываются отклонения от средней динамики и прогноза.</div></div><div class="panel-controls"><label class="small" for="stageTarget_'+safeId+'">Цель:</label><input type="date" id="stageTarget_'+safeId+'" data-stage="'+escapeHtml(name)+'"></div></div><div class="legend-row" id="legendStage_'+safeId+'"></div><div class="chart-wrap"><canvas id="chartStage_'+safeId+'"></canvas></div></div>';
+  container.innerHTML = stageNames.map(function(name, idx){
+    var safeId = 'st'+idx;
+    return '<div class="panel" style="margin-bottom:var(--space-6);"><div class="panel-head"><div><div class="panel-title">'+escapeHtml(name)+'</div><div class="section-note">Сумма остатка по эпикам этапа. Вертикальные пунктирные линии — целевые даты эпиков. При наведении на фактические значения показываются отклонения от средней динамики и прогноза.</div></div><div class="panel-controls"><label class="small" for="stageTarget_'+safeId+'">Цель:</label><input type="date" id="stageTarget_'+safeId+'" data-stage="'+escapeHtml(name)+'"></div></div><div class="legend-row" id="legendStage_'+safeId+'"></div><div class="chart-wrap"><canvas id="chartStage_'+safeId+'"></canvas></div></div>';
   }).join('');
 
   container.querySelectorAll('input[type=date][data-stage]').forEach(function(inp){
@@ -869,8 +890,8 @@ function buildStagePanelsSkeleton(){
 function renderStageCharts(){
   destroyChartsByPrefix('stage_');
   var stageGroups = computeStageGroups();
-  Object.keys(stageGroups).forEach(function(name){
-    var safeId = name.replace(/[^a-zA-Z0-9]/g,'');
+  Object.keys(stageGroups).forEach(function(name, idx){
+    var safeId = 'st'+idx;
     var canvas = document.getElementById('chartStage_'+safeId);
     if(!canvas) return;
     var stat = computeStageStatus(name, stageGroups);
@@ -897,6 +918,21 @@ function renderStageCharts(){
       if(tl) datasets.push(tl);
     }
 
+    /* Целевые даты эпиков этапа — вертикальные отметки на графике */
+    var yMax = 0;
+    agg.remaining.forEach(function(v){ if(v !== null && v !== undefined && v > yMax) yMax = v; });
+    if(yMax > 0){
+      servicesInStage(name, stageGroups).forEach(function(svc, idx){
+        if(!svc.targetDate) return;
+        datasets.push({
+          label: 'Цель эпика: ' + svc.name,
+          data: [{x: svc.targetDate, y: 0}, {x: svc.targetDate, y: yMax}],
+          borderColor: palette[(idx + 3) % palette.length],
+          borderDash: [2, 4], pointRadius: 0, borderWidth: 1.5, tension: 0
+        });
+      });
+    }
+
     renderLegend('legendStage_'+safeId, datasets);
     var tooltipCtx = { avgPts: avgPts, forecastPts: fcData };
     charts['stage_'+safeId] = new Chart(canvas, {type:'line', data:{datasets:datasets}, options: baseChartOptions('Часы (суммарный остаток)', tooltipCtx)});
@@ -909,11 +945,12 @@ function renderStageCharts(){
 function populateServiceSelects(){
   var chartSel = document.getElementById('chartServiceSelect');
   var dataSel = document.getElementById('dataServiceSelect');
-  var optsHtml = STATE.services.map(function(s){ return '<option value="'+s.id+'">'+escapeHtml(s.etap)+' — '+escapeHtml(s.name)+'</option>'; }).join('');
-  if(chartSel) chartSel.innerHTML = optsHtml;
-  if(dataSel) dataSel.innerHTML = optsHtml;
+  var chartOpts = visibleDashboardServices().map(function(s){ return '<option value="'+s.id+'">'+escapeHtml(s.etap)+' — '+escapeHtml(s.name)+(s.isDone?' (сдано)':'')+'</option>'; }).join('');
+  var dataOpts = STATE.services.map(function(s){ return '<option value="'+s.id+'">'+escapeHtml(s.etap)+' — '+escapeHtml(s.name)+(s.isDone?' (сдано)':'')+'</option>'; }).join('');
+  if(chartSel) chartSel.innerHTML = chartOpts;
+  if(dataSel) dataSel.innerHTML = dataOpts;
   document.getElementById('navServiceCount').textContent = STATE.services.length;
-  if(chartSel && !chartSel.value && STATE.services.length) chartSel.value = STATE.services[0].id;
+  if(chartSel && !chartSel.value && visibleDashboardServices().length) chartSel.value = visibleDashboardServices()[0].id;
   if(dataSel && currentDataServiceId) dataSel.value = currentDataServiceId;
 }
 
@@ -1007,10 +1044,10 @@ function renderDataView(){
 ════════════════════════════════════════════════════════════════ */
 function renderServicesView(){
   var table = document.getElementById('servicesTable');
-  var html = '<colgroup><col class="col-drag"><col class="col-etap"><col class="col-name"><col class="col-target"><col class="col-count"><col class="col-actions"></colgroup><thead><tr><th></th><th class="sortable" data-sort="etap">Этап ↕</th><th class="sortable" data-sort="name">Название бизнес-процесса ↕</th><th class="sortable" data-sort="targetDate">Целевая дата ↕</th><th class="sortable" data-sort="count">Замеров ↕</th><th></th></tr></thead><tbody>';
+  var html = '<colgroup><col class="col-drag"><col class="col-etap"><col class="col-name"><col class="col-target"><col class="col-done"><col class="col-group"><col class="col-count"><col class="col-actions"></colgroup><thead><tr><th></th><th class="sortable" data-sort="etap">Этап ↕</th><th class="sortable" data-sort="name">Название бизнес-процесса ↕</th><th class="sortable" data-sort="targetDate">Целевая дата ↕</th><th title="Сданный функционал не учитывается в рамках этапа">Сдано</th><th class="sortable" data-sort="stageGroup" title="Группа для «Свода по этапам»; пусто — группировка по этапу">Группа в своде</th><th class="sortable" data-sort="count">Замеров ↕</th><th></th></tr></thead><tbody>';
   var services = getSortedServices();
   services.forEach(function(s){
-    html += '<tr data-id="'+s.id+'" draggable="true"><td class="drag-handle" title="Перетащите для изменения порядка">⠿</td><td><input type="text" value="'+escapeAttr(s.etap)+'" data-field="etap"></td><td><input type="text" value="'+escapeAttr(s.name)+'" data-field="name"></td><td><input type="date" value="'+(s.targetDate||'')+'" data-field="targetDate"></td><td class="mono">'+entriesForService(s.id).length+'</td><td class="row-actions"><button class="icon-btn" data-action="delete" title="Удалить"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0l-1 14a2 2 0 01-2 2H7a2 2 0 01-2-2L4 6h16z"/></svg></button></td></tr>';
+    html += '<tr data-id="'+s.id+'" draggable="true"'+(s.isDone?' class="done-row"':'')+'><td class="drag-handle" title="Перетащите для изменения порядка">⠿</td><td><input type="text" value="'+escapeAttr(s.etap)+'" data-field="etap"></td><td class="col-name-cell"><input type="text" value="'+escapeAttr(s.name)+'" data-field="name"></td><td><input type="date" value="'+(s.targetDate||'')+'" data-field="targetDate"></td><td style="text-align:center;"><input type="checkbox" data-field="isDone" title="Функционал сдан"'+(s.isDone?' checked':'')+'></td><td><input type="text" value="'+escapeAttr(s.stageGroup||'')+'" placeholder="по этапу" data-field="stageGroup" title="Группа для «Свода по этапам»; пусто — группировка по этапу"></td><td class="mono">'+entriesForService(s.id).length+'</td><td class="row-actions"><button class="icon-btn" data-action="delete" title="Удалить"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0l-1 14a2 2 0 01-2 2H7a2 2 0 01-2-2L4 6h16z"/></svg></button></td></tr>';
   });
   html += '</tbody>';
   table.innerHTML = html;
@@ -1046,11 +1083,19 @@ function renderServicesView(){
       var id = parseInt(tr.dataset.id, 10);
       var svc = serviceById(id);
       if(!svc) return;
-      svc[inp.dataset.field] = inp.value;
-      apiPut('/api/services/'+id, {etap:svc.etap, name:svc.name, targetDate:svc.targetDate}).then(function(){
+      if(inp.type === 'checkbox'){
+        svc.isDone = inp.checked;
+      } else if(inp.dataset.field === 'stageGroup'){
+        svc.stageGroup = inp.value;
+      } else {
+        svc[inp.dataset.field] = inp.value;
+      }
+      apiPut('/api/services/'+id, {etap:svc.etap, name:svc.name, targetDate:svc.targetDate, isDone:svc.isDone, stageGroup:svc.stageGroup}).then(function(){
         toast('Сохранено');
       });
+      if(inp.type === 'checkbox') renderServicesView();
       populateServiceSelects();
+      renderDashboardFilterBar();
     });
   });
   table.querySelectorAll('[data-action="delete"]').forEach(function(btn){
@@ -1374,6 +1419,10 @@ function applyReadonlyToView(viewId){
   view.querySelectorAll('input[type=text], input[type=number]').forEach(function(el){
     el.setAttribute('readonly', true);
   });
+  view.querySelectorAll('input[type=checkbox]').forEach(function(el){
+    if(el.closest('.quick-filter')) return; /* фильтры доступны и в режиме просмотра */
+    el.setAttribute('disabled', true);
+  });
   view.querySelectorAll('input[type=date]').forEach(function(el){
     if(el.id !== 'burnFrom' && el.id !== 'burnTo'){
       el.setAttribute('disabled', true);
@@ -1463,6 +1512,7 @@ function renderStagesView(){
 }
 
 function renderDashboard(){
+  renderDashboardFilterBar();
   populateServiceSelects();
   updateEpicTargetInput();
   renderKpis();
@@ -1472,6 +1522,43 @@ function renderDashboard(){
   renderBurnRateTable();
   applyReadonlyToView('view-dashboard');
 }
+
+/* ── Быстрые фильтры дашборда и свода ────────────────────────── */
+function renderDashboardFilterBar(){
+  var box = document.getElementById('dashEpicChecks');
+  if(!box) return;
+  document.getElementById('dashHideDone').checked = dashboardFilter.hideDone;
+  box.innerHTML = STATE.services.map(function(s){
+    var checked = !(dashboardFilter.epics && dashboardFilter.epics[s.id] === false);
+    return '<label class="epic-check'+(s.isDone?' done':'')+'" title="'+escapeAttr(s.etap+' — '+s.name)+'"><input type="checkbox" data-sid="'+s.id+'"'+(checked?' checked':'')+'>'+escapeHtml(s.name)+'</label>';
+  }).join('');
+  box.querySelectorAll('input[type=checkbox]').forEach(function(inp){
+    inp.addEventListener('change', function(){
+      var sid = parseInt(inp.dataset.sid, 10);
+      if(!dashboardFilter.epics) dashboardFilter.epics = {};
+      dashboardFilter.epics[sid] = inp.checked;
+      renderDashboard();
+    });
+  });
+}
+
+document.getElementById('dashHideDone').addEventListener('change', function(e){
+  dashboardFilter.hideDone = e.target.checked;
+  renderDashboard();
+});
+document.getElementById('dashEpicAll').addEventListener('click', function(){
+  dashboardFilter.epics = null;
+  renderDashboard();
+});
+document.getElementById('dashEpicNone').addEventListener('click', function(){
+  dashboardFilter.epics = {};
+  STATE.services.forEach(function(s){ dashboardFilter.epics[s.id] = false; });
+  renderDashboard();
+});
+document.getElementById('stageShowDone').addEventListener('change', function(e){
+  stageShowDone = e.target.checked;
+  renderStagesView();
+});
 
 /* ════════════════════════════════════════════════════════════════
    Event handlers (epic select, target date, add row/service, etc)
@@ -1522,7 +1609,7 @@ document.getElementById('btnAddRow').addEventListener('click', function(){
 document.getElementById('btnAddService').addEventListener('click', function(){
   if(!canEdit()){ toast('Нет прав на редактирование'); return; }
   apiPost('/api/projects/'+currentProjectId+'/services', {etap:'Этап 5', name:'Новый эпик', targetDate:TODAY}).then(function(data){
-    STATE.services.push({id:data.id, project_id:currentProjectId, etap:'Этап 5', name:'Новый бизнес-процесс', targetDate:TODAY, sortOrder:STATE.services.length+1});
+    STATE.services.push({id:data.id, project_id:currentProjectId, etap:'Этап 5', name:'Новый бизнес-процесс', targetDate:TODAY, isDone:false, stageGroup:'', sortOrder:STATE.services.length+1});
     renderServicesView();
     populateServiceSelects();
     toast('Эпик добавлен');
@@ -1559,7 +1646,13 @@ document.getElementById('stageBurnTo').addEventListener('change', function(){
 });
 
 document.getElementById('btnExport').addEventListener('click', function(){
-  window.open('/api/projects/'+currentProjectId+'/export', '_blank');
+  var a = document.createElement('a');
+  a.href = '/api/projects/'+currentProjectId+'/export';
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  toast('Экспорт JSON скачивается');
 });
 
 /* Profile - opens on userInfo click */
@@ -1778,6 +1871,10 @@ function switchProject(pid){
   currentProjectRole = proj ? proj.role : null;
   currentDataServiceId = null;
   burnRangeOverride = null;
+  dashboardFilter = { hideDone: dashboardFilter.hideDone, epics: null };
+  stageShowDone = false;
+  var stCb = document.getElementById('stageShowDone');
+  if(stCb) stCb.checked = false;
   document.getElementById('burnFrom').value = '';
   document.getElementById('burnTo').value = '';
   loadProjectData(pid);

@@ -68,6 +68,8 @@ def init_db():
             etap TEXT,
             name TEXT,
             target_date TEXT,
+            is_done INTEGER DEFAULT 0,
+            stage_group TEXT,
             sort_order INTEGER DEFAULT 0,
             FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
         )
