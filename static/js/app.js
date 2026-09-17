@@ -410,6 +410,11 @@ function baseChartOptions(yTitle, extraTooltipCtx){
     plugins:{
       legend:{display:false},
       tooltip:{
+        filter: function(item){
+          /* для линий целей эпиков — только одна точка, без верхних/нижних значений */
+          if(item.dataset && item.dataset.isEpicTarget) return item.dataIndex === 0;
+          return true;
+        },
         callbacks:{
           title: function(items){
             if(!items.length) return '';
@@ -418,6 +423,10 @@ function baseChartOptions(yTitle, extraTooltipCtx){
           },
           label: function(ctx){
             var ds = ctx.dataset;
+            /* линии целей эпиков: короткий текст с датой необходимого завершения */
+            if(ds.isEpicTarget){
+              return (ds.epicName || '') + ': завершение ' + fmtDate(ds.targetDate);
+            }
             var val = ctx.parsed.y;
             var lines = [(ds.label || '') + ': ' + fmtNum(val) + ' ч'];
             /* For actual datasets, add deviation info using interpolation at this point's date */
@@ -887,6 +896,38 @@ function buildStagePanelsSkeleton(){
   applyReadonlyToView('view-stages');
 }
 
+/* Подписи дат завершения эпиков у вертикальных линий целей — видны без наведения */
+var epicTargetLabelPlugin = {
+  id: 'epicTargetLabels',
+  afterDatasetsDraw: function(chart){
+    var ctx = chart.ctx;
+    var area = chart.chartArea;
+    if(!area) return;
+    ctx.save();
+    ctx.font = '600 10px "General Sans", Arial, sans-serif';
+    ctx.textBaseline = 'top';
+    var rows = []; /* занятые диапазоны подписей по строкам, чтобы не наползали */
+    chart.data.datasets.forEach(function(ds){
+      if(!ds.isEpicTarget || !ds.data || !ds.data.length) return;
+      var text = fmtDate(ds.targetDate) + ' — ' + (ds.epicName || '');
+      if(text.length > 36) text = text.slice(0, 35) + '…';
+      var w = ctx.measureText(text).width;
+      var x = chart.scales.x.getPixelForValue(ds.targetDate);
+      var tx = x + 5;
+      if(tx + w > area.right - 2) tx = x - w - 5;
+      var y = area.top + 4;
+      for(var r = 0; r < 6; r++){
+        var rowY = area.top + 4 + r * 13;
+        var overlap = rows.some(function(row){ return row.r === r && tx < row.x2 && tx + w > row.x1; });
+        if(!overlap){ y = rowY; rows.push({r:r, x1:tx, x2:tx+w}); break; }
+      }
+      ctx.fillStyle = ds.borderColor;
+      ctx.fillText(text, tx, y);
+    });
+    ctx.restore();
+  }
+};
+
 function renderStageCharts(){
   destroyChartsByPrefix('stage_');
   var stageGroups = computeStageGroups();
@@ -928,14 +969,15 @@ function renderStageCharts(){
           label: 'Цель эпика: ' + svc.name,
           data: [{x: svc.targetDate, y: 0}, {x: svc.targetDate, y: yMax}],
           borderColor: palette[(idx + 3) % palette.length],
-          borderDash: [2, 4], pointRadius: 0, borderWidth: 1.5, tension: 0
+          borderDash: [2, 4], pointRadius: 0, pointHoverRadius: 0, borderWidth: 1.5, tension: 0,
+          isEpicTarget: true, epicName: svc.name, targetDate: svc.targetDate
         });
       });
     }
 
     renderLegend('legendStage_'+safeId, datasets);
     var tooltipCtx = { avgPts: avgPts, forecastPts: fcData };
-    charts['stage_'+safeId] = new Chart(canvas, {type:'line', data:{datasets:datasets}, options: baseChartOptions('Часы (суммарный остаток)', tooltipCtx)});
+    charts['stage_'+safeId] = new Chart(canvas, {type:'line', data:{datasets:datasets}, options: baseChartOptions('Часы (суммарный остаток)', tooltipCtx), plugins:[epicTargetLabelPlugin]});
   });
 }
 
