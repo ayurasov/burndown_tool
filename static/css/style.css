@@ -283,3 +283,16 @@ table.services-table{width:100%;table-layout:fixed;min-width:0;}
 .drag-handle:active{cursor:grabbing;}
 tr.dragging{opacity:0.5;background:var(--color-surface-offset);}
 th.sortable:hover{color:var(--color-primary);}
+
+/* ── Quick filters / done epics ─────────────────────────────── */
+.quick-filter{padding:var(--space-3) var(--space-4);}
+.quick-filter-row{display:flex;align-items:center;gap:var(--space-3);flex-wrap:wrap;}
+.quick-filter-item{display:inline-flex;align-items:center;gap:6px;font-size:var(--text-sm);cursor:pointer;white-space:nowrap;color:var(--color-text);}
+.quick-filter-sep{width:1px;height:20px;background:var(--color-divider);}
+.epic-checks{display:flex;flex-wrap:wrap;gap:var(--space-1) var(--space-3);}
+.epic-check{display:inline-flex;align-items:center;gap:5px;font-size:var(--text-xs);color:var(--color-text-muted);cursor:pointer;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis;}
+.epic-check.done{opacity:0.55;text-decoration:line-through;}
+tr.done-row td{opacity:0.6;}
+tr.done-row td.col-name-cell input{text-decoration:line-through;}
+.services-table col.col-done{width:64px;}
+.services-table col.col-group{width:13%;}
