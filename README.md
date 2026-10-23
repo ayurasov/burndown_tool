@@ -192,6 +192,8 @@ burndown-app/
 ├── app.py              # Flask-приложение (API + маршруты)
 ├── init_db.py          # Инициализация БД и начальных данных
 ├── requirements.txt    # Python-зависимости
+├── requirements-dev.txt # Зависимости для тестов
+├── tests/              # Автотесты (pytest + Playwright)
 ├── burndown.db         # База данных SQLite (создаётся при инициализации)
 ├── templates/
 │   ├── login.html      # Страница авторизации
@@ -248,3 +250,21 @@ python app.py
 ```
 
 Приложение будет доступно по адресу `http://localhost:5000`.
+
+## Автотесты
+
+```bash
+pip install -r requirements-dev.txt
+playwright install chromium   # браузер для e2e-тестов (один раз)
+pytest                        # все тесты
+pytest tests/test_api.py tests/test_pdf.py   # только API и PDF, без браузера
+```
+
+- `tests/test_api.py` — API: авторизация, права доступа, CRUD, валидация, реестр изменений.
+- `tests/test_pdf.py` — PDF-выгрузка: итоги, burn rate, фильтры, вспомогательные функции.
+- `tests/test_e2e.py` — интерфейс в браузере (Playwright): расчёты на дашборде и своде, сортировка,
+  режим просмотра, модальные окна, профиль, администрирование, мобильная вёрстка.
+  Нужен доступ к CDN (Chart.js); если браузер или CDN недоступны, тесты пропускаются.
+  Путь к уже установленному Chromium можно задать переменной `CHROMIUM_PATH`.
+
+Тесты используют временную копию демо-базы из `init_db.py` и не затрагивают рабочую `burndown.db`.
