@@ -13,13 +13,17 @@ var currentDataServiceId = null;
 var burnRangeOverride = null;
 var stageBurnRangeOverride = null;
 var selectedAdminUser = null;
-var TODAY = new Date().toISOString().slice(0,10);
+function localIsoDate(d){
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
+var TODAY = localIsoDate(new Date());
 
 var dashboardFilter = { hideDone:false, epics:null }; /* epics: {id:bool} выбор эпиков для дашборда; null = видны все */
 var stageShowDone = false; /* показывать сданные эпики в своде по этапам */
 
 var DEFAULT_SETTINGS = { forecastMethod:'linear', riskBufferDays:3, burnrateMethod:'all', burnrateWindowDays:14 };
 var charts = {};
+var currentView = 'dashboard';
 
 /* ════════════════════════════════════════════════════════════════
    API helpers
@@ -30,10 +34,21 @@ function api(url, opts){
   opts.headers['Content-Type'] = 'application/json';
   return fetch(url, Object.assign({credentials:'same-origin'}, opts)).then(function(r){
     if(r.status === 401){ window.location.href = '/login'; throw new Error('Unauthorized'); }
-    return r.json();
+    return r.json().catch(function(){ return {}; }).then(function(data){
+      if(!r.ok){
+        var msg = (data && data.error) || ('Ошибка сервера (' + r.status + ')');
+        toast(msg);
+        var err = new Error(msg);
+        err.handled = true;
+        throw err;
+      }
+      return data;
+    });
   });
 }
 
+/* Ошибки API уже показаны пользователю в toast — не засоряем консоль */
+window.addEventListener('unhandledrejection', function(e){ if(e.reason && e.reason.handled) e.preventDefault(); });
 function apiPost(url, data){ return api(url, {method:'POST', body:JSON.stringify(data||{})}); }
 function apiPut(url, data){ return api(url, {method:'PUT', body:JSON.stringify(data||{})}); }
 function apiDelete(url){ return api(url, {method:'DELETE'}); }
@@ -55,35 +70,43 @@ var confirmTitle = document.getElementById('confirmTitle');
 var confirmBody = document.getElementById('confirmBody');
 var confirmOk = document.getElementById('confirmOk');
 var confirmCancel = document.getElementById('confirmCancel');
-var currentConfirmHandler = null;
-function askConfirm(title, body, cb, okLabel){
-  confirmTitle.textContent = title;
-  confirmBody.textContent = body;
-  confirmOk.textContent = okLabel || 'Удалить';
-  if(currentConfirmHandler){
-    confirmOk.removeEventListener('click', currentConfirmHandler);
-  }
+var modalOkHandler = null;
+/* Универсальное модальное окно: подтверждение (text) или форма (html).
+   onOk может вернуть false, чтобы окно осталось открытым (ошибка валидации). */
+function openModal(opts){
+  confirmTitle.textContent = opts.title || '';
+  if(opts.html !== undefined) confirmBody.innerHTML = opts.html;
+  else confirmBody.textContent = opts.text || '';
+  confirmOk.textContent = opts.okLabel || 'OK';
+  confirmOk.className = 'btn ' + (opts.danger ? 'btn-danger' : 'btn-primary');
+  confirmModal.classList.toggle('modal-wide', !!opts.wide);
+  modalOkHandler = opts.onOk || null;
   confirmModal.classList.add('show');
-  var handler = function(){
-    confirmModal.classList.remove('show');
-    confirmOk.removeEventListener('click', handler);
-    currentConfirmHandler = null;
-    cb();
-  };
-  currentConfirmHandler = handler;
-  confirmOk.addEventListener('click', handler);
+  var first = confirmBody.querySelector('input:not([type=file]):not([disabled]),select,textarea');
+  (first || confirmOk).focus();
 }
-confirmCancel.addEventListener('click', function(){
+function closeModal(){
   confirmModal.classList.remove('show');
-  if(currentConfirmHandler){
-    confirmOk.removeEventListener('click', currentConfirmHandler);
-    currentConfirmHandler = null;
-  }
+  modalOkHandler = null;
+}
+function askConfirm(title, body, cb, okLabel){
+  openModal({title:title, text:body, okLabel:okLabel || 'Удалить', danger:true, onOk:cb});
+}
+confirmOk.addEventListener('click', function(){
+  var h = modalOkHandler;
+  if(h && h() === false) return;
+  closeModal();
+});
+confirmCancel.addEventListener('click', closeModal);
+confirmModal.addEventListener('mousedown', function(e){ if(e.target === confirmModal) closeModal(); });
+document.addEventListener('keydown', function(e){
+  if(e.key === 'Escape' && confirmModal.classList.contains('show')) closeModal();
 });
 
 function fmtNum(v){
   if(v === null || v === undefined || isNaN(v)) return '—';
-  return (Math.round(v*100)/100).toLocaleString('ru-RU', {maximumFractionDigits:2});
+  var r = Math.round(v*100)/100;
+  return (r === 0 ? 0 : r).toLocaleString('ru-RU', {maximumFractionDigits:2}); /* без «-0» */
 }
 function hoursToStr(v){
   if(v === null || v === undefined || isNaN(v)) return '—';
@@ -100,25 +123,36 @@ function escapeAttr(str){
 
 /* ── Sorting helpers ─────────────────────────────────────────── */
 var tableSortState = {};
+var STATUS_RANK = {danger:0, risk:1, ok:2, unknown:3};
+function compareValues(av, bv, dir){
+  /* Пустые значения — всегда в конце; числа сравниваются как числа */
+  var aEmpty = av === null || av === undefined || av === '';
+  var bEmpty = bv === null || bv === undefined || bv === '';
+  if(aEmpty || bEmpty) return aEmpty === bEmpty ? 0 : (aEmpty ? 1 : -1);
+  var res;
+  if(typeof av === 'number' && typeof bv === 'number') res = av - bv;
+  else res = String(av).localeCompare(String(bv), 'ru', {numeric:true, sensitivity:'base'});
+  return dir === 'desc' ? -res : res;
+}
+function sortValue(row, field){
+  return field === 'status' ? STATUS_RANK[row.status] : row[field];
+}
 function getSortedServices(){
   var list = STATE.services.slice();
   var sort = tableSortState['servicesTable'];
-  if(!sort) { list.sort(function(a,b){ return (a.sortOrder||0)-(b.sortOrder||0); }); return list; }
+  if(!sort){ list.sort(function(a,b){ return (a.sortOrder||0)-(b.sortOrder||0); }); return list; }
   list.sort(function(a,b){
-    var av = a[sort.field], bv = b[sort.field];
-    if(sort.field === 'count'){ av = entriesForService(a.id).length; bv = entriesForService(b.id).length; }
-    if(av == null) av = ''; if(bv == null) bv = '';
-    av = String(av).toLowerCase(); bv = String(bv).toLowerCase();
-    if(av < bv) return sort.dir === 'desc' ? 1 : -1;
-    if(av > bv) return sort.dir === 'desc' ? -1 : 1;
-    return 0;
+    var av = sort.field === 'count' ? entriesForService(a.id).length : a[sort.field];
+    var bv = sort.field === 'count' ? entriesForService(b.id).length : b[sort.field];
+    return compareValues(av, bv, sort.dir);
   });
   return list;
 }
-function initTableSort(table, data, renderFn){
+function initTableSort(table, renderFn){
   var key = table.id;
+  var sort = tableSortState[key];
   table.querySelectorAll('th.sortable').forEach(function(th){
-    th.style.cursor = 'pointer';
+    if(sort && sort.field === th.dataset.sort) th.classList.add(sort.dir === 'desc' ? 'sorted-desc' : 'sorted-asc');
     th.addEventListener('click', function(){
       var field = th.dataset.sort;
       if(tableSortState[key] && tableSortState[key].field === field){
@@ -134,12 +168,7 @@ function applyTableSort(key, rows){
   var sort = tableSortState[key];
   if(!sort) return rows;
   return rows.slice().sort(function(a, b){
-    var av = a[sort.field], bv = b[sort.field];
-    if(av == null) av = ''; if(bv == null) bv = '';
-    av = String(av).toLowerCase(); bv = String(bv).toLowerCase();
-    if(av < bv) return sort.dir === 'desc' ? 1 : -1;
-    if(av > bv) return sort.dir === 'desc' ? -1 : 1;
-    return 0;
+    return compareValues(sortValue(a, sort.field), sortValue(b, sort.field), sort.dir);
   });
 }
 function getCss(varName){
@@ -149,16 +178,24 @@ function colorPalette(){
   return [getCss('--color-primary'), getCss('--color-blue'), getCss('--color-orange'), getCss('--color-error'), getCss('--color-success'), getCss('--color-warning')];
 }
 function daysBetween(d1, d2){
-  return Math.round((new Date(d2) - new Date(d1)) / 86400000);
+  return Math.round((Date.parse(d2 + 'T00:00:00Z') - Date.parse(d1 + 'T00:00:00Z')) / 86400000);
 }
 function addDays(dateStr, days){
-  var d = new Date(dateStr);
-  d.setDate(d.getDate() + days);
+  var d = new Date(dateStr + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0,10);
 }
 function fmtDate(d){
   if(!d) return '—';
   return d.split('-').reverse().join('.');
+}
+function fmtShortDate(d){ return d.slice(5).split('-').reverse().join('.'); }
+function isNum(v){ return v !== null && v !== undefined && !isNaN(v); }
+var ROLE_LABELS = {admin:'Администратор', manager:'Руководитель', user:'Пользователь'};
+var ICON_EDIT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
+var ICON_DELETE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0l-1 14a2 2 0 01-2 2H7a2 2 0 01-2-2L4 6h16z"/></svg>';
+function actionBtn(action, title, icon, extra){
+  return '<button class="icon-btn'+(action === 'delete' ? ' icon-btn-danger' : '')+'" data-action="'+action+'" title="'+title+'" aria-label="'+title+'"'+(extra||'')+'>'+icon+'</button>';
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -181,6 +218,7 @@ themeToggle.addEventListener('click', function(){
   localStorage.setItem('burndown-theme', themeMode);
   setThemeIcon(themeMode);
   refreshCharts();
+  renderProjectsNav();
 });
 
 /* ════════════════════════════════════════════════════════════════
@@ -311,8 +349,10 @@ function computeStatus(dates, remainingVals, targetDate){
   var lastDate = dates[dates.length-1];
   var pts = dates.map(function(d,i){ return {x:daysBetween(baseDate, d), y:remainingVals[i]}; }).filter(function(p){ return p.y !== null && p.y !== undefined; });
   var burnRate = avgBurnRate(dates, remainingVals);
-  var lastRemaining = remainingVals.length ? remainingVals[remainingVals.length-1] : null;
+  /* Последний заполненный замер: пустая строка «+ Новая дата» не обнуляет остаток */
+  var lastRemaining = pts.length ? pts[pts.length-1].y : null;
   var lastX = pts.length ? pts[pts.length-1].x : null;
+  if(lastX !== null) lastDate = addDays(baseDate, lastX);
   var reg = null;
   var method = (STATE.settings && STATE.settings.forecastMethod) || 'linear';
   if(method === 'average'){
@@ -470,10 +510,10 @@ function renderLegend(containerId, datasets){
   }).join('');
 }
 
-function avgLineDataset(dates, burnRate, lastRemaining){
+function avgLineDataset(dates, burnRate, lastRemaining, lastDate){
   if(!dates.length || burnRate === null || burnRate === undefined || lastRemaining === null) return null;
   var baseDate = dates[0];
-  var lastDate = dates[dates.length-1];
+  lastDate = lastDate || dates[dates.length-1];
   var daysSpan = Math.max(1, daysBetween(baseDate, lastDate));
   var startVal = lastRemaining + burnRate * daysSpan;
   return {
@@ -516,7 +556,7 @@ function buildDatasetsForMetric(metric, serviceIds){
     var svc = serviceById(sid);
     var rows = entriesForService(sid);
     var data = rows.map(function(r){ return {x: r.date, y: r[metric]}; });
-    return { label: svc ? svc.name : '', data: data, borderColor: palette[i % palette.length], backgroundColor: palette[i % palette.length]+'22', spanGaps:true, tension:0.25, pointRadius:3, borderWidth:2 };
+    return { label: svc ? svc.name : '', data: data, borderColor: palette[i % palette.length], backgroundColor: palette[i % palette.length]+'22', spanGaps:true, tension:0.25, cubicInterpolationMode:'monotone', pointRadius:3, borderWidth:2 };
   });
 }
 
@@ -543,10 +583,10 @@ function renderEpicRemainingChart(){
   var remVals = rows.map(function(r){ return r.remaining; });
 
   var datasets = [
-    { label: 'Факт: остаток', data: actualData, borderColor: palette[0], backgroundColor: palette[0]+'33', borderWidth: 2.5, pointRadius:4, tension:0.2, fill:false, spanGaps:true, isActual:true }
+    { label: 'Факт: остаток', data: actualData, borderColor: palette[0], backgroundColor: palette[0]+'33', borderWidth: 2.5, pointRadius:4, tension:0.2, cubicInterpolationMode:'monotone', fill:false, spanGaps:true, isActual:true }
   ];
 
-  var avgLine = avgLineDataset(dates, stat.burnRate, stat.lastRemaining);
+  var avgLine = avgLineDataset(dates, stat.burnRate, stat.lastRemaining, stat.lastDate);
   if(avgLine) datasets.push(avgLine);
 
   var fcData = null, avgPts = null;
@@ -555,7 +595,7 @@ function renderEpicRemainingChart(){
     var lastRow = rows[rows.length-1];
     var fc = forecastDataset(stat.reg, stat.baseDate, firstRow.date, lastRow, svc.targetDate);
     if(fc){ datasets.push(fc); fcData = fc.data; }
-    var tl = targetLineDataset(lastRow.date, stat.lastRemaining, svc.targetDate, 'Целевая линия (эпик)');
+    var tl = targetLineDataset(stat.lastDate, stat.lastRemaining, svc.targetDate, 'Целевая линия (эпик)');
     if(tl) datasets.push(tl);
     if(avgLine) avgPts = avgLine.data;
   }
@@ -573,7 +613,7 @@ function renderEpicSpentChart(){
   var rows = svc ? entriesForService(sid) : [];
   var palette = colorPalette();
   var data = rows.map(function(r){ return {x:r.date, y:r.spent}; });
-  var datasets = [{ label: svc ? svc.name : '', data: data, borderColor: palette[1], backgroundColor: palette[1]+'33', spanGaps:true, tension:0.25, pointRadius:3, borderWidth:2 }];
+  var datasets = [{ label: svc ? svc.name : '', data: data, borderColor: palette[1], backgroundColor: palette[1]+'33', spanGaps:true, tension:0.25, cubicInterpolationMode:'monotone', pointRadius:3, borderWidth:2 }];
   renderLegend('legendSpentEpic', datasets);
   var ctx = document.getElementById('chartSpentEpic');
   charts.epicSpent = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions('Часы')});
@@ -586,7 +626,7 @@ function renderEpicEstimateChart(){
   var rows = svc ? entriesForService(sid) : [];
   var palette = colorPalette();
   var data = rows.map(function(r){ return {x:r.date, y:r.estimate}; });
-  var datasets = [{ label: svc ? svc.name : '', data: data, borderColor: palette[2], backgroundColor: palette[2]+'33', spanGaps:true, tension:0.25, pointRadius:3, borderWidth:2 }];
+  var datasets = [{ label: svc ? svc.name : '', data: data, borderColor: palette[2], backgroundColor: palette[2]+'33', spanGaps:true, tension:0.25, cubicInterpolationMode:'monotone', pointRadius:3, borderWidth:2 }];
   renderLegend('legendEstimateEpic', datasets);
   var ctx = document.getElementById('chartEstimateEpic');
   charts.epicEstimate = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions('Часы')});
@@ -623,111 +663,119 @@ function refreshCharts(){
 /* ════════════════════════════════════════════════════════════════
    KPIs & Summary tables
 ════════════════════════════════════════════════════════════════ */
+function kpiCard(label, value, note, color){
+  return '<div class="kpi-card"><div class="kpi-label">'+label+'</div><div class="kpi-value"'+(color?' style="color:var('+color+')"':'')+'>'+value+'</div><div class="kpi-note">'+note+'</div></div>';
+}
+
 function renderKpis(){
-  var grid = document.getElementById('kpiGrid');
   var vis = visibleDashboardServices();
-  var total = vis.length;
-  var okCount=0, riskCount=0, dangerCount=0;
+  var okCount=0, riskCount=0, dangerCount=0, totalRemaining=0;
   vis.forEach(function(s){
-    var st = computeServiceStatus(s.id).status;
-    if(st==='ok') okCount++; else if(st==='risk') riskCount++; else if(st==='danger') dangerCount++;
-  });
-  var totalRemaining = vis.reduce(function(sum,s){
     var stat = computeServiceStatus(s.id);
-    return sum + (stat.lastRemaining || 0);
-  }, 0);
-  grid.innerHTML =
-    '<div class="kpi-card"><div class="kpi-label">Всего эпиков</div><div class="kpi-value">'+total+'</div><div class="kpi-note">Бизнес-процессов в работе</div></div>'+
-    '<div class="kpi-card"><div class="kpi-label">Успевают</div><div class="kpi-value" style="color:var(--color-success)">'+okCount+'</div><div class="kpi-note">В рамках целевой даты</div></div>'+
-    '<div class="kpi-card"><div class="kpi-label">Риск срыва</div><div class="kpi-value" style="color:var(--color-warning)">'+riskCount+'</div><div class="kpi-note">В буфере риска</div></div>'+
-    '<div class="kpi-card"><div class="kpi-label">Не успевают</div><div class="kpi-value" style="color:var(--color-error)">'+dangerCount+'</div><div class="kpi-note">Прогноз позже цели</div></div>'+
-    '<div class="kpi-card"><div class="kpi-label">Остаток по проекту</div><div class="kpi-value">'+fmtNum(totalRemaining)+' ч</div><div class="kpi-note">Суммарно по всем эпикам</div></div>';
+    if(stat.status==='ok') okCount++; else if(stat.status==='risk') riskCount++; else if(stat.status==='danger') dangerCount++;
+    totalRemaining += stat.lastRemaining || 0;
+  });
+  document.getElementById('kpiGrid').innerHTML =
+    kpiCard('Всего эпиков', vis.length, 'Выбрано на дашборде') +
+    kpiCard('Успевают', okCount, 'В рамках целевой даты', '--color-success') +
+    kpiCard('Риск срыва', riskCount, 'В пределах буфера риска', '--color-warning') +
+    kpiCard('Не успевают', dangerCount, 'Прогноз позже цели', '--color-error') +
+    kpiCard('Остаток по проекту', hoursToStr(totalRemaining), 'Сумма по выбранным эпикам');
 }
 
 function renderSummaryTable(){
   var table = document.getElementById('summaryTable');
   var html = '<thead><tr>'+
-    '<th class="sortable" data-sort="etap">Этап ↕</th>'+
-    '<th class="sortable" data-sort="name">Эпик ↕</th>'+
-    '<th class="sortable" data-sort="remaining">Остаток ↕</th>'+
-    '<th class="sortable" data-sort="burnRate">Burn rate, ч/день ↕</th>'+
-    '<th class="sortable" data-sort="targetDate">Цель ↕</th>'+
-    '<th class="sortable" data-sort="forecastZero">Прогноз \"0\" ↕</th>'+
-    '<th class="sortable" data-sort="status">Статус ↕</th>'+
+    '<th class="sortable" data-sort="etap">Этап</th>'+
+    '<th class="sortable" data-sort="name">Эпик</th>'+
+    '<th class="sortable num" data-sort="remaining">Остаток</th>'+
+    '<th class="sortable num" data-sort="burnRate">Burn rate, ч/день</th>'+
+    '<th class="sortable" data-sort="targetDate">Цель</th>'+
+    '<th class="sortable" data-sort="forecastZero">Прогноз «0»</th>'+
+    '<th class="sortable" data-sort="status">Статус</th>'+
     '</tr></thead><tbody>';
   var totalRemaining = 0, totalBurnRate = 0, hasRemaining=false, hasBurn=false;
-  var _rows = [];
-  visibleDashboardServices().forEach(function(s){
+  var rows = visibleDashboardServices().map(function(s){
     var stat = computeServiceStatus(s.id);
-    _rows.push({etap:s.etap, name:s.name, remaining:stat.lastRemaining, burnRate:stat.burnRate, targetDate:s.targetDate||'', forecastZero:stat.forecastZeroDate||'', status:stat.status});
-    if(stat.lastRemaining !== null && stat.lastRemaining !== undefined){ totalRemaining += stat.lastRemaining; hasRemaining = true; }
-    if(stat.burnRate !== null && stat.burnRate !== undefined){ totalBurnRate += stat.burnRate; hasBurn = true; }
+    if(isNum(stat.lastRemaining)){ totalRemaining += stat.lastRemaining; hasRemaining = true; }
+    if(isNum(stat.burnRate)){ totalBurnRate += stat.burnRate; hasBurn = true; }
+    return {etap:s.etap, name:s.name, isDone:s.isDone, remaining:stat.lastRemaining, burnRate:stat.burnRate, targetDate:s.targetDate||'', forecastZero:stat.forecastZeroDate||'', status:stat.status};
   });
-  _rows = applyTableSort('summaryTable', _rows);
-  _rows.forEach(function(r){
-    html += '<tr><td>'+escapeHtml(r.etap)+'</td><td>'+escapeHtml(r.name)+'</td><td class="mono">'+hoursToStr(r.remaining)+'</td><td class="mono">'+hoursToStr(r.burnRate)+'</td><td class="mono">'+(r.targetDate || '\u2014')+'</td><td class="mono">'+(r.forecastZero || '\u2014')+'</td><td>'+statusBadge(r.status)+'</td></tr>';
+  if(!rows.length){
+    html += '<tr><td colspan="7" class="empty-cell">Нет эпиков для отображения — проверьте фильтр выше.</td></tr>';
+  }
+  applyTableSort('summaryTable', rows).forEach(function(r){
+    html += '<tr'+(r.isDone?' class="done-row"':'')+'><td class="nowrap">'+escapeHtml(r.etap)+'</td><td>'+escapeHtml(r.name)+'</td><td class="num">'+hoursToStr(r.remaining)+'</td><td class="num">'+hoursToStr(r.burnRate)+'</td><td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+fmtDate(r.forecastZero)+'</td><td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
   });
-  html += '<tr class="total-row"><td><b>Итого</b></td><td></td><td class="mono"><b>'+(hasRemaining?hoursToStr(totalRemaining):'—')+'</b></td><td class="mono"><b>'+(hasBurn?hoursToStr(totalBurnRate):'—')+'</b></td><td></td><td></td><td></td></tr>';
+  if(rows.length){
+    html += '<tr class="total-row"><td colspan="2">Итого</td><td class="num">'+(hasRemaining?hoursToStr(totalRemaining):'—')+'</td><td class="num">'+(hasBurn?hoursToStr(totalBurnRate):'—')+'</td><td colspan="3"></td></tr>';
+  }
   html += '</tbody>';
   table.innerHTML = html;
-  initTableSort(table, _rows, function(){ renderSummaryTable(); });
+  initTableSort(table, renderSummaryTable);
 }
 
 /* ════════════════════════════════════════════════════════════════
-   Burn rate daily table
+   Burn rate daily tables
 ════════════════════════════════════════════════════════════════ */
 function unionOfAllDates(){
   var set = {};
-  STATE.entries.forEach(function(e){ if(e.remaining !== null && e.remaining !== undefined) set[e.date] = true; });
+  STATE.entries.forEach(function(e){ if(isNum(e.remaining)) set[e.date] = true; });
   return Object.keys(set).sort();
+}
+
+function burnRateDates(range){
+  var allDates = unionOfAllDates();
+  if(range && (range.from || range.to)){
+    return allDates.filter(function(d){ return (!range.from || d >= range.from) && (!range.to || d <= range.to); });
+  }
+  return allDates.slice(-5);
+}
+
+/* Дневной burn rate эпика на каждую из дат: (предыдущий заполненный остаток − текущий) / дней между замерами */
+function serviceDailyRates(serviceId, dates){
+  var rows = entriesForService(serviceId).filter(function(r){ return isNum(r.remaining); });
+  return dates.map(function(d){
+    var idx = -1;
+    for(var i=0;i<rows.length;i++){ if(rows[i].date === d){ idx = i; break; } }
+    if(idx <= 0) return null;
+    var days = daysBetween(rows[idx-1].date, d);
+    return days > 0 ? (rows[idx-1].remaining - rows[idx].remaining) / days : null;
+  });
+}
+
+function sumRates(rateLists, len){
+  var res = [];
+  for(var i=0;i<len;i++){
+    var sum = 0, has = false;
+    rateLists.forEach(function(list){ if(isNum(list[i])){ sum += list[i]; has = true; } });
+    res.push(has ? sum : null);
+  }
+  return res;
+}
+
+function burnRateTableHtml(firstHeader, dates, rows){
+  /* rows: [{label, rates}] — последняя строка «Итого по проекту» добавляется автоматически */
+  var rateCells = function(rates){ return rates.map(function(r){ return '<td class="num">'+(r===null?'—':fmtNum(r))+'</td>'; }).join(''); };
+  var html = '<thead><tr><th>'+firstHeader+'</th>' + dates.map(function(d){ return '<th class="num">'+fmtShortDate(d)+'</th>'; }).join('') + '</tr></thead><tbody>';
+  rows.forEach(function(r){ html += '<tr><td>'+escapeHtml(r.label)+'</td>'+rateCells(r.rates)+'</tr>'; });
+  var totals = sumRates(rows.map(function(r){ return r.rates; }), dates.length);
+  html += '<tr class="total-row"><td>Итого по проекту</td>'+rateCells(totals)+'</tr></tbody>';
+  return html;
+}
+
+function emptyTable(table, title, text){
+  table.innerHTML = '<thead><tr><th>'+title+'</th></tr></thead><tbody><tr><td class="empty-cell">'+text+'</td></tr></tbody>';
 }
 
 function renderBurnRateTable(){
   var table = document.getElementById('burnRateTable');
-  var allDates = unionOfAllDates();
-  var dates;
-  if(burnRangeOverride && (burnRangeOverride.from || burnRangeOverride.to)){
-    dates = allDates.filter(function(d){
-      return (!burnRangeOverride.from || d >= burnRangeOverride.from) && (!burnRangeOverride.to || d <= burnRangeOverride.to);
-    });
-  } else {
-    dates = allDates.slice(-5);
-  }
-  if(!dates.length){
-    table.innerHTML = '<thead><tr><th>Нет данных</th></tr></thead><tbody><tr><td>Добавьте замеры в разделе «Данные по датам».</td></tr></tbody>';
-    return;
-  }
-  var html = '<thead><tr><th>Бизнес-процесс</th>' + dates.map(function(d){ return '<th class="mono">'+d.slice(5).split('-').reverse().join('.')+'</th>'; }).join('') + '</tr></thead><tbody>';
-  var perServiceRates = {};
-  var visServices = visibleDashboardServices();
-  visServices.forEach(function(s){
-    var rows = entriesForService(s.id);
-    var byDate = {};
-    rows.forEach(function(r){ byDate[r.date] = r.remaining; });
-    var rates = [];
-    for(var i=0;i<dates.length;i++){
-      var d = dates[i];
-      if(!(d in byDate) || byDate[d] === null || byDate[d] === undefined){ rates.push(null); continue; }
-      var prevDate = null, prevVal = null;
-      for(var j=0;j<rows.length;j++){
-        if(rows[j].date < d && rows[j].remaining !== null && rows[j].remaining !== undefined){ prevDate = rows[j].date; prevVal = rows[j].remaining; }
-      }
-      if(prevDate === null){ rates.push(null); continue; }
-      var days = daysBetween(prevDate, d);
-      if(days <= 0){ rates.push(null); continue; }
-      rates.push((prevVal - byDate[d]) / days);
-    }
-    perServiceRates[s.id] = rates;
-    html += '<tr><td>'+escapeHtml(s.etap)+' — '+escapeHtml(s.name)+'</td>' + rates.map(function(r){ return '<td class="mono">'+(r===null?'—':fmtNum(r))+'</td>'; }).join('') + '</tr>';
+  var dates = burnRateDates(burnRangeOverride);
+  if(!dates.length){ emptyTable(table, 'Нет данных', 'Добавьте замеры в разделе «Данные по датам».'); return; }
+  var rows = visibleDashboardServices().map(function(s){
+    return {label: s.etap+' — '+s.name, rates: serviceDailyRates(s.id, dates)};
   });
-  var totalRates = dates.map(function(d,i){
-    var sum = 0, has = false;
-    visServices.forEach(function(s){ var r = perServiceRates[s.id][i]; if(r !== null && r !== undefined){ sum += r; has = true; } });
-    return has ? sum : null;
-  });
-  html += '<tr class="total-row"><td><b>Итого по проекту</b></td>' + totalRates.map(function(r){ return '<td class="mono"><b>'+(r===null?'—':fmtNum(r))+'</b></td>'; }).join('') + '</tr>';
-  html += '</tbody>';
-  table.innerHTML = html;
+  table.innerHTML = burnRateTableHtml('Эпик', dates, rows);
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -737,137 +785,54 @@ function renderStageKpis(){
   var grid = document.getElementById('stageKpiGrid');
   var stageGroups = computeStageGroups();
   var stageNames = Object.keys(stageGroups);
-  var html = '';
-  if(stageNames.length === 0){
-    html = '<div class="empty-state" style="grid-column:1/-1;padding:var(--space-8);"><p>Нет этапов в этом проекте. Добавьте эпики в разделе «Бизнес-процессы».</p></div>';
+  if(!stageNames.length){
+    grid.innerHTML = '<div class="empty-state panel" style="grid-column:1/-1;"><p>Нет этапов в этом проекте. Добавьте эпики в разделе «Эпики (блоки задач)».</p></div>';
+    return;
   }
-  stageNames.forEach(function(name){
+  grid.innerHTML = stageNames.map(function(name){
     var stat = computeStageStatus(name, stageGroups);
-    html += '<div class="kpi-card"><div class="kpi-label">'+escapeHtml(name)+'</div><div class="kpi-value">'+hoursToStr(stat.lastRemaining)+'</div><div class="kpi-note">Цель: '+(STATE.stageTargets[name]||'—')+' · '+statusBadge(stat.status)+'</div></div>';
-  });
-  grid.innerHTML = html;
+    return kpiCard(escapeHtml(name), hoursToStr(stat.lastRemaining), 'Цель: '+fmtDate(STATE.stageTargets[name])+' '+statusBadge(stat.status));
+  }).join('');
 }
 
 function renderStageSummaryTable(){
   var table = document.getElementById('stageSummaryTable');
   var stageGroups = computeStageGroups();
   var stageNames = Object.keys(stageGroups);
-  if(!stageNames.length){
-    table.innerHTML = '<thead><tr><th>Нет данных</th></tr></thead><tbody><tr><td style="color:var(--color-text-muted);">Добавьте эпики для отображения этапов.</td></tr></tbody>';
-    return;
-  }
+  if(!stageNames.length){ emptyTable(table, 'Нет данных', 'Добавьте эпики для отображения этапов.'); return; }
   var html = '<thead><tr>'+
-    '<th class="sortable" data-sort="name">Этап ↕</th>'+
-    '<th class="sortable" data-sort="count">Эпиков ↕</th>'+
-    '<th class="sortable" data-sort="remaining">Остаток (сумма) ↕</th>'+
-    '<th class="sortable" data-sort="burnRate">Burn rate ↕</th>'+
-    '<th class="sortable" data-sort="targetDate">Цель ↕</th>'+
-    '<th class="sortable" data-sort="forecastZero">Прогноз \"0\" ↕</th>'+
-    '<th class="sortable" data-sort="status">Статус ↕</th>'+
+    '<th class="sortable" data-sort="name">Этап</th>'+
+    '<th class="sortable num" data-sort="count">Эпиков</th>'+
+    '<th class="sortable num" data-sort="remaining">Остаток (сумма)</th>'+
+    '<th class="sortable num" data-sort="burnRate">Burn rate, ч/день</th>'+
+    '<th class="sortable" data-sort="targetDate">Цель</th>'+
+    '<th class="sortable" data-sort="forecastZero">Прогноз «0»</th>'+
+    '<th class="sortable" data-sort="status">Статус</th>'+
     '</tr></thead><tbody>';
-  var _srows = [];
-  stageNames.forEach(function(name){
+  var rows = stageNames.map(function(name){
     var stat = computeStageStatus(name, stageGroups);
-    var count = servicesInStage(name, stageGroups).length;
-    _srows.push({name:name, count:count, remaining:stat.lastRemaining, burnRate:stat.burnRate, targetDate:STATE.stageTargets[name]||'', forecastZero:stat.forecastZeroDate||'', status:stat.status});
+    return {name:name, count:stageGroups[name].length, remaining:stat.lastRemaining, burnRate:stat.burnRate, targetDate:STATE.stageTargets[name]||'', forecastZero:stat.forecastZeroDate||'', status:stat.status};
   });
-  _srows = applyTableSort('stageSummaryTable', _srows);
-  _srows.forEach(function(r){
-    html += '<tr><td>'+escapeHtml(r.name)+'</td><td class="mono">'+r.count+'</td><td class="mono">'+hoursToStr(r.remaining)+'</td><td class="mono">'+hoursToStr(r.burnRate)+'</td><td class="mono">'+(r.targetDate||'\u2014')+'</td><td class="mono">'+(r.forecastZero||'\u2014')+'</td><td>'+statusBadge(r.status)+'</td></tr>';
+  applyTableSort('stageSummaryTable', rows).forEach(function(r){
+    html += '<tr><td>'+escapeHtml(r.name)+'</td><td class="num">'+r.count+'</td><td class="num">'+hoursToStr(r.remaining)+'</td><td class="num">'+hoursToStr(r.burnRate)+'</td><td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+fmtDate(r.forecastZero)+'</td><td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
   });
   html += '</tbody>';
   table.innerHTML = html;
-  initTableSort(table, _srows, function(){ renderStageSummaryTable(); });
+  initTableSort(table, renderStageSummaryTable);
 }
 
 function renderStageBurnRateTable(){
   var table = document.getElementById('stageBurnRateTable');
-  if(!table) return;
-  var allDates = unionOfAllDates();
-  var dates;
-  if(stageBurnRangeOverride && (stageBurnRangeOverride.from || stageBurnRangeOverride.to)){
-    dates = allDates.filter(function(d){
-      return (!stageBurnRangeOverride.from || d >= stageBurnRangeOverride.from) && (!stageBurnRangeOverride.to || d <= stageBurnRangeOverride.to);
-    });
-  } else {
-    dates = allDates.slice(-5);
-  }
-  if(!dates.length){
-    table.innerHTML = '<thead><tr><th>Нет данных</th></tr></thead><tbody><tr><td>Добавьте замеры для отображения burn rate.</td></tr></tbody>';
-    return;
-  }
+  var dates = burnRateDates(stageBurnRangeOverride);
+  if(!dates.length){ emptyTable(table, 'Нет данных', 'Добавьте замеры для отображения burn rate.'); return; }
   var stageGroups = computeStageGroups();
   var stageNames = Object.keys(stageGroups);
-  if(!stageNames.length){
-    table.innerHTML = '<thead><tr><th>Нет данных</th></tr></thead><tbody><tr><td>Нет этапов для отображения.</td></tr></tbody>';
-    return;
-  }
-  var html = '<thead><tr><th>Этап</th>' + dates.map(function(d){ return '<th class="mono">'+d.slice(5).split('-').reverse().join('.')+'</th>'; }).join('') + '</tr></thead><tbody>';
-  var perStageRates = {};
-  stageNames.forEach(function(name){
-    var services = servicesInStage(name, stageGroups);
-    var rates = dates.map(function(d){
-      var sum = 0, hasVal = false, hasPrev = false;
-      var prevSum = 0, curSum = 0;
-      services.forEach(function(s){
-        var rows = entriesForService(s.id);
-        var byDate = {};
-        rows.forEach(function(r){ byDate[r.date] = r.remaining; });
-        if(d in byDate && byDate[d] !== null && byDate[d] !== undefined){
-          curSum += byDate[d]; hasVal = true;
-        }
-        var prevDate = null, prevVal = null;
-        for(var j=0;j<rows.length;j++){
-          if(rows[j].date < d && rows[j].remaining !== null && rows[j].remaining !== undefined){ prevDate = rows[j].date; prevVal = rows[j].remaining; }
-        }
-        if(prevDate !== null && hasVal){ prevSum += prevVal; hasPrev = true; }
-        if(prevDate){
-          var days = daysBetween(prevDate, d);
-          if(days <= 0){ /* skip */ }
-        }
-      });
-      if(hasVal && hasPrev){
-        var prevDateOverall = null;
-        var totalPrev = 0, totalCur = 0, hasPrevOverall = false;
-        services.forEach(function(s){
-          var rows = entriesForService(s.id);
-          var byDate = {};
-          rows.forEach(function(r){ byDate[r.date] = r.remaining; });
-          if(d in byDate && byDate[d] !== null && byDate[d] !== undefined){ totalCur += byDate[d]; }
-          var pd = null, pv = null;
-          for(var j=0;j<rows.length;j++){
-            if(rows[j].date < d && rows[j].remaining !== null && rows[j].remaining !== undefined){ pd = rows[j].date; pv = rows[j].remaining; }
-          }
-          if(pd){ totalPrev += pv; hasPrevOverall = true; }
-        });
-        if(hasPrevOverall){
-          var earliestPrev = null, latestPrev = null;
-          services.forEach(function(s){
-            var rows = entriesForService(s.id);
-            for(var j=0;j<rows.length;j++){
-              if(rows[j].date < d && rows[j].remaining !== null && rows[j].remaining !== undefined){
-                if(!earliestPrev || rows[j].date < earliestPrev) earliestPrev = rows[j].date;
-                if(!latestPrev || rows[j].date > latestPrev) latestPrev = rows[j].date;
-              }
-            }
-          });
-          var days = daysBetween(latestPrev || earliestPrev, d);
-          if(days > 0) return (totalPrev - totalCur) / days;
-        }
-      }
-      return null;
-    });
-    perStageRates[name] = rates;
-    html += '<tr><td>'+escapeHtml(name)+'</td>' + rates.map(function(r){ return '<td class="mono">'+(r===null?'—':fmtNum(r))+'</td>'; }).join('') + '</tr>';
+  if(!stageNames.length){ emptyTable(table, 'Нет данных', 'Нет этапов для отображения.'); return; }
+  /* Burn rate этапа — сумма дневных burn rate его эпиков (согласовано с таблицей на дашборде) */
+  var rows = stageNames.map(function(name){
+    return {label: name, rates: sumRates(stageGroups[name].map(function(id){ return serviceDailyRates(id, dates); }), dates.length)};
   });
-  var totalRates = dates.map(function(d,i){
-    var sum = 0, has = false;
-    stageNames.forEach(function(name){ var r = perStageRates[name][i]; if(r !== null && r !== undefined){ sum += r; has = true; } });
-    return has ? sum : null;
-  });
-  html += '<tr class="total-row"><td><b>Итого по проекту</b></td>' + totalRates.map(function(r){ return '<td class="mono"><b>'+(r===null?'—':fmtNum(r))+'</b></td>'; }).join('') + '</tr>';
-  html += '</tbody>';
-  table.innerHTML = html;
+  table.innerHTML = burnRateTableHtml('Этап', dates, rows);
 }
 
 function buildStagePanelsSkeleton(){
@@ -877,7 +842,7 @@ function buildStagePanelsSkeleton(){
   if(!stageNames.length){ container.innerHTML = ''; return; }
   container.innerHTML = stageNames.map(function(name, idx){
     var safeId = 'st'+idx;
-    return '<div class="panel" style="margin-bottom:var(--space-6);"><div class="panel-head"><div><div class="panel-title">'+escapeHtml(name)+'</div><div class="section-note">Сумма остатка по эпикам этапа. Вертикальные пунктирные линии — целевые даты эпиков. При наведении на фактические значения показываются отклонения от средней динамики и прогноза.</div></div><div class="panel-controls"><label class="small" for="stageTarget_'+safeId+'">Цель:</label><input type="date" id="stageTarget_'+safeId+'" data-stage="'+escapeHtml(name)+'"></div></div><div class="legend-row" id="legendStage_'+safeId+'"></div><div class="chart-wrap"><canvas id="chartStage_'+safeId+'"></canvas></div></div>';
+    return '<div class="panel"><div class="panel-head"><div><div class="panel-title">'+escapeHtml(name)+'</div><div class="section-note">Сумма остатка по эпикам этапа. Вертикальный пунктир — целевые даты эпиков.</div></div><div class="panel-controls"><label class="small" for="stageTarget_'+safeId+'">Цель этапа</label><input type="date" id="stageTarget_'+safeId+'" data-stage="'+escapeAttr(name)+'"></div></div><div class="legend-row" id="legendStage_'+safeId+'"></div><div class="chart-wrap"><canvas id="chartStage_'+safeId+'"></canvas></div></div>';
   }).join('');
 
   container.querySelectorAll('input[type=date][data-stage]').forEach(function(inp){
@@ -942,10 +907,10 @@ function renderStageCharts(){
 
     var actualData = agg.dates.map(function(d,i){ return {x:d, y: agg.remaining[i]}; });
     var datasets = [
-      { label: name+': остаток (сумма)', data: actualData, borderColor: palette[1], backgroundColor: palette[1]+'33', borderWidth: 2.5, pointRadius:4, tension:0.2, spanGaps:true, isActual:true }
+      { label: name+': остаток (сумма)', data: actualData, borderColor: palette[1], backgroundColor: palette[1]+'33', borderWidth: 2.5, pointRadius:4, tension:0.2, cubicInterpolationMode:'monotone', spanGaps:true, isActual:true }
     ];
 
-    var avgLine = avgLineDataset(agg.dates, stat.burnRate, stat.lastRemaining);
+    var avgLine = avgLineDataset(agg.dates, stat.burnRate, stat.lastRemaining, stat.lastDate);
     var avgPts = null;
     if(avgLine){ datasets.push(avgLine); avgPts = avgLine.data; }
 
@@ -955,7 +920,7 @@ function renderStageCharts(){
       var lastRow = {date: agg.dates[agg.dates.length-1]};
       var fc = forecastDataset(stat.reg, stat.baseDate, firstDate, lastRow, targetDate);
       if(fc){ datasets.push(fc); fcData = fc.data; }
-      var tl = targetLineDataset(lastRow.date, stat.lastRemaining, targetDate, 'Целевая линия (этап)');
+      var tl = targetLineDataset(stat.lastDate, stat.lastRemaining, targetDate, 'Целевая линия (этап)');
       if(tl) datasets.push(tl);
     }
 
@@ -984,95 +949,99 @@ function renderStageCharts(){
 /* ════════════════════════════════════════════════════════════════
    Data entry view
 ════════════════════════════════════════════════════════════════ */
+function serviceOption(s){
+  return '<option value="'+s.id+'">'+escapeHtml(s.etap)+' — '+escapeHtml(s.name)+(s.isDone?' (сдано)':'')+'</option>';
+}
 function populateServiceSelects(){
   var chartSel = document.getElementById('chartServiceSelect');
   var dataSel = document.getElementById('dataServiceSelect');
-  var chartOpts = visibleDashboardServices().map(function(s){ return '<option value="'+s.id+'">'+escapeHtml(s.etap)+' — '+escapeHtml(s.name)+(s.isDone?' (сдано)':'')+'</option>'; }).join('');
-  var dataOpts = STATE.services.map(function(s){ return '<option value="'+s.id+'">'+escapeHtml(s.etap)+' — '+escapeHtml(s.name)+(s.isDone?' (сдано)':'')+'</option>'; }).join('');
-  if(chartSel) chartSel.innerHTML = chartOpts;
-  if(dataSel) dataSel.innerHTML = dataOpts;
+  var vis = visibleDashboardServices();
+  var prevChart = parseInt(chartSel.value, 10);
+  chartSel.innerHTML = vis.length ? vis.map(serviceOption).join('') : '<option value="">Нет выбранных эпиков</option>';
+  if(vis.some(function(s){ return s.id === prevChart; })) chartSel.value = prevChart;
+  dataSel.innerHTML = STATE.services.length ? STATE.services.map(serviceOption).join('') : '<option value="">Нет эпиков</option>';
+  if(currentDataServiceId) dataSel.value = currentDataServiceId;
   document.getElementById('navServiceCount').textContent = STATE.services.length;
-  if(chartSel && !chartSel.value && visibleDashboardServices().length) chartSel.value = visibleDashboardServices()[0].id;
-  if(dataSel && currentDataServiceId) dataSel.value = currentDataServiceId;
+}
+
+function refreshDashboardParts(){
+  refreshCharts();
+  renderSummaryTable();
+  renderKpis();
+  renderBurnRateTable();
+}
+
+/* Перетаскивание строк только за «ручку», чтобы не мешать выделению текста в полях */
+function enableRowDrag(table, onDrop){
+  var dragRow = null;
+  table.querySelectorAll('tbody tr[data-id]').forEach(function(tr){
+    var handle = tr.querySelector('.drag-handle');
+    if(!handle) return;
+    handle.addEventListener('mousedown', function(){ tr.setAttribute('draggable', 'true'); });
+    handle.addEventListener('mouseup', function(){ tr.removeAttribute('draggable'); });
+    tr.addEventListener('dragstart', function(e){ dragRow = tr; tr.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
+    tr.addEventListener('dragend', function(){ tr.classList.remove('dragging'); tr.removeAttribute('draggable'); dragRow = null; });
+    tr.addEventListener('dragover', function(e){
+      e.preventDefault();
+      if(!dragRow || dragRow === tr) return;
+      var rect = tr.getBoundingClientRect();
+      tr.parentNode.insertBefore(dragRow, e.clientY < rect.top + rect.height/2 ? tr : tr.nextSibling);
+    });
+    tr.addEventListener('drop', function(e){
+      e.preventDefault();
+      if(dragRow) onDrop(Array.from(table.querySelectorAll('tbody tr[data-id]')));
+    });
+  });
 }
 
 function renderDataView(){
   populateServiceSelects();
-  var dsel = document.getElementById('dataServiceSelect');
-  if(currentDataServiceId) dsel.value = currentDataServiceId;
   var rows = currentDataServiceId ? entriesForService(currentDataServiceId) : [];
   rows = applyTableSort('entriesTable', rows);
   var table = document.getElementById('entriesTable');
-  var emptyHint = document.getElementById('dataEmptyHint');
-  emptyHint.style.display = rows.length ? 'none' : 'flex';
-  table.className = 'data-table compact-table services-table';
+  document.getElementById('dataEmptyHint').style.display = rows.length ? 'none' : '';
   table.style.display = rows.length ? '' : 'none';
 
-  var html = '<colgroup><col class="col-drag"><col class="col-date"><col class="col-num"><col class="col-num"><col class="col-num"><col class="col-actions"></colgroup><thead><tr><th></th><th class="sortable" data-sort="date">Дата ↕</th><th class="sortable" data-sort="remaining">Ост. (ч) ↕</th><th class="sortable" data-sort="spent">Затр. (ч) ↕</th><th class="sortable" data-sort="estimate">Оценка (ч) ↕</th><th></th></tr></thead><tbody>';
+  var numInput = function(r, field){ return '<input type="number" step="0.01" min="0" value="'+(r[field] ?? '')+'" data-field="'+field+'">'; };
+  var html = '<colgroup><col class="col-date"><col class="col-num"><col class="col-num"><col class="col-num"><col class="col-actions"></colgroup>'+
+    '<thead><tr><th class="sortable" data-sort="date">Дата</th><th class="sortable" data-sort="remaining">Остаток, ч</th><th class="sortable" data-sort="spent">Затрачено, ч</th><th class="sortable" data-sort="estimate">Оценка, ч</th><th></th></tr></thead><tbody>';
   rows.forEach(function(r){
-    html += '<tr data-id="'+r.id+'" draggable="true"><td class="drag-handle" title="Перетащите для изменения порядка">\u2630</td><td><input type="date" value="'+r.date+'" data-field="date"></td><td><input type="number" step="0.01" value="'+(r.remaining ?? '')+'" data-field="remaining"></td><td><input type="number" step="0.01" value="'+(r.spent ?? '')+'" data-field="spent"></td><td><input type="number" step="0.01" value="'+(r.estimate ?? '')+'" data-field="estimate"></td><td class="row-actions"><button class="icon-btn" data-action="delete" title="Удалить"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0l-1 14a2 2 0 01-2 2H7a2 2 0 01-2-2L4 6h16z"/></svg></button></td></tr>';
+    html += '<tr data-id="'+r.id+'"><td><input type="date" value="'+r.date+'" data-field="date" required></td><td>'+numInput(r,'remaining')+'</td><td>'+numInput(r,'spent')+'</td><td>'+numInput(r,'estimate')+'</td><td class="row-actions">'+actionBtn('delete','Удалить',ICON_DELETE)+'</td></tr>';
   });
   html += '</tbody>';
   table.innerHTML = html;
-  initTableSort(table, rows, function(){ renderDataView(); });
-
-  // Drag-and-drop for data rows
-  var dragRow2 = null;
-  table.querySelectorAll('tbody tr').forEach(function(tr){
-    tr.addEventListener('dragstart', function(){ dragRow2 = tr; tr.classList.add('dragging'); });
-    tr.addEventListener('dragend', function(){ tr.classList.remove('dragging'); });
-    tr.addEventListener('dragover', function(e){ e.preventDefault(); if(dragRow2 && dragRow2 !== tr){ var rect = tr.getBoundingClientRect(); var mid = rect.top + rect.height/2; if(e.clientY < mid){ tr.parentNode.insertBefore(dragRow2, tr); } else { tr.parentNode.insertBefore(dragRow2, tr.nextSibling); } } });
-    tr.addEventListener('drop', function(e){
-      e.preventDefault();
-      if(!dragRow2) return;
-      var newRows = Array.from(table.querySelectorAll('tbody tr'));
-      newRows.forEach(function(r, i){
-        var id = parseInt(r.dataset.id, 10);
-        var entry = STATE.entries.find(function(e){ return e.id === id; });
-        if(entry){
-          // Reorder in STATE.entries
-        }
-      });
-      // Reorder entries in state
-      var sid = currentDataServiceId;
-      var allEntries = STATE.entries.filter(function(e){ return e.service_id === sid; });
-      var newOrder = newRows.map(function(r){ return parseInt(r.dataset.id, 10); });
-      // Update date order in entries
-      toast('Порядок строк обновлён');
-      dragRow2 = null;
-    });
-  });
+  initTableSort(table, renderDataView);
 
   table.querySelectorAll('input').forEach(function(inp){
     inp.addEventListener('change', function(){
-      var tr = inp.closest('tr');
-      var id = parseInt(tr.dataset.id, 10);
+      var id = parseInt(inp.closest('tr').dataset.id, 10);
       var entry = STATE.entries.find(function(e){ return e.id === id; });
       if(!entry) return;
       var field = inp.dataset.field;
-      var newVal = field === 'date' ? inp.value : (inp.value === '' ? null : parseFloat(inp.value));
-      entry[field] = newVal;
+      if(field === 'date'){
+        var dup = STATE.entries.some(function(e){ return e.id !== id && e.service_id === entry.service_id && e.date === inp.value; });
+        if(!inp.value || dup){
+          toast(inp.value ? 'Замер на эту дату уже есть' : 'Укажите дату');
+          inp.value = entry.date;
+          return;
+        }
+      }
+      entry[field] = field === 'date' ? inp.value : (inp.value === '' ? null : parseFloat(inp.value));
       apiPut('/api/entries/'+id, {date:entry.date, remaining:entry.remaining, spent:entry.spent, estimate:entry.estimate}).then(function(){
         toast('Сохранено');
       });
-      refreshCharts();
-      renderSummaryTable();
-      renderKpis();
-      renderBurnRateTable();
+      if(field === 'date') renderDataView();
+      refreshDashboardParts();
     });
   });
   table.querySelectorAll('[data-action="delete"]').forEach(function(btn){
     btn.addEventListener('click', function(){
-      var tr = btn.closest('tr');
-      var id = parseInt(tr.dataset.id, 10);
+      var id = parseInt(btn.closest('tr').dataset.id, 10);
       askConfirm('Удалить запись?', 'Строка данных будет удалена без возможности восстановления.', function(){
         apiDelete('/api/entries/'+id).then(function(){
           STATE.entries = STATE.entries.filter(function(e){ return e.id !== id; });
           renderDataView();
-          refreshCharts();
-          renderSummaryTable();
-          renderKpis();
-          renderBurnRateTable();
+          refreshDashboardParts();
           toast('Строка удалена');
         });
       });
@@ -1086,70 +1055,70 @@ function renderDataView(){
 ════════════════════════════════════════════════════════════════ */
 function renderServicesView(){
   var table = document.getElementById('servicesTable');
-  var html = '<colgroup><col class="col-drag"><col class="col-etap"><col class="col-name"><col class="col-target"><col class="col-done"><col class="col-group"><col class="col-count"><col class="col-actions"></colgroup><thead><tr><th></th><th class="sortable" data-sort="etap">Этап ↕</th><th class="sortable" data-sort="name">Название бизнес-процесса ↕</th><th class="sortable" data-sort="targetDate">Целевая дата ↕</th><th title="Сданный функционал не учитывается в рамках этапа">Сдано</th><th class="sortable" data-sort="stageGroup" title="Группа для «Свода по этапам»; пусто — группировка по этапу">Группа в своде</th><th class="sortable" data-sort="count">Замеров ↕</th><th></th></tr></thead><tbody>';
+  var groupHint = 'Группа для «Свода по этапам»; пусто — группировка по этапу';
+  var html = '<colgroup><col class="col-drag"><col class="col-etap"><col class="col-name"><col class="col-target"><col class="col-done"><col class="col-group"><col class="col-count"><col class="col-actions"></colgroup>'+
+    '<thead><tr><th></th><th class="sortable" data-sort="etap">Этап</th><th class="sortable" data-sort="name">Название эпика</th><th class="sortable" data-sort="targetDate">Целевая дата</th><th class="center" title="Сданный функционал не учитывается в рамках этапа">Сдано</th><th class="sortable" data-sort="stageGroup" title="'+groupHint+'">Группа в своде</th><th class="sortable num" data-sort="count">Замеров</th><th></th></tr></thead><tbody>';
   var services = getSortedServices();
+  if(!services.length){
+    html += '<tr><td colspan="8" class="empty-cell">Эпиков пока нет — добавьте первый.</td></tr>';
+  }
   services.forEach(function(s){
-    html += '<tr data-id="'+s.id+'" draggable="true"'+(s.isDone?' class="done-row"':'')+'><td class="drag-handle" title="Перетащите для изменения порядка">⠿</td><td><input type="text" value="'+escapeAttr(s.etap)+'" data-field="etap"></td><td class="col-name-cell"><input type="text" value="'+escapeAttr(s.name)+'" data-field="name"></td><td><input type="date" value="'+(s.targetDate||'')+'" data-field="targetDate"></td><td style="text-align:center;"><input type="checkbox" data-field="isDone" title="Функционал сдан"'+(s.isDone?' checked':'')+'></td><td><input type="text" value="'+escapeAttr(s.stageGroup||'')+'" placeholder="по этапу" data-field="stageGroup" title="Группа для «Свода по этапам»; пусто — группировка по этапу"></td><td class="mono">'+entriesForService(s.id).length+'</td><td class="row-actions"><button class="icon-btn" data-action="delete" title="Удалить"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0l-1 14a2 2 0 01-2 2H7a2 2 0 01-2-2L4 6h16z"/></svg></button></td></tr>';
+    html += '<tr data-id="'+s.id+'"'+(s.isDone?' class="done-row"':'')+'>'+
+      '<td class="drag-handle" title="Перетащите для изменения порядка">⠿</td>'+
+      '<td><input type="text" value="'+escapeAttr(s.etap)+'" data-field="etap"></td>'+
+      '<td class="col-name-cell"><input type="text" value="'+escapeAttr(s.name)+'" data-field="name"></td>'+
+      '<td><input type="date" value="'+(s.targetDate||'')+'" data-field="targetDate"></td>'+
+      '<td class="center"><input type="checkbox" data-field="isDone" title="Функционал сдан"'+(s.isDone?' checked':'')+'></td>'+
+      '<td><input type="text" value="'+escapeAttr(s.stageGroup||'')+'" placeholder="по этапу" data-field="stageGroup" title="'+groupHint+'"></td>'+
+      '<td class="num">'+entriesForService(s.id).length+'</td>'+
+      '<td class="row-actions">'+actionBtn('delete','Удалить',ICON_DELETE)+'</td></tr>';
   });
   html += '</tbody>';
   table.innerHTML = html;
-  initTableSort(table, services, function(sorted){ renderServicesView(); });
+  initTableSort(table, renderServicesView);
 
-  // Drag-and-drop reorder
-  var dragRow = null;
-  table.querySelectorAll('tbody tr').forEach(function(tr){
-    tr.addEventListener('dragstart', function(){ dragRow = tr; tr.classList.add('dragging'); });
-    tr.addEventListener('dragend', function(){ tr.classList.remove('dragging'); });
-    tr.addEventListener('dragover', function(e){ e.preventDefault(); if(dragRow && dragRow !== tr){ var rect = tr.getBoundingClientRect(); var mid = rect.top + rect.height/2; if(e.clientY < mid){ tr.parentNode.insertBefore(dragRow, tr); } else { tr.parentNode.insertBefore(dragRow, tr.nextSibling); } } });
-    tr.addEventListener('drop', function(e){
-      e.preventDefault();
-      if(!dragRow) return;
-      var rows = Array.from(table.querySelectorAll('tbody tr'));
+  if(canEdit()){
+    enableRowDrag(table, function(rows){
       var orders = rows.map(function(r, i){ return {id: parseInt(r.dataset.id, 10), sortOrder: i+1}; });
       apiPost('/api/projects/'+currentProjectId+'/services/reorder', {orders: orders}).then(function(){
-        STATE.services.forEach(function(s){
-          var idx = rows.findIndex(function(r){ return parseInt(r.dataset.id,10) === s.id; });
-          if(idx >= 0) s.sortOrder = idx + 1;
-        });
+        orders.forEach(function(o){ var svc = serviceById(o.id); if(svc) svc.sortOrder = o.sortOrder; });
         STATE.services.sort(function(a,b){ return (a.sortOrder||0) - (b.sortOrder||0); });
+        delete tableSortState['servicesTable'];
+        renderServicesView();
+        populateServiceSelects();
         toast('Порядок обновлён');
-        refreshCharts();
       });
-      dragRow = null;
     });
-  });
+  }
 
   table.querySelectorAll('input').forEach(function(inp){
     inp.addEventListener('change', function(){
-      var tr = inp.closest('tr');
-      var id = parseInt(tr.dataset.id, 10);
+      var id = parseInt(inp.closest('tr').dataset.id, 10);
       var svc = serviceById(id);
       if(!svc) return;
-      if(inp.type === 'checkbox'){
-        svc.isDone = inp.checked;
-      } else if(inp.dataset.field === 'stageGroup'){
-        svc.stageGroup = inp.value;
-      } else {
-        svc[inp.dataset.field] = inp.value;
-      }
+      var field = inp.dataset.field;
+      if(field === 'isDone') svc.isDone = inp.checked;
+      else if(field === 'etap' || field === 'name') svc[field] = inp.value.trim();
+      else svc[field] = inp.value;
       apiPut('/api/services/'+id, {etap:svc.etap, name:svc.name, targetDate:svc.targetDate, isDone:svc.isDone, stageGroup:svc.stageGroup}).then(function(){
         toast('Сохранено');
       });
-      if(inp.type === 'checkbox') renderServicesView();
+      if(field === 'isDone') inp.closest('tr').classList.toggle('done-row', svc.isDone);
       populateServiceSelects();
       renderDashboardFilterBar();
     });
   });
   table.querySelectorAll('[data-action="delete"]').forEach(function(btn){
     btn.addEventListener('click', function(){
-      var tr = btn.closest('tr');
-      var id = parseInt(tr.dataset.id, 10);
+      var id = parseInt(btn.closest('tr').dataset.id, 10);
       askConfirm('Удалить эпик?', 'Все связанные замеры данных также будут удалены.', function(){
         apiDelete('/api/services/'+id).then(function(){
           STATE.services = STATE.services.filter(function(s){ return s.id !== id; });
           STATE.entries = STATE.entries.filter(function(e){ return e.service_id !== id; });
+          if(currentDataServiceId === id) currentDataServiceId = STATE.services.length ? STATE.services[0].id : null;
           renderServicesView();
           populateServiceSelects();
+          renderDashboardFilterBar();
           toast('Эпик удалён');
         });
       });
@@ -1162,37 +1131,27 @@ function renderServicesView(){
    Settings view
 ════════════════════════════════════════════════════════════════ */
 function renderSettingsView(){
-  var grid = document.getElementById('settingsGrid');
-  var burnMethod = STATE.settings.burnrateMethod || 'all';
-  var burnWindow = STATE.settings.burnrateWindowDays || 14;
-  grid.innerHTML =
-    '<div class="setting-item"><label class="small" for="setForecastMethod">Метод прогноза</label><select id="setForecastMethod"><option value="linear" '+(STATE.settings.forecastMethod==='linear'?'selected':'')+'>Линейная регрессия</option><option value="average" '+(STATE.settings.forecastMethod==='average'?'selected':'')+'>Средняя скорость сгорания (burn rate)</option></select></div>'+
-    '<div class="setting-item"><label class="small" for="setRiskBuffer">Буфер риска (дней)</label><input type="number" id="setRiskBuffer" min="0" step="1" value="'+(STATE.settings.riskBufferDays ?? 3)+'"></div>'+
-    '<div class="setting-item" style="grid-column:1/-1;border-top:1px solid var(--color-divider);padding-top:var(--space-4);"><label class="small" style="text-transform:uppercase;letter-spacing:0.03em;color:var(--color-text-faint);">Расчёт среднего burn rate</label></div>'+
-    '<div class="setting-item"><label class="small" for="setBurnrateMethod">Метод расчёта burn rate</label><select id="setBurnrateMethod"><option value="all" '+(burnMethod==='all'?'selected':'')+'>По всей истории</option><option value="rolling" '+(burnMethod==='rolling'?'selected':'')+'>Скользящее среднее</option></select></div>'+
-    '<div class="setting-item"><label class="small" for="setBurnrateWindow">Окно скользящего среднего (дней)</label><input type="number" id="setBurnrateWindow" min="1" step="1" value="'+burnWindow+'" '+(burnMethod!=='rolling'?'disabled':'')+'></div>';
+  var st = STATE.settings;
+  var burnMethod = st.burnrateMethod || 'all';
+  var opt = function(value, label, current){ return '<option value="'+value+'"'+(current===value?' selected':'')+'>'+label+'</option>'; };
+  document.getElementById('settingsGrid').innerHTML =
+    '<div class="setting-item"><label class="small" for="setForecastMethod">Метод прогноза</label><select id="setForecastMethod">'+opt('linear','Линейная регрессия',st.forecastMethod)+opt('average','Средняя скорость сгорания (burn rate)',st.forecastMethod)+'</select></div>'+
+    '<div class="setting-item"><label class="small" for="setRiskBuffer">Буфер риска, дней</label><input type="number" id="setRiskBuffer" min="0" step="1" value="'+(st.riskBufferDays ?? 3)+'"></div>'+
+    '<div class="settings-divider">Расчёт среднего burn rate</div>'+
+    '<div class="setting-item"><label class="small" for="setBurnrateMethod">Метод расчёта</label><select id="setBurnrateMethod">'+opt('all','По всей истории',burnMethod)+opt('rolling','Скользящее среднее',burnMethod)+'</select></div>'+
+    '<div class="setting-item"><label class="small" for="setBurnrateWindow">Окно скользящего среднего, дней</label><input type="number" id="setBurnrateWindow" min="1" step="1" value="'+(st.burnrateWindowDays || 14)+'"'+(burnMethod!=='rolling'?' disabled':'')+'></div>';
 
-  document.getElementById('setForecastMethod').addEventListener('change', function(e){
-    STATE.settings.forecastMethod = e.target.value;
-    saveSettings();
-    refreshCharts(); renderSummaryTable(); renderKpis(); renderBurnRateTable(); renderStageKpis(); renderStageSummaryTable();
-  });
-  document.getElementById('setRiskBuffer').addEventListener('change', function(e){
-    STATE.settings.riskBufferDays = parseInt(e.target.value, 10) || 0;
-    saveSettings();
-    refreshCharts(); renderSummaryTable(); renderKpis(); renderStageKpis(); renderStageSummaryTable();
-  });
-  document.getElementById('setBurnrateMethod').addEventListener('change', function(e){
-    STATE.settings.burnrateMethod = e.target.value;
-    saveSettings();
-    refreshCharts(); renderSummaryTable(); renderBurnRateTable(); renderStageKpis(); renderStageSummaryTable();
-    renderSettingsView();
-  });
-  document.getElementById('setBurnrateWindow').addEventListener('change', function(e){
-    STATE.settings.burnrateWindowDays = Math.max(1, parseInt(e.target.value, 10) || 14);
-    saveSettings();
-    refreshCharts(); renderSummaryTable(); renderBurnRateTable(); renderStageKpis(); renderStageSummaryTable();
-  });
+  var bind = function(id, apply){
+    document.getElementById(id).addEventListener('change', function(e){
+      apply(e.target);
+      saveSettings();
+      renderSettingsView();
+    });
+  };
+  bind('setForecastMethod', function(el){ st.forecastMethod = el.value; });
+  bind('setRiskBuffer', function(el){ st.riskBufferDays = Math.max(0, parseInt(el.value, 10) || 0); });
+  bind('setBurnrateMethod', function(el){ st.burnrateMethod = el.value; });
+  bind('setBurnrateWindow', function(el){ st.burnrateWindowDays = Math.max(1, parseInt(el.value, 10) || 14); });
   applyReadonlyToView('view-settings');
 }
 
@@ -1210,91 +1169,80 @@ function saveSettings(){
    Admin: User management
 ════════════════════════════════════════════════════════════════ */
 var allUsersCache = [];
-function renderUsersTable(){
-  api('/api/users').then(function(users){
-    allUsersCache = users;
-    var table = document.getElementById('usersTable');
-    var search = (document.getElementById('userSearch')||{}).value || '';
-    search = search.toLowerCase().trim();
-    var filtered = search ? users.filter(function(u){
-      return (u.username||'').toLowerCase().indexOf(search)!==-1 || (u.displayName||'').toLowerCase().indexOf(search)!==-1;
-    }) : users;
-    filtered = applyTableSort('usersTable', filtered);
-    var html = '<thead><tr><th class="sortable" data-sort="username">Логин ↕</th><th class="sortable" data-sort="displayName">Имя ↕</th><th class="sortable" data-sort="email">Email ↕</th><th class="sortable" data-sort="position">Должность ↕</th><th class="sortable" data-sort="role">Роль ↕</th><th></th></tr></thead><tbody>';
-    if(!filtered.length){
-      html += '<tr><td colspan="6" style="text-align:center;padding:var(--space-4);color:var(--color-text-muted);">Ничего не найдено</td></tr>';
-    }
-    filtered.forEach(function(u){
-      var roleLabel = u.role === 'admin' ? 'Администратор' : (u.role === 'manager' ? 'Руководитель' : 'Пользователь');
-      var sel = u.id === selectedAdminUser ? ' style="background:var(--color-primary-highlight);"' : '';
-      html += '<tr data-uid="'+u.id+'"'+sel+'><td>'+escapeHtml(u.username)+'</td><td>'+escapeHtml(u.displayName||'')+'</td><td>'+escapeHtml(u.email||'')+'</td><td>'+escapeHtml(u.position||'')+'</td><td><span class="role-badge '+u.role+'">'+roleLabel+'</span></td><td class="row-actions"><button class="icon-btn" data-action="edit" title="Редактировать"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button><button class="icon-btn" data-action="delete" title="Удалить"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0l-1 14a2 2 0 01-2 2H7a2 2 0 01-2-2L4 6h16z"/></svg></button></td></tr>';
-    });
-    html += '</tbody>';
-    table.innerHTML = html;
-    initTableSort(table, filtered, function(){ renderUsersTable(); });
+function field(label, inputHtml){ return '<div class="setting-item"><label class="small">'+label+'</label>'+inputHtml+'</div>'; }
+function roleOptions(current){
+  return ['user','manager','admin'].map(function(r){
+    var label = r === 'manager' ? 'Руководитель проекта' : ROLE_LABELS[r];
+    return '<option value="'+r+'"'+(current===r?' selected':'')+'>'+label+'</option>';
+  }).join('');
+}
+function roleBadge(role){ return '<span class="role-badge '+escapeAttr(role)+'">'+(ROLE_LABELS[role] || escapeHtml(role))+'</span>'; }
 
-    table.querySelectorAll('tr[data-uid]').forEach(function(tr){
-      tr.addEventListener('click', function(){
-        selectedAdminUser = parseInt(tr.dataset.uid, 10);
-        renderUsersTable();
-        renderUserProjectsMgmt();
-      });
+function loadUsers(){
+  return api('/api/users').then(function(users){ allUsersCache = users; renderUsersTable(); });
+}
+
+function renderUsersTable(){
+  var table = document.getElementById('usersTable');
+  var search = document.getElementById('userSearch').value.toLowerCase().trim();
+  var filtered = search ? allUsersCache.filter(function(u){
+    return (u.username||'').toLowerCase().indexOf(search)!==-1 || (u.displayName||'').toLowerCase().indexOf(search)!==-1;
+  }) : allUsersCache;
+  filtered = applyTableSort('usersTable', filtered);
+  var html = '<thead><tr><th class="sortable" data-sort="username">Логин</th><th class="sortable" data-sort="displayName">Имя</th><th class="sortable" data-sort="email">Email</th><th class="sortable" data-sort="position">Должность</th><th class="sortable" data-sort="role">Роль</th><th></th></tr></thead><tbody>';
+  if(!filtered.length){
+    html += '<tr><td colspan="6" class="empty-cell">Ничего не найдено</td></tr>';
+  }
+  filtered.forEach(function(u){
+    html += '<tr class="clickable'+(u.id === selectedAdminUser ? ' selected' : '')+'" data-uid="'+u.id+'"><td>'+escapeHtml(u.username)+'</td><td>'+escapeHtml(u.displayName||'')+'</td><td>'+escapeHtml(u.email||'')+'</td><td>'+escapeHtml(u.position||'')+'</td><td class="nowrap">'+roleBadge(u.role)+'</td><td class="row-actions">'+actionBtn('edit','Редактировать',ICON_EDIT)+actionBtn('delete','Удалить',ICON_DELETE)+'</td></tr>';
+  });
+  html += '</tbody>';
+  table.innerHTML = html;
+  initTableSort(table, renderUsersTable);
+
+  table.querySelectorAll('tr[data-uid]').forEach(function(tr){
+    tr.addEventListener('click', function(){
+      selectedAdminUser = parseInt(tr.dataset.uid, 10);
+      renderUsersTable();
+      renderUserProjectsMgmt();
     });
-    table.querySelectorAll('[data-action="delete"]').forEach(function(btn){
-      btn.addEventListener('click', function(e){
-        e.stopPropagation();
-        var uid = parseInt(btn.closest('tr').dataset.uid, 10);
-        askConfirm('Удалить пользователя?', 'Пользователь и все его назначения будут удалены.', function(){
-          apiDelete('/api/users/'+uid).then(function(){
-            if(selectedAdminUser === uid) selectedAdminUser = null;
-            renderUsersTable();
-            renderUserProjectsMgmt();
-            toast('Пользователь удалён');
-          });
+  });
+  table.querySelectorAll('[data-action="delete"]').forEach(function(btn){
+    btn.addEventListener('click', function(e){
+      e.stopPropagation();
+      var uid = parseInt(btn.closest('tr').dataset.uid, 10);
+      askConfirm('Удалить пользователя?', 'Пользователь и все его назначения будут удалены.', function(){
+        apiDelete('/api/users/'+uid).then(function(){
+          if(selectedAdminUser === uid) selectedAdminUser = null;
+          loadUsers();
+          renderUserProjectsMgmt();
+          toast('Пользователь удалён');
         });
       });
     });
-    table.querySelectorAll('[data-action="edit"]').forEach(function(btn){
-      btn.addEventListener('click', function(e){
-        e.stopPropagation();
-        var uid = parseInt(btn.closest('tr').dataset.uid, 10);
-        showEditUserModal(uid);
-      });
+  });
+  table.querySelectorAll('[data-action="edit"]').forEach(function(btn){
+    btn.addEventListener('click', function(e){
+      e.stopPropagation();
+      showEditUserModal(parseInt(btn.closest('tr').dataset.uid, 10));
     });
   });
 }
 
 function showEditUserModal(uid){
-  api('/api/users').then(function(users){
-    var u = users.find(function(x){ return x.id === uid; });
-    if(!u) return;
-    var modal = document.getElementById('confirmModal');
-    document.getElementById('confirmTitle').textContent = 'Редактирование пользователя';
-    document.getElementById('confirmModal').classList.add('profile-modal');
-    document.getElementById('confirmBody').innerHTML =
-      '<div style="display:flex;flex-direction:column;gap:var(--space-4);">'+
-      '<div class="user-form-row">'+
-        '<div class="setting-item"><label class="small">Логин</label><input type="text" id="editUsername" value="'+escapeHtml(u.username||'')+'"></div>'+
-        '<div class="setting-item"><label class="small">Отображаемое имя</label><input type="text" id="editDisplayName" value="'+escapeHtml(u.displayName||'')+'"></div>'+
-      '</div>'+
-      '<div class="user-form-row">'+
-        '<div class="setting-item"><label class="small">Email</label><input type="text" id="editEmail" value="'+escapeHtml(u.email||'')+'"></div>'+
-        '<div class="setting-item"><label class="small">Должность</label><input type="text" id="editPosition" value="'+escapeHtml(u.position||'')+'"></div>'+
-      '</div>'+
-      '<div class="user-form-row">'+
-        '<div class="setting-item"><label class="small">Роль</label><select id="editRole"><option value="user" '+(u.role==='user'?'selected':'')+'>Пользователь</option><option value="manager" '+(u.role==='manager'?'selected':'')+'>Руководитель проекта</option><option value="admin" '+(u.role==='admin'?'selected':'')+'>Администратор</option></select></div>'+
-        '<div class="setting-item"><label class="small">Новый пароль</label><input type="password" id="editPassword" placeholder="Не менять"></div>'+
-      '</div>'+
-      '</div>';
-    var okBtn = document.getElementById('confirmOk');
-    okBtn.textContent = 'Сохранить';
-    modal.classList.add('show');
-    if(currentConfirmHandler){ okBtn.removeEventListener('click', currentConfirmHandler); }
-    var handler = function(){
-      modal.classList.remove('show');
-      modal.classList.remove('profile-modal');
-      okBtn.removeEventListener('click', handler);
-      currentConfirmHandler = null;
+  var u = allUsersCache.find(function(x){ return x.id === uid; });
+  if(!u) return;
+  openModal({
+    title: 'Редактирование пользователя', okLabel: 'Сохранить', wide: true,
+    html: '<div class="form-grid">'+
+      field('Логин', '<input type="text" id="editUsername" value="'+escapeAttr(u.username||'')+'">')+
+      field('Отображаемое имя', '<input type="text" id="editDisplayName" value="'+escapeAttr(u.displayName||'')+'">')+
+      field('Email', '<input type="email" id="editEmail" value="'+escapeAttr(u.email||'')+'">')+
+      field('Должность', '<input type="text" id="editPosition" value="'+escapeAttr(u.position||'')+'">')+
+      field('Роль', '<select id="editRole">'+roleOptions(u.role)+'</select>')+
+      field('Новый пароль', '<input type="password" id="editPassword" placeholder="Не менять" autocomplete="new-password">')+
+      '</div>',
+    onOk: function(){
       var data = {
         username: document.getElementById('editUsername').value.trim(),
         displayName: document.getElementById('editDisplayName').value,
@@ -1302,45 +1250,50 @@ function showEditUserModal(uid){
         position: document.getElementById('editPosition').value,
         role: document.getElementById('editRole').value
       };
+      if(!data.username){ toast('Укажите логин'); return false; }
       var pw = document.getElementById('editPassword').value;
       if(pw) data.password = pw;
       apiPut('/api/users/'+uid, data).then(function(){
         toast('Пользователь обновлён');
-        renderUsersTable();
+        if(currentUser && currentUser.id === uid){
+          Object.assign(currentUser, {username:data.username, displayName:data.displayName, email:data.email, position:data.position, role:data.role});
+          updateRoleUI();
+        }
+        loadUsers();
         renderUserProjectsMgmt();
       });
-    };
-    currentConfirmHandler = handler;
-    okBtn.addEventListener('click', handler);
-    okBtn.addEventListener('click', handler);
+    }
   });
 }
 
 function renderUserProjectsMgmt(){
   var container = document.getElementById('userProjectsMgmt');
   if(!selectedAdminUser){
-    container.innerHTML = '<p style="font-size:var(--text-sm);color:var(--color-text-muted);">Выберите пользователя слева, чтобы настроить ему видимость проектов.</p>';
+    container.innerHTML = '<p class="muted-text">Выберите пользователя в таблице, чтобы настроить ему видимость проектов.</p>';
+    return;
+  }
+  var user = allUsersCache.find(function(u){ return u.id === selectedAdminUser; });
+  if(user && user.role === 'admin'){
+    container.innerHTML = '<p class="muted-text">«'+escapeHtml(user.displayName || user.username)+'» — администратор и видит все проекты с полными правами.</p>';
     return;
   }
   Promise.all([
     api('/api/users/'+selectedAdminUser+'/projects'),
     api('/api/projects')
   ]).then(function(results){
-    var assignments = results[0];
-    var allProjects = results[1];
     var assignedMap = {};
-    assignments.forEach(function(a){ assignedMap[a.projectId] = a.role; });
-    var html = '<p style="font-size:var(--text-sm);color:var(--color-text-muted);margin-bottom:var(--space-3);">Настройте видимость проектов и роли для пользователя:</p>';
-    allProjects.forEach(function(p){
+    results[0].forEach(function(a){ assignedMap[a.projectId] = a.role; });
+    var html = user ? '<p class="muted-text">Пользователь: <b>'+escapeHtml(user.displayName || user.username)+'</b></p>' : '';
+    if(!results[1].length) html += '<p class="muted-text">Проектов пока нет.</p>';
+    results[1].forEach(function(p){
       var role = assignedMap[p.id] || null;
-      var isAssigned = role !== null;
       html += '<div class="assign-row">'+
-        '<label class="small" style="min-width:140px;">'+escapeHtml(p.name)+'</label>'+
-        '<select data-pid="'+p.id+'" '+(isAssigned?'':'disabled')+'>'+
-        '<option value="user" '+(role==='user'?'selected':'')+'>Пользователь (только просмотр)</option>'+
-        '<option value="manager" '+(role==='manager'?'selected':'')+'>Руководитель (редактирование)</option>'+
+        '<span class="assign-name">'+escapeHtml(p.name)+'</span>'+
+        '<select data-pid="'+p.id+'"'+(role?'':' disabled')+'>'+
+        '<option value="user"'+(role==='user'?' selected':'')+'>Пользователь (только просмотр)</option>'+
+        '<option value="manager"'+(role==='manager'?' selected':'')+'>Руководитель (редактирование)</option>'+
         '</select>'+
-        '<button class="btn '+(isAssigned?'btn-danger':'btn-primary')+' btn-sm" data-toggle="'+p.id+'">'+(isAssigned?'Убрать':'Назначить')+'</button>'+
+        '<button class="btn btn-sm '+(role?'btn-danger':'btn-primary')+'" data-toggle="'+p.id+'" data-assigned="'+(role?1:0)+'">'+(role?'Убрать':'Назначить')+'</button>'+
         '</div>';
     });
     container.innerHTML = html;
@@ -1356,39 +1309,59 @@ function renderUserProjectsMgmt(){
     container.querySelectorAll('[data-toggle]').forEach(function(btn){
       btn.addEventListener('click', function(){
         var pid = parseInt(btn.dataset.toggle, 10);
-        if(btn.classList.contains('btn-danger')){
-          apiDelete('/api/users/'+selectedAdminUser+'/projects/'+pid).then(function(){
-            toast('Доступ удалён');
-            renderUserProjectsMgmt();
-          });
-        } else {
-          apiPost('/api/users/'+selectedAdminUser+'/projects', {projectId:pid, role:'user'}).then(function(){
-            toast('Доступ добавлен');
-            renderUserProjectsMgmt();
-          });
-        }
+        var req = btn.dataset.assigned === '1'
+          ? apiDelete('/api/users/'+selectedAdminUser+'/projects/'+pid)
+          : apiPost('/api/users/'+selectedAdminUser+'/projects', {projectId:pid, role:'user'});
+        req.then(function(){
+          toast(btn.dataset.assigned === '1' ? 'Доступ удалён' : 'Доступ добавлен');
+          renderUserProjectsMgmt();
+        });
       });
     });
+  });
+}
+
+function projectFormHtml(p){
+  p = p || {};
+  return '<div class="form-stack">'+
+    field('Название', '<input type="text" id="projectName" value="'+escapeAttr(p.name||'')+'" placeholder="Введите название проекта">')+
+    field('Описание', '<textarea id="projectDesc" rows="3" placeholder="Описание проекта (необязательно)">'+escapeHtml(p.description||'')+'</textarea>')+
+    '</div>';
+}
+function openProjectModal(p){
+  openModal({
+    title: p ? 'Редактирование проекта' : 'Новый проект', okLabel: p ? 'Сохранить' : 'Создать',
+    html: projectFormHtml(p),
+    onOk: function(){
+      var data = {name: document.getElementById('projectName').value.trim(), description: document.getElementById('projectDesc').value};
+      if(!data.name){ toast('Введите название проекта'); return false; }
+      (p ? apiPut('/api/projects/'+p.id, data) : apiPost('/api/projects', data)).then(function(){
+        toast(p ? 'Проект обновлён' : 'Проект добавлен');
+        loadProjects();
+        renderProjectsMgmtTable();
+      });
+    }
   });
 }
 
 function renderProjectsMgmtTable(){
   api('/api/projects').then(function(projs){
     var table = document.getElementById('projectsMgmtTable');
-    var html = '<thead><tr><th class="sortable" data-sort="name">Название ↕</th><th class="sortable" data-sort="description">Описание ↕</th><th></th></tr></thead><tbody>';
-    projs = applyTableSort('projectsMgmtTable', projs);
-    projs.forEach(function(p){
-      html += '<tr><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(p.description||'')+'</td><td class="row-actions"><button class="icon-btn" data-action="edit" data-pid="'+p.id+'" title="Редактировать"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button><button class="icon-btn" data-action="delete" data-pid="'+p.id+'" title="Удалить"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="15" height="15"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0l-1 14a2 2 0 01-2 2H7a2 2 0 01-2-2L4 6h16z"/></svg></button></td></tr>';
+    var html = '<thead><tr><th class="sortable" data-sort="name">Название</th><th class="sortable" data-sort="description">Описание</th><th></th></tr></thead><tbody>';
+    if(!projs.length) html += '<tr><td colspan="3" class="empty-cell">Проектов пока нет.</td></tr>';
+    applyTableSort('projectsMgmtTable', projs).forEach(function(p){
+      html += '<tr data-pid="'+p.id+'"><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(p.description||'')+'</td><td class="row-actions">'+actionBtn('edit','Редактировать',ICON_EDIT)+actionBtn('delete','Удалить',ICON_DELETE)+'</td></tr>';
     });
     html += '</tbody>';
     table.innerHTML = html;
-    initTableSort(table, projs, function(){ renderProjectsMgmtTable(); });
+    initTableSort(table, renderProjectsMgmtTable);
 
+    var projectOf = function(btn){ var pid = parseInt(btn.closest('tr').dataset.pid, 10); return projs.find(function(x){ return x.id === pid; }); };
     table.querySelectorAll('[data-action="delete"]').forEach(function(btn){
       btn.addEventListener('click', function(){
-        var pid = parseInt(btn.dataset.pid, 10);
-        askConfirm('Удалить проект?', 'Проект и все его данные (эпики, замеры, настройки) будут удалены безвозвратно.', function(){
-          apiDelete('/api/projects/'+pid).then(function(){
+        var p = projectOf(btn);
+        askConfirm('Удалить проект «'+p.name+'»?', 'Проект и все его данные (эпики, замеры, настройки) будут удалены безвозвратно.', function(){
+          apiDelete('/api/projects/'+p.id).then(function(){
             toast('Проект удалён');
             loadProjects();
             renderProjectsMgmtTable();
@@ -1397,41 +1370,7 @@ function renderProjectsMgmtTable(){
       });
     });
     table.querySelectorAll('[data-action="edit"]').forEach(function(btn){
-      btn.addEventListener('click', function(){
-        var pid = parseInt(btn.dataset.pid, 10);
-        api('/api/projects').then(function(projs){
-          var p = projs.find(function(x){ return x.id === pid; });
-          if(!p) return;
-          var modal = document.getElementById('confirmModal');
-          modal.classList.add('profile-modal');
-          document.getElementById('confirmTitle').textContent = 'Редактирование проекта';
-          document.getElementById('confirmBody').innerHTML =
-            '<div style="display:flex;flex-direction:column;gap:var(--space-3);">'+
-            '<div class="setting-item"><label class="small">Название</label><input type="text" id="editProjectName" value="'+escapeHtml(p.name)+'"></div>'+
-            '<div class="setting-item"><label class="small">Описание</label><textarea id="editProjectDesc" rows="3" style="width:100%;padding:var(--space-2) var(--space-3);border:1px solid var(--color-border);border-radius:var(--radius-md);font:inherit;font-size:var(--text-sm);resize:vertical;">'+escapeHtml(p.description||'')+'</textarea></div>'+
-            '</div>';
-          var okBtn = document.getElementById('confirmOk');
-          okBtn.textContent = 'Сохранить';
-          modal.classList.add('show');
-          if(currentConfirmHandler){ okBtn.removeEventListener('click', currentConfirmHandler); }
-          var handler = function(){
-            modal.classList.remove('show');
-            modal.classList.remove('profile-modal');
-            okBtn.removeEventListener('click', handler);
-            currentConfirmHandler = null;
-            apiPut('/api/projects/'+pid, {
-              name: document.getElementById('editProjectName').value.trim(),
-              description: document.getElementById('editProjectDesc').value
-            }).then(function(){
-              toast('Проект обновлён');
-              loadProjects();
-              renderProjectsMgmtTable();
-            });
-          };
-          currentConfirmHandler = handler;
-          okBtn.addEventListener('click', handler);
-        });
-      });
+      btn.addEventListener('click', function(){ openProjectModal(projectOf(btn)); });
     });
   });
 }
@@ -1440,8 +1379,7 @@ function renderProjectsMgmtTable(){
    Admin view render
 ════════════════════════════════════════════════════════════════ */
 function renderUsersView(){
-  renderUsersTable();
-  renderUserProjectsMgmt();
+  loadUsers().then(renderUserProjectsMgmt);
 }
 function renderProjectsView(){
   renderProjectsMgmtTable();
@@ -1453,44 +1391,35 @@ function renderProjectsView(){
 function canEdit(){ return currentProjectRole === 'admin' || currentProjectRole === 'manager'; }
 function isGlobalAdmin(){ return currentUser && currentUser.role === 'admin'; }
 
+/* Режим просмотра: поля редактирования блокируются, фильтры (.filter-input и быстрые фильтры) остаются доступны */
 function applyReadonlyToView(viewId){
-  if(canEdit()) return;
   var view = document.getElementById(viewId);
   if(!view) return;
-  view.classList.add('readonly-overlay');
-  view.querySelectorAll('input[type=text], input[type=number]').forEach(function(el){
-    el.setAttribute('readonly', true);
-  });
-  view.querySelectorAll('input[type=checkbox]').forEach(function(el){
-    if(el.closest('.quick-filter')) return; /* фильтры доступны и в режиме просмотра */
-    el.setAttribute('disabled', true);
-  });
-  view.querySelectorAll('input[type=date]').forEach(function(el){
-    if(el.id !== 'burnFrom' && el.id !== 'burnTo'){
-      el.setAttribute('disabled', true);
-    }
+  var readonly = !canEdit();
+  view.classList.toggle('readonly-overlay', readonly);
+  if(!readonly) return;
+  view.querySelectorAll('input, select, textarea').forEach(function(el){
+    if(el.closest('.quick-filter') || el.classList.contains('filter-input')) return;
+    if(el.type === 'text' || el.type === 'number') el.setAttribute('readonly', true);
+    else el.setAttribute('disabled', true);
   });
 }
 
+function userAvatarHtml(user, cls){
+  if(user.photo) return '<img src="'+escapeAttr(user.photo)+'" class="'+cls+' has-photo" alt="">';
+  return '<div class="'+cls+'">'+escapeHtml((user.displayName || user.username || '?').charAt(0).toUpperCase())+'</div>';
+}
+
 function updateRoleUI(){
-  var banner = document.getElementById('readonlyBanner');
-  if(!canEdit() && currentProjectId){
-    banner.style.display = '';
-  } else {
-    banner.style.display = 'none';
-  }
-  document.getElementById('navUsers').style.display = isGlobalAdmin() ? '' : 'none';
-  document.getElementById('navProjects').style.display = isGlobalAdmin() ? '' : 'none';
-  document.getElementById('navAudit').style.display = isGlobalAdmin() ? '' : 'none';
-  document.getElementById('adminNav').style.display = isGlobalAdmin() ? '' : 'none';
+  var admin = isGlobalAdmin();
+  document.getElementById('readonlyBanner').style.display = (!canEdit() && currentProjectId) ? '' : 'none';
+  document.getElementById('adminNav').style.display = admin ? '' : 'none';
+  ['navUsers','navProjects','navAudit','btnExport'].forEach(function(id){ document.getElementById(id).style.display = admin ? '' : 'none'; });
   document.getElementById('navSettings').style.display = canEdit() ? '' : 'none';
-  document.getElementById('btnExport').style.display = isGlobalAdmin() ? '' : 'none';
-  var userInfo = document.getElementById('userInfo');
+  document.getElementById('sectionsNav').style.display = currentProjectId ? '' : 'none';
   if(currentUser){
-    var initials = (currentUser.displayName || currentUser.username || '?').charAt(0).toUpperCase();
-    var roleLabel = currentUser.role === 'admin' ? 'Администратор' : (currentUser.role === 'manager' ? 'Руководитель' : 'Пользователь');
-    var photoHtml = currentUser.photo ? '<img src="'+escapeHtml(currentUser.photo)+'" class="avatar avatar-img">' : '<div class="avatar">'+initials+'</div>';
-    userInfo.innerHTML = photoHtml+'<div>'+escapeHtml(currentUser.displayName||currentUser.username)+'<br><span class="role-badge '+currentUser.role+'">'+roleLabel+'</span></div>';
+    document.getElementById('userInfo').innerHTML = userAvatarHtml(currentUser, 'avatar')+
+      '<div class="user-info-text"><span class="user-info-name">'+escapeHtml(currentUser.displayName||currentUser.username)+'</span>'+roleBadge(currentUser.role)+'</div>';
   }
 }
 
@@ -1500,38 +1429,41 @@ function updateRoleUI(){
 var navItems = document.querySelectorAll('.nav-item');
 var pageTitle = document.getElementById('pageTitle');
 var pageSub = document.getElementById('pageSub');
+var ADMIN_VIEWS = ['users', 'projects', 'audit'];
+var PDF_VIEWS = ['dashboard', 'stages', 'data'];
 var titles = {
   dashboard: ['Дашборд сгорания', 'Свод по эпикам и этапам'],
   stages: ['Свод по этапам', 'Агрегированное сгорание по укрупнённым этапам'],
   data: ['Данные по датам', 'Внесение и редактирование замеров'],
   services: ['Эпики (блоки задач)', 'Список эпиков проекта и целевых дат'],
-  settings: ['Настройки проекта', 'Общие параметры прогноза и метод расчёта burn rate'],
+  settings: ['Настройки проекта', 'Параметры прогноза и расчёта burn rate'],
   users: ['Управление пользователями', 'Пользователи, роли и доступ к проектам'],
-  projects: ['Управление проектами', 'Создание и удаление проектов'],
+  projects: ['Управление проектами', 'Создание, редактирование и удаление проектов'],
   audit: ['Реестр изменений', 'Журнал всех изменений с фильтрами']
 };
 
+function projectTitleSuffix(){
+  var p = projects.find(function(x){ return x.id === currentProjectId; });
+  return p ? ' · ' + p.name : '';
+}
+
 function navigate(view){
-  if((view === 'users' || view === 'projects' || view === 'audit') && !isGlobalAdmin()) return;
+  var isAdminView = ADMIN_VIEWS.indexOf(view) !== -1;
+  if(isAdminView && !isGlobalAdmin()) view = 'dashboard';
+  if(view === 'settings' && !canEdit()) view = 'dashboard';
+  if(!isAdminView && !currentProjectId && isGlobalAdmin()) view = 'projects';
+  currentView = view;
   navItems.forEach(function(n){ n.classList.toggle('active', n.dataset.view === view); });
-  document.querySelectorAll('.view').forEach(function(v){ v.classList.toggle('active', v.id === 'view-'+view); });
-  if(titles[view]){ pageTitle.textContent = titles[view][0]; pageSub.textContent = titles[view][1]; }
-  if(view === 'dashboard') renderDashboard();
-  if(view === 'stages') renderStagesView();
-  if(view === 'data') renderDataView();
-  if(view === 'services') renderServicesView();
-  if(view === 'settings') renderSettingsView();
-  if(view === 'users') renderUsersView();
-  if(view === 'projects') renderProjectsView();
-  if(view === 'audit') renderAuditView();
-  // Show/hide PDF buttons based on current view
-  ['btnPdfDashboard','btnPdfStages','btnPdfData'].forEach(function(id){
-    var el = document.getElementById(id);
-    if(el) el.style.display = 'none';
-  });
-  var pdfMap = {dashboard:'btnPdfDashboard', stages:'btnPdfStages', data:'btnPdfData'};
-  var pdfBtn = document.getElementById(pdfMap[view]);
-  if(pdfBtn) pdfBtn.style.display = '';
+  var viewId = (!currentProjectId && ADMIN_VIEWS.indexOf(view) === -1) ? 'view-empty' : 'view-'+view;
+  document.querySelectorAll('.view').forEach(function(v){ v.classList.toggle('active', v.id === viewId); });
+  if(titles[view]){
+    pageTitle.textContent = titles[view][0];
+    pageSub.textContent = titles[view][1] + (ADMIN_VIEWS.indexOf(view) === -1 ? projectTitleSuffix() : '');
+  }
+  var renderers = {dashboard:renderDashboard, stages:renderStagesView, data:renderDataView, services:renderServicesView,
+    settings:renderSettingsView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:renderAuditTable};
+  if(renderers[view] && (currentProjectId || ADMIN_VIEWS.indexOf(view) !== -1)) renderers[view]();
+  document.getElementById('btnPdf').style.display = (PDF_VIEWS.indexOf(view) !== -1 && currentProjectId) ? '' : 'none';
   if(window.matchMedia('(max-width: 900px)').matches) setSidebarCollapsed(true);
 }
 
@@ -1546,6 +1478,7 @@ navItems.forEach(function(n){
    Dashboard render
 ════════════════════════════════════════════════════════════════ */
 function renderStagesView(){
+  document.getElementById('stageShowDone').checked = stageShowDone;
   buildStagePanelsSkeleton();
   renderStageKpis();
   renderStageSummaryTable();
@@ -1562,23 +1495,20 @@ function renderDashboard(){
   renderEpicCharts();
   renderAllEpicsCharts();
   renderBurnRateTable();
-  applyReadonlyToView('view-dashboard');
 }
 
 /* ── Быстрые фильтры дашборда и свода ────────────────────────── */
 function renderDashboardFilterBar(){
   var box = document.getElementById('dashEpicChecks');
-  if(!box) return;
   document.getElementById('dashHideDone').checked = dashboardFilter.hideDone;
   box.innerHTML = STATE.services.map(function(s){
     var checked = !(dashboardFilter.epics && dashboardFilter.epics[s.id] === false);
-    return '<label class="epic-check'+(s.isDone?' done':'')+'" title="'+escapeAttr(s.etap+' — '+s.name)+'"><input type="checkbox" data-sid="'+s.id+'"'+(checked?' checked':'')+'>'+escapeHtml(s.name)+'</label>';
-  }).join('');
+    return '<label class="epic-check'+(s.isDone?' done':'')+'" title="'+escapeAttr(s.etap+' — '+s.name)+'"><input type="checkbox" data-sid="'+s.id+'"'+(checked?' checked':'')+'><span>'+escapeHtml(s.name)+'</span></label>';
+  }).join('') || '<span class="muted-text">Эпиков нет</span>';
   box.querySelectorAll('input[type=checkbox]').forEach(function(inp){
     inp.addEventListener('change', function(){
-      var sid = parseInt(inp.dataset.sid, 10);
       if(!dashboardFilter.epics) dashboardFilter.epics = {};
-      dashboardFilter.epics[sid] = inp.checked;
+      dashboardFilter.epics[parseInt(inp.dataset.sid, 10)] = inp.checked;
       renderDashboard();
     });
   });
@@ -1612,37 +1542,35 @@ document.getElementById('chartServiceSelect').addEventListener('change', functio
 document.getElementById('epicTargetDate').addEventListener('change', function(e){
   var sid = parseInt(document.getElementById('chartServiceSelect').value, 10);
   var svc = serviceById(sid);
-  if(svc && canEdit()){
-    svc.targetDate = e.target.value;
-    apiPut('/api/services/'+sid, {etap:svc.etap, name:svc.name, targetDate:svc.targetDate}).then(function(){
-      toast('Целевая дата обновлена');
-    });
-    renderEpicCharts();
-    renderSummaryTable();
-    renderKpis();
-  }
+  if(!svc || !canEdit()) return;
+  svc.targetDate = e.target.value;
+  apiPut('/api/services/'+sid, {etap:svc.etap, name:svc.name, targetDate:svc.targetDate, isDone:svc.isDone, stageGroup:svc.stageGroup}).then(function(){
+    toast('Целевая дата обновлена');
+  });
+  renderEpicCharts();
+  renderSummaryTable();
+  renderKpis();
 });
 document.getElementById('dataServiceSelect').addEventListener('change', function(e){
-  currentDataServiceId = parseInt(e.target.value, 10);
+  currentDataServiceId = parseInt(e.target.value, 10) || null;
   renderDataView();
 });
 
 function updateEpicTargetInput(){
-  var sid = parseInt(document.getElementById('chartServiceSelect').value, 10);
-  var svc = serviceById(sid);
+  var svc = serviceById(parseInt(document.getElementById('chartServiceSelect').value, 10));
   var inp = document.getElementById('epicTargetDate');
   inp.value = svc ? (svc.targetDate || '') : '';
-  if(!canEdit()) inp.setAttribute('disabled', true);
+  inp.disabled = !canEdit() || !svc;
 }
 
 document.getElementById('btnAddRow').addEventListener('click', function(){
   if(!canEdit()){ toast('Нет прав на редактирование'); return; }
   if(!currentDataServiceId){ toast('Сначала добавьте эпик'); return; }
   var rows = entriesForService(currentDataServiceId);
-  var lastDate = rows.length ? rows[rows.length-1].date : TODAY;
-  var newDate = rows.length ? addDays(lastDate, 1) : lastDate;
-  apiPost('/api/services/'+currentDataServiceId+'/entries', {date:newDate, remaining:null, spent:null, estimate:null}).then(function(data){
-    STATE.entries.push({id:data.id, service_id:currentDataServiceId, date:newDate, remaining:null, spent:null, estimate:null});
+  var newDate = rows.length ? addDays(rows[rows.length-1].date, 1) : TODAY;
+  var sid = currentDataServiceId;
+  apiPost('/api/services/'+sid+'/entries', {date:newDate, remaining:null, spent:null, estimate:null}).then(function(data){
+    STATE.entries.push({id:data.id, service_id:sid, date:newDate, remaining:null, spent:null, estimate:null});
     renderDataView();
     toast('Добавлена новая дата');
   });
@@ -1650,44 +1578,40 @@ document.getElementById('btnAddRow').addEventListener('click', function(){
 
 document.getElementById('btnAddService').addEventListener('click', function(){
   if(!canEdit()){ toast('Нет прав на редактирование'); return; }
-  apiPost('/api/projects/'+currentProjectId+'/services', {etap:'Этап 5', name:'Новый эпик', targetDate:TODAY}).then(function(data){
-    STATE.services.push({id:data.id, project_id:currentProjectId, etap:'Этап 5', name:'Новый бизнес-процесс', targetDate:TODAY, isDone:false, stageGroup:'', sortOrder:STATE.services.length+1});
+  var last = STATE.services[STATE.services.length-1];
+  var svc = {etap: last ? last.etap : 'Этап 1', name: 'Новый эпик', targetDate: TODAY};
+  apiPost('/api/projects/'+currentProjectId+'/services', svc).then(function(data){
+    var maxOrder = STATE.services.reduce(function(m, s){ return Math.max(m, s.sortOrder||0); }, 0);
+    STATE.services.push(Object.assign(svc, {id:data.id, project_id:currentProjectId, isDone:false, stageGroup:'', sortOrder:maxOrder+1}));
+    if(!currentDataServiceId) currentDataServiceId = data.id;
     renderServicesView();
     populateServiceSelects();
+    renderDashboardFilterBar();
     toast('Эпик добавлен');
   });
 });
 
-document.getElementById('burnResetRange').addEventListener('click', function(){
+/* Диапазон дат таблиц burn rate (дашборд и свод по этапам) */
+function bindBurnRange(fromId, toId, resetId, setRange, render){
+  var fromEl = document.getElementById(fromId), toEl = document.getElementById(toId);
+  var onChange = function(){ setRange({from: fromEl.value || null, to: toEl.value || null}); render(); };
+  fromEl.addEventListener('change', onChange);
+  toEl.addEventListener('change', onChange);
+  document.getElementById(resetId).addEventListener('click', function(){
+    fromEl.value = ''; toEl.value = '';
+    setRange(null); render();
+  });
+}
+bindBurnRange('burnFrom', 'burnTo', 'burnResetRange', function(r){ burnRangeOverride = r; }, renderBurnRateTable);
+bindBurnRange('stageBurnFrom', 'stageBurnTo', 'stageBurnResetRange', function(r){ stageBurnRangeOverride = r; }, renderStageBurnRateTable);
+function resetBurnRanges(){
   burnRangeOverride = null;
-  document.getElementById('burnFrom').value = '';
-  document.getElementById('burnTo').value = '';
-  renderBurnRateTable();
-});
-document.getElementById('burnFrom').addEventListener('change', function(){
-  burnRangeOverride = {from:document.getElementById('burnFrom').value||null, to:document.getElementById('burnTo').value||null};
-  renderBurnRateTable();
-});
-document.getElementById('burnTo').addEventListener('change', function(){
-  burnRangeOverride = {from:document.getElementById('burnFrom').value||null, to:document.getElementById('burnTo').value||null};
-  renderBurnRateTable();
-});
-document.getElementById('stageBurnResetRange').addEventListener('click', function(){
   stageBurnRangeOverride = null;
-  document.getElementById('stageBurnFrom').value = '';
-  document.getElementById('stageBurnTo').value = '';
-  renderStageBurnRateTable();
-});
-document.getElementById('stageBurnFrom').addEventListener('change', function(){
-  stageBurnRangeOverride = {from:document.getElementById('stageBurnFrom').value||null, to:document.getElementById('stageBurnTo').value||null};
-  renderStageBurnRateTable();
-});
-document.getElementById('stageBurnTo').addEventListener('change', function(){
-  stageBurnRangeOverride = {from:document.getElementById('stageBurnFrom').value||null, to:document.getElementById('stageBurnTo').value||null};
-  renderStageBurnRateTable();
-});
+  ['burnFrom','burnTo','stageBurnFrom','stageBurnTo'].forEach(function(id){ document.getElementById(id).value = ''; });
+}
 
 document.getElementById('btnExport').addEventListener('click', function(){
+  if(!currentProjectId){ toast('Нет выбранного проекта'); return; }
   var a = document.createElement('a');
   a.href = '/api/projects/'+currentProjectId+'/export';
   a.download = '';
@@ -1697,260 +1621,190 @@ document.getElementById('btnExport').addEventListener('click', function(){
   toast('Экспорт JSON скачивается');
 });
 
-/* Profile - opens on userInfo click */
-document.getElementById('userInfo').addEventListener('click', function(){
-  var modal = document.getElementById('confirmModal');
-  modal.classList.add('profile-modal');
-  document.getElementById('confirmTitle').textContent = 'Профиль';
-  var initials = (currentUser.displayName || currentUser.username || '?').charAt(0).toUpperCase();
-  var photoHtml = currentUser.photo 
-    ? '<img src="'+escapeHtml(currentUser.photo)+'" class="profile-avatar has-photo" alt="Фото">'
-    : '<div class="profile-avatar">'+initials+'</div>';
-  var roleLabel = currentUser.role === 'admin' ? 'Администратор' : (currentUser.role === 'manager' ? 'Руководитель' : 'Пользователь');
-  document.getElementById('confirmBody').innerHTML =
-    '<div class="profile-grid">'+
-      '<div class="profile-photo-section">'+
-        photoHtml+
-        '<div class="profile-photo-btns">'+
-          '<label class="btn btn-ghost btn-sm" style="cursor:pointer;text-align:center;">Загрузить фото<input type="file" accept="image/*" id="profilePhotoFile" style="display:none;"></label>'+
-          (currentUser.photo ? '<button class="btn btn-ghost btn-sm" id="profileDeletePhoto" style="color:var(--color-error);">Удалить фото</button>' : '')+
-        '</div>'+
-        '<div class="profile-photo-hint">JPG или PNG, до 1,5 МБ</div>'+
-      '</div>'+
-      '<div class="profile-fields">'+
-        '<div>'+
-          '<div class="profile-section-title">Учётная запись</div>'+
-          '<div class="profile-info-row"><span class="profile-info-label">Логин</span><span class="profile-info-value">'+escapeHtml(currentUser.username)+'</span></div>'+
-          '<div class="profile-info-row"><span class="profile-info-label">Роль</span><span class="profile-info-value"><span class="role-badge '+currentUser.role+'">'+roleLabel+'</span></span></div>'+
-        '</div>'+
-        '<div>'+
-          '<div class="profile-section-title">Личные данные</div>'+
-          '<div class="setting-item"><label class="small">ФИО</label><input type="text" id="profileDisplayName" value="'+escapeHtml(currentUser.displayName||'')+'" '+(isGlobalAdmin()?'':'disabled')+'></div>'+
-          '<div class="setting-item"><label class="small">Email</label><input type="text" id="profileEmail" value="'+escapeHtml(currentUser.email||'')+'" '+(isGlobalAdmin()?'':'disabled')+'></div>'+
-          '<div class="setting-item"><label class="small">Должность</label><input type="text" id="profilePosition" value="'+escapeHtml(currentUser.position||'')+'" '+(isGlobalAdmin()?'':'disabled')+'></div>'+
-          '<div class="setting-item" style="margin-top:var(--space-3);"><label class="small">Новый пароль</label><input type="password" id="profilePassword" placeholder="Не менять"></div>'+
-        '</div>'+
-      '</div>'+
-    '</div>';
-  var okBtn = document.getElementById('confirmOk');
-  okBtn.textContent = 'Сохранить';
-  modal.classList.add('show');
-  if(currentConfirmHandler){ okBtn.removeEventListener('click', currentConfirmHandler); }
+/* Чтение фото с проверкой размера; cb(dataUrl) */
+var MAX_PHOTO_BYTES = 1572864;
+function readPhoto(file, cb){
+  if(!file) return;
+  if(file.size > MAX_PHOTO_BYTES){ toast('Файл слишком большой (макс. 1,5 МБ)'); return; }
+  var reader = new FileReader();
+  reader.onload = function(ev){ cb(ev.target.result); };
+  reader.readAsDataURL(file);
+}
 
-  /* File upload handler */
-  var fileInput = document.getElementById('profilePhotoFile');
-  if(fileInput){
-    fileInput.addEventListener('change', function(e){
-      var file = e.target.files[0];
-      if(!file) return;
-      if(file.size > 1572864){ toast('Файл слишком большой (макс. 1,5 МБ)'); return; }
-      var reader = new FileReader();
-      reader.onload = function(ev){
-        var imgEl = document.querySelector('.profile-avatar');
-        if(imgEl){
-          imgEl.outerHTML = '<img src="'+ev.target.result+'" class="profile-avatar has-photo" alt="Фото">';
-        }
-        document.getElementById('profilePhotoFile').dataset.photoData = ev.target.result;
-      };
-      reader.readAsDataURL(file);
-    });
-  }
-
-  /* Delete photo handler */
-  var delPhotoBtn = document.getElementById('profileDeletePhoto');
-  if(delPhotoBtn){
-    delPhotoBtn.addEventListener('click', function(){
-      var imgEl = document.querySelector('.profile-avatar');
-      if(imgEl){
-        var initials2 = (currentUser.displayName || currentUser.username || '?').charAt(0).toUpperCase();
-        imgEl.outerHTML = '<div class="profile-avatar">'+initials2+'</div>';
+/* Профиль — открывается по клику на блок пользователя */
+function openProfile(){
+  var admin = isGlobalAdmin();
+  var photo = currentUser.photo || '';  /* итоговое фото после правок в окне */
+  var dis = admin ? '' : ' disabled';
+  openModal({
+    title: 'Профиль', okLabel: 'Сохранить', wide: true,
+    html:
+      '<div class="profile-grid">'+
+        '<div class="profile-photo-section">'+
+          '<div id="profileAvatarBox">'+userAvatarHtml(currentUser, 'profile-avatar')+'</div>'+
+          '<div class="profile-photo-btns">'+
+            '<label class="btn btn-ghost btn-sm">Загрузить фото<input type="file" accept="image/*" id="profilePhotoFile" hidden></label>'+
+            '<button type="button" class="btn btn-ghost btn-sm text-danger" id="profileDeletePhoto"'+(photo?'':' hidden')+'>Удалить фото</button>'+
+          '</div>'+
+          '<div class="profile-photo-hint">JPG или PNG, до 1,5 МБ</div>'+
+        '</div>'+
+        '<div class="profile-fields">'+
+          '<div>'+
+            '<div class="profile-section-title">Учётная запись</div>'+
+            '<div class="profile-info-row"><span class="profile-info-label">Логин</span><span class="profile-info-value">'+escapeHtml(currentUser.username)+'</span></div>'+
+            '<div class="profile-info-row"><span class="profile-info-label">Роль</span><span class="profile-info-value">'+roleBadge(currentUser.role)+'</span></div>'+
+          '</div>'+
+          '<div class="form-stack">'+
+            '<div class="profile-section-title">Личные данные</div>'+
+            field('ФИО', '<input type="text" id="profileDisplayName" value="'+escapeAttr(currentUser.displayName||'')+'"'+dis+'>')+
+            field('Email', '<input type="email" id="profileEmail" value="'+escapeAttr(currentUser.email||'')+'"'+dis+'>')+
+            field('Должность', '<input type="text" id="profilePosition" value="'+escapeAttr(currentUser.position||'')+'"'+dis+'>')+
+            field('Новый пароль', '<input type="password" id="profilePassword" placeholder="Не менять" autocomplete="new-password">')+
+          '</div>'+
+        '</div>'+
+      '</div>',
+    onOk: function(){
+      var data = {};
+      if(photo !== (currentUser.photo || '')) data.photo = photo;
+      if(admin){
+        data.displayName = document.getElementById('profileDisplayName').value;
+        data.email = document.getElementById('profileEmail').value;
+        data.position = document.getElementById('profilePosition').value;
       }
-      if(document.getElementById('profilePhotoFile')){
-        document.getElementById('profilePhotoFile').dataset.photoData = '';
-      }
-    });
-  }
+      var pw = document.getElementById('profilePassword').value;
+      if(pw) data.password = pw;
+      apiPut('/api/profile', data).then(function(){
+        Object.assign(currentUser, data);
+        delete currentUser.password;
+        updateRoleUI();
+        toast('Профиль обновлён');
+      });
+    }
+  });
 
-  var handler = function(){
-    modal.classList.remove('show');
-    modal.classList.remove('profile-modal');
-    okBtn.removeEventListener('click', handler);
-    currentConfirmHandler = null;
-    var photoData = '';
-    if(document.getElementById('profilePhotoFile')){
-      photoData = document.getElementById('profilePhotoFile').dataset.photoData || '';
-    }
-    var data = {};
-    if(photoData !== '') data.photo = photoData;
-    if(isGlobalAdmin()){
-      data.displayName = document.getElementById('profileDisplayName').value;
-      data.email = document.getElementById('profileEmail').value;
-      data.position = document.getElementById('profilePosition').value;
-    }
-    var pw = document.getElementById('profilePassword').value;
-    if(pw) data.password = pw;
-    /* If admin editing own profile, also save display/email/position via profile endpoint */
-    apiPut('/api/profile', data).then(function(){
-      if(photoData !== '') currentUser.photo = photoData;
-      if(photoData === '' && document.getElementById('profileDeletePhoto')) currentUser.photo = '';
-      updateRoleUI();
-      toast('Профиль обновлён');
-    });
+  var avatarBox = document.getElementById('profileAvatarBox');
+  var delBtn = document.getElementById('profileDeletePhoto');
+  var showPhoto = function(){
+    avatarBox.innerHTML = userAvatarHtml({photo:photo, displayName:currentUser.displayName, username:currentUser.username}, 'profile-avatar');
+    delBtn.hidden = !photo;
   };
-  currentConfirmHandler = handler;
-  okBtn.addEventListener('click', handler);
-});
+  document.getElementById('profilePhotoFile').addEventListener('change', function(e){
+    readPhoto(e.target.files[0], function(dataUrl){ photo = dataUrl; showPhoto(); });
+  });
+  delBtn.addEventListener('click', function(){ photo = ''; showPhoto(); });
+}
+var userInfoEl = document.getElementById('userInfo');
+userInfoEl.addEventListener('click', function(){ if(currentUser) openProfile(); });
+userInfoEl.addEventListener('keydown', function(e){ if((e.key === 'Enter' || e.key === ' ') && currentUser){ e.preventDefault(); openProfile(); } });
 
 /* Add user form */
+var newUserPhoto = '';
+function resetNewUserPhoto(){
+  newUserPhoto = '';
+  document.getElementById('newUserPhotoPreview').innerHTML = '?';
+  document.getElementById('newUserPhotoFile').value = '';
+}
 document.getElementById('addUserForm').addEventListener('submit', function(e){
   e.preventDefault();
   var username = document.getElementById('newUsername').value.trim();
   var password = document.getElementById('newPassword').value;
   if(!username || !password){ toast('Укажите логин и пароль'); return; }
-  var photoData = '';
-  var fileInput = document.getElementById('newUserPhotoFile');
-  if(fileInput && fileInput.dataset.photoData) photoData = fileInput.dataset.photoData;
   apiPost('/api/users', {
     username:username, password:password,
     displayName:document.getElementById('newDisplayName').value,
     email:document.getElementById('newEmail').value,
     position:document.getElementById('newPosition').value,
     role:document.getElementById('newRole').value,
-    photo:photoData
-  }).then(function(){
+    photo:newUserPhoto
+  }).then(function(data){
     document.getElementById('addUserForm').reset();
-    var preview = document.getElementById('newUserPhotoPreview');
-    if(preview){ preview.textContent='?'; preview.style.background='var(--color-surface-offset)'; preview.classList.remove('has-photo'); }
-    var fileInput2 = document.getElementById('newUserPhotoFile');
-    if(fileInput2){ fileInput2.dataset.photoData=''; fileInput2.value=''; }
+    resetNewUserPhoto();
+    selectedAdminUser = data.id;
     toast('Пользователь добавлен');
-    renderUsersTable();
-  }).catch(function(){ toast('Ошибка: логин уже существует'); });
+    loadUsers().then(renderUserProjectsMgmt);
+  });
 });
 
 /* New user photo upload */
 document.getElementById('newUserPhotoFile').addEventListener('change', function(e){
-  var file = e.target.files[0];
-  if(!file) return;
-  if(file.size > 1572864){ toast('Файл слишком большой (макс. 1,5 МБ)'); return; }
-  var reader = new FileReader();
-  reader.onload = function(ev){
-    var preview = document.getElementById('newUserPhotoPreview');
-    if(preview){
-      preview.innerHTML = '<img src="'+ev.target.result+'" style="width:48px;height:48px;border-radius:50%;object-fit:cover;">';
-    }
-    e.target.dataset.photoData = ev.target.result;
-  };
-  reader.readAsDataURL(file);
+  readPhoto(e.target.files[0], function(dataUrl){
+    newUserPhoto = dataUrl;
+    document.getElementById('newUserPhotoPreview').innerHTML = '<img src="'+escapeAttr(dataUrl)+'" alt="">';
+  });
 });
 
 /* User search */
-document.getElementById('userSearch').addEventListener('input', function(){
-  renderUsersTable();
-});
+document.getElementById('userSearch').addEventListener('input', renderUsersTable);
 
 /* Add project */
-document.getElementById('btnAddProject').addEventListener('click', function(){
-  var modal = document.getElementById('confirmModal');
-  modal.classList.add('profile-modal');
-  document.getElementById('confirmTitle').textContent = 'Новый проект';
-  document.getElementById('confirmBody').innerHTML =
-    '<div style="display:flex;flex-direction:column;gap:var(--space-3);">'+
-    '<div class="setting-item"><label class="small">Название</label><input type="text" id="newProjectName" placeholder="Введите название проекта"></div>'+
-    '<div class="setting-item"><label class="small">Описание</label><textarea id="newProjectDesc" rows="3" placeholder="Описание проекта (необязательно)" style="width:100%;padding:var(--space-2) var(--space-3);border:1px solid var(--color-border);border-radius:var(--radius-md);font:inherit;font-size:var(--text-sm);resize:vertical;"></textarea></div>'+
-    '</div>';
-  var okBtn = document.getElementById('confirmOk');
-  okBtn.textContent = 'Создать';
-  modal.classList.add('show');
-  if(currentConfirmHandler){ okBtn.removeEventListener('click', currentConfirmHandler); }
-  var handler = function(){
-    var name = document.getElementById('newProjectName').value.trim();
-    var desc = document.getElementById('newProjectDesc').value;
-    if(!name){ toast('Введите название проекта'); return; }
-    modal.classList.remove('show');
-    modal.classList.remove('profile-modal');
-    okBtn.removeEventListener('click', handler);
-    currentConfirmHandler = null;
-    apiPost('/api/projects', {name:name, description:desc}).then(function(){
-      toast('Проект добавлен');
-      loadProjects();
-      renderProjectsMgmtTable();
-    });
-  };
-  currentConfirmHandler = handler;
-  okBtn.addEventListener('click', handler);
-});
+document.getElementById('btnAddProject').addEventListener('click', function(){ openProjectModal(null); });
 
 /* ════════════════════════════════════════════════════════════════
    Project loading & switching
 ════════════════════════════════════════════════════════════════ */
 function renderProjectsNav(){
   var nav = document.getElementById('projectsNav');
+  var html = '<div class="nav-label">Проекты</div>';
   if(!projects.length){
-    nav.innerHTML = '<div class="nav-label">Проекты</div><div style="font-size:var(--text-xs);color:var(--color-text-faint);padding:0 var(--space-3);">Нет доступных проектов</div>';
+    nav.innerHTML = html + '<div class="nav-empty">Нет доступных проектов</div>';
     return;
   }
   var palette = colorPalette();
-  var html = '<div class="nav-label">Проекты</div>';
   projects.forEach(function(p, i){
-    var color = palette[i % palette.length];
-    var active = p.id === currentProjectId ? ' active' : '';
-    html += '<div class="nav-project'+active+'" data-pid="'+p.id+'"><span class="dot" style="background:'+color+'"></span>'+escapeHtml(p.name)+'</div>';
+    html += '<a href="#" class="nav-project'+(p.id === currentProjectId ? ' active' : '')+'" data-pid="'+p.id+'" title="'+escapeAttr(p.description||p.name)+'"><span class="dot" style="background:'+palette[i % palette.length]+'"></span><span class="nav-project-name">'+escapeHtml(p.name)+'</span></a>';
   });
   nav.innerHTML = html;
-
   nav.querySelectorAll('.nav-project').forEach(function(el){
-    el.addEventListener('click', function(){
+    el.addEventListener('click', function(e){
+      e.preventDefault();
       switchProject(parseInt(el.dataset.pid, 10));
     });
   });
 }
 
 function switchProject(pid){
-  if(pid === currentProjectId) return;
-  currentProjectId = pid;
+  if(pid === currentProjectId){ if(ADMIN_VIEWS.indexOf(currentView) !== -1) navigate('dashboard'); return; }
   var proj = projects.find(function(p){ return p.id === pid; });
+  currentProjectId = pid;
   currentProjectRole = proj ? proj.role : null;
   currentDataServiceId = null;
-  burnRangeOverride = null;
   dashboardFilter = { hideDone: dashboardFilter.hideDone, epics: null };
   stageShowDone = false;
-  var stCb = document.getElementById('stageShowDone');
-  if(stCb) stCb.checked = false;
-  document.getElementById('burnFrom').value = '';
-  document.getElementById('burnTo').value = '';
-  loadProjectData(pid);
+  resetBurnRanges();
   renderProjectsNav();
   updateRoleUI();
+  /* из админ-разделов переходим к данным выбранного проекта */
+  loadProjectData(pid, ADMIN_VIEWS.indexOf(currentView) !== -1 ? 'dashboard' : currentView);
 }
 
-function loadProjectData(pid){
-  api('/api/projects/'+pid+'/data').then(function(data){
+function loadProjectData(pid, view){
+  return api('/api/projects/'+pid+'/data').then(function(data){
+    if(pid !== currentProjectId) return; /* пользователь успел переключить проект */
     STATE.services = data.services || [];
     STATE.entries = data.entries || [];
     STATE.stageTargets = data.stageTargets || {};
     STATE.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings || {});
-    currentDataServiceId = STATE.services.length ? STATE.services[0].id : null;
-    navigate('dashboard');
+    if(!serviceById(currentDataServiceId)) currentDataServiceId = STATE.services.length ? STATE.services[0].id : null;
+    navigate(view || currentView);
   });
 }
 
 function loadProjects(){
-  api('/api/projects').then(function(projs){
+  return api('/api/projects').then(function(projs){
     projects = projs;
-    if(!projects.length){
-      currentProjectId = null;
-      renderProjectsNav();
-      return;
+    var proj = projects.find(function(p){ return p.id === currentProjectId; });
+    if(!proj && projects.length){
+      proj = projects[0];
+      resetBurnRanges();
+      dashboardFilter.epics = null;
     }
-    if(!currentProjectId || !projects.find(function(p){ return p.id === currentProjectId; })){
-      currentProjectId = projects[0].id;
-      var proj = projects[0];
-      currentProjectRole = proj.role;
-    }
+    currentProjectId = proj ? proj.id : null;
+    currentProjectRole = proj ? proj.role : null;
     renderProjectsNav();
     updateRoleUI();
-    loadProjectData(currentProjectId);
+    if(currentProjectId) return loadProjectData(currentProjectId);
+    STATE = { services:[], entries:[], stageTargets:{}, settings:Object.assign({}, DEFAULT_SETTINGS) };
+    navigate(currentView);
   });
 }
 
@@ -1967,8 +1821,6 @@ function init(){
   });
 }
 
-init();
-
 /* ════════════════════════════════════════════════════════════════
    Audit log
 ════════════════════════════════════════════════════════════════ */
@@ -1977,70 +1829,77 @@ var auditPageLabels = {
   services: 'Эпики', settings: 'Настройки', users: 'Пользователи',
   projects: 'Проекты', profile: 'Профиль'
 };
-function renderAuditView(){
-  renderAuditTable();
+var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление' };
+/* В БД время хранится в UTC (CURRENT_TIMESTAMP) — показываем в локальном часовом поясе */
+function fmtDateTime(ts){
+  if(!ts) return '—';
+  var d = new Date(ts.replace(' ', 'T') + 'Z');
+  if(isNaN(d)) return ts;
+  return localIsoDate(d).split('-').reverse().join('.') + ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+}
+function fillSelect(sel, allLabel, items){
+  var cur = sel.value;
+  sel.innerHTML = '<option value="">'+allLabel+'</option>' + items.map(function(it){
+    return '<option value="'+escapeAttr(it.value)+'">'+escapeHtml(it.label)+'</option>';
+  }).join('');
+  sel.value = items.some(function(it){ return String(it.value) === cur; }) ? cur : '';
 }
 function renderAuditTable(){
+  var selU = document.getElementById('auditFilterUser');
+  var selP = document.getElementById('auditFilterPage');
+  var selPr = document.getElementById('auditFilterProject');
   var params = new URLSearchParams();
-  var fu = document.getElementById('auditFilterUser').value;
-  var fp = document.getElementById('auditFilterPage').value;
-  var fpr = document.getElementById('auditFilterProject').value;
-  if(fu) params.set('username', fu);
-  if(fp) params.set('page', fp);
-  if(fpr) params.set('projectId', fpr);
+  if(selU.value) params.set('username', selU.value);
+  if(selP.value) params.set('page', selP.value);
+  if(selPr.value) params.set('projectId', selPr.value);
   api('/api/audit' + (params.toString() ? '?' + params.toString() : '')).then(function(data){
     var table = document.getElementById('auditLogTable');
-    var selU = document.getElementById('auditFilterUser');
-    var selP = document.getElementById('auditFilterPage');
-    var selPr = document.getElementById('auditFilterProject');
-    var curU = selU.value, curP = selP.value, curPr = selPr.value;
-    selU.innerHTML = '<option value="">Все авторы</option>' + data.filters.usernames.map(function(u){ return '<option value="'+escapeHtml(u)+'"'+(u===curU?' selected':'')+'>'+escapeHtml(u)+'</option>'; }).join('');
-    selP.innerHTML = '<option value="">Все страницы</option>' + data.filters.pages.map(function(p){ return '<option value="'+escapeHtml(p)+'"'+(p===curP?' selected':'')+'>'+(auditPageLabels[p]||escapeHtml(p))+'</option>'; }).join('');
-    selPr.innerHTML = '<option value="">Все проекты</option>' + data.filters.projects.map(function(p){ return '<option value="'+p.id+'"'+(String(p.id)===curPr?' selected':'')+'>'+escapeHtml(p.name)+'</option>'; }).join('');
-    selU.value = curU; selP.value = curP; selPr.value = curPr;
-    if(!data.entries.length){
-      table.innerHTML = '<thead><tr><th>Нет данных</th></tr></thead><tbody><tr><td style="color:var(--color-text-muted);">Изменений пока не зафиксировано.</td></tr></tbody>';
-      return;
-    }
-    var html = '<thead><tr><th class="sortable" data-sort="createdAt">Дата/время ↕</th><th class="sortable" data-sort="username">Автор ↕</th><th class="sortable" data-sort="projectName">Проект ↕</th><th class="sortable" data-sort="page">Страница ↕</th><th class="sortable" data-sort="action">Действие ↕</th><th>Сущность</th><th class="sortable" data-sort="fieldName">Поле ↕</th><th class="sortable" data-sort="oldValue">Было ↕</th><th class="sortable" data-sort="newValue">Стало ↕</th></tr></thead><tbody>';
-    var entries = applyTableSort('auditLogTable', data.entries);
-    entries.forEach(function(e){
-      var entityStr = e.entityType ? escapeHtml(e.entityType) + (e.entityName ? ' / ' + escapeHtml(e.entityName) : '') + ' #' + (e.entityId || '') : '—';
+    fillSelect(selU, 'Все авторы', data.filters.usernames.map(function(u){ return {value:u, label:u}; }));
+    fillSelect(selP, 'Все страницы', data.filters.pages.map(function(p){ return {value:p, label:auditPageLabels[p] || p}; }));
+    fillSelect(selPr, 'Все проекты', data.filters.projects.map(function(p){ return {value:p.id, label:p.name}; }));
+    if(!data.entries.length){ emptyTable(table, 'Нет данных', 'Изменений пока не зафиксировано.'); return; }
+    var html = '<thead><tr><th class="sortable" data-sort="createdAt">Дата/время</th><th class="sortable" data-sort="username">Автор</th><th class="sortable" data-sort="projectName">Проект</th><th class="sortable" data-sort="page">Страница</th><th class="sortable" data-sort="action">Действие</th><th>Сущность</th><th class="sortable" data-sort="fieldName">Поле</th><th class="sortable" data-sort="oldValue">Было</th><th class="sortable" data-sort="newValue">Стало</th></tr></thead><tbody>';
+    applyTableSort('auditLogTable', data.entries).forEach(function(e){
+      var entityStr = e.entityType ? escapeHtml(e.entityType) + (e.entityName ? ' / ' + escapeHtml(e.entityName) : '') + (e.entityId ? ' #' + e.entityId : '') : '—';
       html += '<tr>'+
-        '<td class="mono" style="white-space:nowrap;">'+escapeHtml(e.createdAt||'')+'</td>'+
+        '<td class="mono nowrap">'+fmtDateTime(e.createdAt)+'</td>'+
         '<td>'+escapeHtml(e.username||'')+'</td>'+
         '<td>'+escapeHtml(e.projectName||'—')+'</td>'+
-        '<td>'+(auditPageLabels[e.page]||escapeHtml(e.page||''))+'</td>'+
-        '<td>'+escapeHtml(e.action||'')+'</td>'+
+        '<td>'+escapeHtml(auditPageLabels[e.page]||e.page||'')+'</td>'+
+        '<td>'+escapeHtml(auditActionLabels[e.action]||e.action||'')+'</td>'+
         '<td>'+entityStr+'</td>'+
         '<td>'+escapeHtml(e.fieldName||'—')+'</td>'+
-        '<td style="color:var(--color-text-muted);">'+escapeHtml(e.oldValue||'—')+'</td>'+
-        '<td style="font-weight:500;">'+escapeHtml(e.newValue||'—')+'</td>'+
+        '<td class="muted-cell">'+escapeHtml(e.oldValue||'—')+'</td>'+
+        '<td class="strong-cell">'+escapeHtml(e.newValue||'—')+'</td>'+
       '</tr>';
     });
     html += '</tbody>';
     table.innerHTML = html;
-    initTableSort(table, entries, function(){ renderAuditTable(); });
+    initTableSort(table, renderAuditTable);
   });
 }
-document.getElementById('auditFilterUser').addEventListener('change', renderAuditTable);
-document.getElementById('auditFilterPage').addEventListener('change', renderAuditTable);
-document.getElementById('auditFilterProject').addEventListener('change', renderAuditTable);
+['auditFilterUser','auditFilterPage','auditFilterProject'].forEach(function(id){
+  document.getElementById(id).addEventListener('change', renderAuditTable);
+});
 document.getElementById('auditResetFilters').addEventListener('click', function(){
-  document.getElementById('auditFilterUser').value = '';
-  document.getElementById('auditFilterPage').value = '';
-  document.getElementById('auditFilterProject').value = '';
+  ['auditFilterUser','auditFilterPage','auditFilterProject'].forEach(function(id){ document.getElementById(id).value = ''; });
   renderAuditTable();
 });
 
 /* ════════════════════════════════════════════════════════════════
-   PDF export
+   PDF export — учитывает текущие фильтры дашборда и свода по этапам
 ════════════════════════════════════════════════════════════════ */
-function exportPdf(page){
-  window.open('/api/projects/'+currentProjectId+'/pdf?page='+page, '_blank');
-}
-document.getElementById('btnPdfDashboard').addEventListener('click', function(){ exportPdf('dashboard'); });
-document.getElementById('btnPdfStages').addEventListener('click', function(){ exportPdf('stages'); });
-document.getElementById('btnPdfData').addEventListener('click', function(){ exportPdf('data'); });
+document.getElementById('btnPdf').addEventListener('click', function(){
+  if(!currentProjectId) return;
+  var params = new URLSearchParams({page: currentView});
+  if(currentView === 'dashboard'){
+    params.set('epics', visibleDashboardServices().map(function(s){ return s.id; }).join(','));
+  } else if(currentView === 'stages' && stageShowDone){
+    params.set('showDone', '1');
+  }
+  window.open('/api/projects/'+currentProjectId+'/pdf?'+params.toString(), '_blank');
+});
+
+init();
 
 })();

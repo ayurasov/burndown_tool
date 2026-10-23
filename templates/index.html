@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Диаграммы сгорания (burndown)</title>
 <link rel="icon" type="image/svg+xml" href="/static/img/favicon.svg">
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('burndown-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'));}catch(e){}</script>
+<link rel="preconnect" href="https://api.fontshare.com" crossorigin>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600,700&display=swap" rel="stylesheet">
@@ -15,12 +17,12 @@
 </head>
 <body>
 <div class="modal-overlay" id="confirmModal">
-  <div class="modal">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
     <h3 id="confirmTitle">Подтвердите действие</h3>
-    <p id="confirmBody"></p>
+    <div class="modal-body" id="confirmBody"></div>
     <div class="modal-actions">
-      <button class="btn btn-ghost" id="confirmCancel">Отмена</button>
-      <button class="btn btn-danger" id="confirmOk">Удалить</button>
+      <button type="button" class="btn btn-ghost" id="confirmCancel">Отмена</button>
+      <button type="button" class="btn btn-danger" id="confirmOk">Удалить</button>
     </div>
   </div>
 </div>
@@ -28,7 +30,7 @@
   <div class="sidebar-scrim" id="sidebarScrim"></div>
   <aside class="sidebar">
     <div class="brand">
-      <svg viewBox="0 0 32 32" fill="none" aria-label="Логотип" width="32" height="32"><rect width="32" height="32" rx="7" fill="currentColor"/><path d="M7 21 L13 14 L17 17 L24 9" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M24 9 L24 13 M24 9 L20 9" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round"/><path d="M7 24 L24 24" stroke="#fff" stroke-width="1.5" opacity="0.5"/></svg>
+      <svg viewBox="0 0 32 32" fill="none" aria-hidden="true" width="32" height="32"><rect width="32" height="32" rx="7" fill="currentColor"/><path d="M7 21 L13 14 L17 17 L24 9" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M24 9 L24 13 M24 9 L20 9" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round"/><path d="M7 24 L24 24" stroke="#fff" stroke-width="1.5" opacity="0.5"/></svg>
       <div>
         <div class="brand-title">Burndown</div>
         <div class="brand-sub">Сгорание работ по эпикам</div>
@@ -41,32 +43,34 @@
 
     <nav class="nav-group" id="sectionsNav">
       <div class="nav-label">Данные проекта</div>
-      <a class="nav-item active" data-view="dashboard">Дашборд <span class="chip" id="navServiceCount">0</span></a>
-      <a class="nav-item" data-view="stages">Свод по этапам</a>
-      <a class="nav-item" data-view="data">Данные по датам</a>
-      <a class="nav-item" data-view="services">Эпики (блоки задач)</a>
-      <a class="nav-item" data-view="settings" id="navSettings">Настройки проекта</a>
+      <a href="#" class="nav-item active" data-view="dashboard">Дашборд <span class="chip" id="navServiceCount" title="Эпиков в проекте">0</span></a>
+      <a href="#" class="nav-item" data-view="stages">Свод по этапам</a>
+      <a href="#" class="nav-item" data-view="data">Данные по датам</a>
+      <a href="#" class="nav-item" data-view="services">Эпики (блоки задач)</a>
+      <a href="#" class="nav-item" data-view="settings" id="navSettings">Настройки проекта</a>
     </nav>
 
-    <nav class="nav-group" id="adminNav">
+    <nav class="nav-group" id="adminNav" style="display:none;">
       <div class="nav-label">Администрирование</div>
-      <a class="nav-item" data-view="users" id="navUsers" style="display:none;">Управление пользователями</a>
-      <a class="nav-item" data-view="projects" id="navProjects" style="display:none;">Управление проектами</a>
-      <a class="nav-item" data-view="audit" id="navAudit" style="display:none;">Реестр изменений</a>
+      <a href="#" class="nav-item" data-view="users" id="navUsers">Пользователи</a>
+      <a href="#" class="nav-item" data-view="projects" id="navProjects">Проекты</a>
+      <a href="#" class="nav-item" data-view="audit" id="navAudit">Реестр изменений</a>
     </nav>
 
     <div class="sidebar-actions">
-      <div class="user-info" id="userInfo"></div>
-      <button class="btn btn-ghost btn-sm" id="btnExport">⬇ Экспорт JSON</button>
-      <button class="btn btn-ghost btn-sm" id="btnLogout">⏻ Выйти</button>
+      <div class="user-info" id="userInfo" role="button" tabindex="0" title="Профиль"></div>
+      <div class="sidebar-buttons">
+        <button type="button" class="btn btn-ghost btn-sm" id="btnExport" style="display:none;" title="Экспорт данных текущего проекта">⬇ JSON</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="btnLogout">⏻ Выйти</button>
+      </div>
       <div class="sidebar-copyright">© Alexander Yurasov</div>
     </div>
   </aside>
 
   <main class="main">
     <div class="topbar">
-      <div style="display:flex;align-items:center;gap:var(--space-3);">
-        <button class="sidebar-toggle" id="sidebarToggle" aria-label="Свернуть/развернуть меню">
+      <div class="topbar-title">
+        <button type="button" class="sidebar-toggle" id="sidebarToggle" aria-label="Свернуть/развернуть меню">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
         </button>
         <div>
@@ -75,10 +79,8 @@
         </div>
       </div>
       <div class="topbar-actions">
-        <button class="btn btn-ghost btn-sm" id="btnPdfDashboard" style="display:none;">⬇ PDF</button>
-        <button class="btn btn-ghost btn-sm" id="btnPdfStages" style="display:none;">⬇ PDF</button>
-        <button class="btn btn-ghost btn-sm" id="btnPdfData" style="display:none;">⬇ PDF</button>
-        <button class="theme-toggle" id="themeToggle" aria-label="Переключить тему"></button>
+        <button type="button" class="btn btn-ghost btn-sm" id="btnPdf" style="display:none;" title="Выгрузить раздел в PDF с учётом фильтров">⬇ PDF</button>
+        <button type="button" class="theme-toggle" id="themeToggle" aria-label="Переключить тему"></button>
       </div>
     </div>
 
@@ -90,10 +92,12 @@
         <div class="quick-filter-row">
           <label class="quick-filter-item" title="Сданные эпики не будут учитываться в списках, графиках и расчётах дашборда"><input type="checkbox" id="dashHideDone"> Скрыть сданные</label>
           <span class="quick-filter-sep"></span>
-          <span class="small" style="text-transform:uppercase;letter-spacing:0.03em;">Эпики на дашборде:</span>
+          <span class="quick-filter-label">Эпики на дашборде</span>
           <div class="epic-checks" id="dashEpicChecks"></div>
-          <button class="btn btn-ghost btn-sm" id="dashEpicAll">Все</button>
-          <button class="btn btn-ghost btn-sm" id="dashEpicNone">Снять все</button>
+          <div class="quick-filter-actions">
+            <button type="button" class="btn btn-ghost btn-sm" id="dashEpicAll">Все</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="dashEpicNone">Снять все</button>
+          </div>
         </div>
       </div>
       <div class="kpi-grid" id="kpiGrid"></div>
@@ -101,15 +105,13 @@
         <div class="panel-head">
           <div>
             <div class="panel-title">Динамика по выбранному эпику</div>
-            <div class="section-note">Оставшееся время, затраченное время и первоначальная оценка для одного эпика. При наведении на фактические значения показываются отклонения от средней динамики и прогноза.</div>
+            <div class="section-note">Остаток с прогнозом и целевой линией. При наведении на факт видны отклонения от средней динамики и прогноза.</div>
           </div>
           <div class="panel-controls">
-            <label class="small" for="chartServiceSelect">Эпик:</label>
-            <select id="chartServiceSelect"></select>
-            <div class="target-input-inline">
-              <label class="small" for="epicTargetDate">Цель:</label>
-              <input type="date" id="epicTargetDate">
-            </div>
+            <label class="small" for="chartServiceSelect">Эпик</label>
+            <select id="chartServiceSelect" class="filter-input select-wide"></select>
+            <label class="small" for="epicTargetDate">Цель</label>
+            <input type="date" id="epicTargetDate">
           </div>
         </div>
         <div class="legend-row" id="legendRemaining"></div>
@@ -119,19 +121,19 @@
         <div class="panel">
           <div class="panel-head"><div class="panel-title">Затраченное время (эпик)</div></div>
           <div class="legend-row" id="legendSpentEpic"></div>
-          <div class="chart-wrap" style="height:280px;"><canvas id="chartSpentEpic"></canvas></div>
+          <div class="chart-wrap chart-wrap-sm"><canvas id="chartSpentEpic"></canvas></div>
         </div>
         <div class="panel">
           <div class="panel-head"><div class="panel-title">Первоначальная оценка (эпик)</div></div>
           <div class="legend-row" id="legendEstimateEpic"></div>
-          <div class="chart-wrap" style="height:280px;"><canvas id="chartEstimateEpic"></canvas></div>
+          <div class="chart-wrap chart-wrap-sm"><canvas id="chartEstimateEpic"></canvas></div>
         </div>
       </div>
       <div class="panel">
         <div class="panel-head">
           <div>
             <div class="panel-title">Оставшееся время — все эпики</div>
-            <div class="section-note">Сравнение динамики остатка по всем бизнес-процессам одновременно</div>
+            <div class="section-note">Сравнение динамики остатка по выбранным эпикам</div>
           </div>
         </div>
         <div class="legend-row" id="legendRemainingAll"></div>
@@ -141,12 +143,12 @@
         <div class="panel">
           <div class="panel-head"><div class="panel-title">Затраченное время — все эпики</div></div>
           <div class="legend-row" id="legendSpent"></div>
-          <div class="chart-wrap" style="height:280px;"><canvas id="chartSpent"></canvas></div>
+          <div class="chart-wrap chart-wrap-sm"><canvas id="chartSpent"></canvas></div>
         </div>
         <div class="panel">
           <div class="panel-head"><div class="panel-title">Первоначальная оценка — все эпики</div></div>
           <div class="legend-row" id="legendEstimate"></div>
-          <div class="chart-wrap" style="height:280px;"><canvas id="chartEstimate"></canvas></div>
+          <div class="chart-wrap chart-wrap-sm"><canvas id="chartEstimate"></canvas></div>
         </div>
       </div>
       <div class="panel">
@@ -156,18 +158,18 @@
       <div class="panel">
         <div class="panel-head">
           <div>
-            <div class="panel-title">Burn rate по бизнес-процессам (в день)</div>
-            <div class="section-note">Дневная скорость сгорания остатка по каждому эпику и итого по проекту. По умолчанию — последние 5 заполненных дней.</div>
+            <div class="panel-title">Burn rate по эпикам, ч/день</div>
+            <div class="section-note">Дневная скорость сгорания остатка. По умолчанию — последние 5 дат замеров.</div>
           </div>
           <div class="panel-controls">
-            <label class="small" for="burnFrom">С:</label>
-            <input type="date" id="burnFrom">
-            <label class="small" for="burnTo">По:</label>
-            <input type="date" id="burnTo">
-            <button class="btn btn-ghost btn-sm" id="burnResetRange">Последние 5 дней</button>
+            <label class="small" for="burnFrom">С</label>
+            <input type="date" id="burnFrom" class="filter-input">
+            <label class="small" for="burnTo">по</label>
+            <input type="date" id="burnTo" class="filter-input">
+            <button type="button" class="btn btn-ghost btn-sm" id="burnResetRange">Последние 5</button>
           </div>
         </div>
-        <div class="table-scroll"><table class="data-table mono" id="burnRateTable"></table></div>
+        <div class="table-scroll"><table class="data-table" id="burnRateTable"></table></div>
       </div>
     </section>
 
@@ -175,11 +177,11 @@
     <section class="view" id="view-stages">
       <div class="panel quick-filter">
         <div class="quick-filter-row">
-          <label class="quick-filter-item" title="По умолчанию сданные эпики не учитываются в своде по этапам"><input type="checkbox" id="stageShowDone"> Показывать сданные эпики в своде</label>
+          <label class="quick-filter-item" title="По умолчанию сданные эпики не учитываются в своде по этапам"><input type="checkbox" id="stageShowDone"> Учитывать сданные эпики</label>
         </div>
       </div>
       <div class="kpi-grid" id="stageKpiGrid"></div>
-      <div id="stageChartsContainer"></div>
+      <div class="view-stack" id="stageChartsContainer"></div>
       <div class="panel">
         <div class="panel-head"><div class="panel-title">Сводка по этапам</div></div>
         <div class="table-scroll"><table class="data-table" id="stageSummaryTable"></table></div>
@@ -187,18 +189,18 @@
       <div class="panel">
         <div class="panel-head">
           <div>
-            <div class="panel-title">Burn rate по этапам (в день)</div>
-            <div class="section-note">Дневная скорость сгорания остатка по каждому этапу и итого по проекту. По умолчанию — последние 5 заполненных дней.</div>
+            <div class="panel-title">Burn rate по этапам, ч/день</div>
+            <div class="section-note">Сумма дневных burn rate эпиков этапа. По умолчанию — последние 5 дат замеров.</div>
           </div>
           <div class="panel-controls">
-            <label class="small" for="stageBurnFrom">С:</label>
-            <input type="date" id="stageBurnFrom">
-            <label class="small" for="stageBurnTo">По:</label>
-            <input type="date" id="stageBurnTo">
-            <button class="btn btn-ghost btn-sm" id="stageBurnResetRange">Последние 5 дней</button>
+            <label class="small" for="stageBurnFrom">С</label>
+            <input type="date" id="stageBurnFrom" class="filter-input">
+            <label class="small" for="stageBurnTo">по</label>
+            <input type="date" id="stageBurnTo" class="filter-input">
+            <button type="button" class="btn btn-ghost btn-sm" id="stageBurnResetRange">Последние 5</button>
           </div>
         </div>
-        <div class="table-scroll"><table class="data-table mono" id="stageBurnRateTable"></table></div>
+        <div class="table-scroll"><table class="data-table" id="stageBurnRateTable"></table></div>
       </div>
     </section>
 
@@ -208,19 +210,19 @@
         <div class="panel-head">
           <div>
             <div class="panel-title">Внесение данных по датам</div>
-            <div class="section-note">Компактная таблица: оставшееся время, затраченное время, оценка на каждую дату замера.</div>
+            <div class="section-note">Остаток, затраченное время и оценка на каждую дату замера. Изменения сохраняются автоматически.</div>
           </div>
           <div class="panel-controls">
-            <select id="dataServiceSelect"></select>
-            <button class="btn btn-primary btn-sm" id="btnAddRow">+ Новая дата</button>
+            <label class="small" for="dataServiceSelect">Эпик</label>
+            <select id="dataServiceSelect" class="filter-input select-wide"></select>
+            <button type="button" class="btn btn-primary btn-sm" id="btnAddRow">+ Новая дата</button>
           </div>
         </div>
-        <div class="table-scroll"><table class="data-table compact-table" id="entriesTable"></table></div>
-        <div class="empty-state" id="dataEmptyHint" style="display:none;padding:var(--space-8);">
+        <div class="table-scroll"><table class="data-table compact-table entries-table" id="entriesTable"></table></div>
+        <div class="empty-state" id="dataEmptyHint" style="display:none;">
           <p>Нет замеров для этого эпика — добавьте первую дату.</p>
         </div>
       </div>
-      <div class="hint-card">Данные сохраняются в базе данных автоматически при изменении полей.</div>
     </section>
 
     <!-- SERVICES -->
@@ -229,9 +231,9 @@
         <div class="panel-head">
           <div>
             <div class="panel-title">Эпики (блоки задач) проекта</div>
-            <div class="section-note">Список эпиков и этапов, включая индивидуальную целевую дату каждого эпика.</div>
+            <div class="section-note">Этапы, целевые даты и признак сдачи. Порядок меняется перетаскиванием за ⠿.</div>
           </div>
-          <button class="btn btn-primary btn-sm" id="btnAddService">+ Добавить эпик</button>
+          <button type="button" class="btn btn-primary btn-sm" id="btnAddService">+ Добавить эпик</button>
         </div>
         <div class="table-scroll"><table class="data-table services-table" id="servicesTable"></table></div>
       </div>
@@ -243,36 +245,43 @@
         <div class="panel-head">
           <div>
             <div class="panel-title">Настройки проекта</div>
-            <div class="section-note">Целевые даты задаются индивидуально по каждому эпику (раздел «Эпики (блоки задач)») и по каждому этапу (раздел «Свод по этапам»). Здесь — общие параметры прогноза и расчёта burn rate.</div>
+            <div class="section-note">Целевые даты задаются по каждому эпику («Эпики (блоки задач)») и этапу («Свод по этапам»). Здесь — общие параметры прогноза и burn rate.</div>
           </div>
         </div>
         <div class="settings-grid" id="settingsGrid"></div>
       </div>
       <div class="panel">
-        <div class="panel-title" style="margin-bottom:var(--space-3);">Как считаются метрики</div>
-        <p style="font-size:var(--text-sm);color:var(--color-text-muted);max-width:75ch;line-height:1.6;">
-        <b>Burn rate</b> — средняя дневная скорость сгорания остатка, по всей истории или по скользящему окну (настраивается).
-        <b>Прогноз</b> строится линейной регрессией по факту либо продолжением текущего burn rate — выбирается в настройках.
-        <b>Целевая линия сгорания</b> — прямая от последнего фактического остатка (на дату последнего замера) к нулю на целевую дату.
-        Если прогноз достигает нуля позже целевой даты — статус «риск» (в пределах буфера) или «не успеваем».
-        </p>
+        <div class="panel-head"><div class="panel-title">Как считаются метрики</div></div>
+        <ul class="metrics-help">
+          <li><b>Burn rate</b> — средняя дневная скорость сгорания остатка: по всей истории или по скользящему окну.</li>
+          <li><b>Прогноз</b> — линейная регрессия по факту либо продолжение текущего burn rate.</li>
+          <li><b>Целевая линия</b> — прямая от последнего заполненного остатка к нулю на целевую дату.</li>
+          <li><b>Статус</b>: прогноз достигает нуля к цели — «успеваем», в пределах буфера — «риск», позже — «не успеваем».</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- NO PROJECT -->
+    <section class="view" id="view-empty">
+      <div class="panel empty-state">
+        <p>Нет доступных проектов. Обратитесь к администратору, чтобы получить доступ.</p>
       </div>
     </section>
 
     <!-- ADMIN: USER MANAGEMENT -->
     <section class="view" id="view-users">
       <div class="user-mgmt-grid">
-        <div class="panel">
+        <div class="panel user-mgmt-wide">
           <div class="panel-head">
             <div class="panel-title">Пользователи</div>
-            <input type="text" id="userSearch" placeholder="Поиск по имени или логину..." style="max-width:280px;padding:6px var(--space-3);font-size:var(--text-sm);border:1px solid var(--color-border);border-radius:var(--radius-md);">
+            <input type="search" id="userSearch" class="search-input" placeholder="Поиск по имени или логину…">
           </div>
           <div class="users-scroll"><table class="data-table" id="usersTable"></table></div>
         </div>
         <div class="panel">
           <div class="panel-head"><div class="panel-title">Доступ к проектам</div></div>
           <div id="userProjectsMgmt">
-            <p style="font-size:var(--text-sm);color:var(--color-text-muted);">Выберите пользователя выше, чтобы настроить видимость проектов.</p>
+            <p class="muted-text">Выберите пользователя в таблице, чтобы настроить ему видимость проектов.</p>
           </div>
         </div>
         <div class="panel">
@@ -280,15 +289,15 @@
           <form class="user-form" id="addUserForm">
             <div class="profile-photo-upload">
               <div class="profile-photo-preview" id="newUserPhotoPreview">?</div>
-              <label class="btn btn-ghost btn-sm" style="cursor:pointer;">Загрузить фото<input type="file" accept="image/*" id="newUserPhotoFile" style="display:none;"></label>
+              <label class="btn btn-ghost btn-sm">Загрузить фото<input type="file" accept="image/*" id="newUserPhotoFile" hidden></label>
             </div>
             <div class="user-form-row">
               <div class="setting-item"><label class="small">Логин</label><input type="text" id="newUsername" required></div>
-              <div class="setting-item"><label class="small">Пароль</label><input type="password" id="newPassword" required></div>
+              <div class="setting-item"><label class="small">Пароль</label><input type="password" id="newPassword" required autocomplete="new-password"></div>
             </div>
             <div class="user-form-row">
               <div class="setting-item"><label class="small">Отображаемое имя</label><input type="text" id="newDisplayName"></div>
-              <div class="setting-item"><label class="small">Email</label><input type="text" id="newEmail"></div>
+              <div class="setting-item"><label class="small">Email</label><input type="email" id="newEmail"></div>
             </div>
             <div class="user-form-row">
               <div class="setting-item"><label class="small">Должность</label><input type="text" id="newPosition"></div>
@@ -296,7 +305,7 @@
                 <select id="newRole"><option value="user">Пользователь</option><option value="manager">Руководитель проекта</option><option value="admin">Администратор</option></select>
               </div>
             </div>
-            <button type="submit" class="btn btn-primary btn-sm">+ Добавить</button>
+            <div class="form-actions"><button type="submit" class="btn btn-primary btn-sm">+ Добавить пользователя</button></div>
           </form>
         </div>
       </div>
@@ -307,7 +316,7 @@
       <div class="panel" id="adminProjectsPanel">
         <div class="panel-head">
           <div class="panel-title">Управление проектами</div>
-          <button class="btn btn-primary btn-sm" id="btnAddProject">+ Добавить проект</button>
+          <button type="button" class="btn btn-primary btn-sm" id="btnAddProject">+ Добавить проект</button>
         </div>
         <div class="table-scroll"><table class="data-table" id="projectsMgmtTable"></table></div>
       </div>
@@ -322,7 +331,7 @@
             <select id="auditFilterUser"><option value="">Все авторы</option></select>
             <select id="auditFilterPage"><option value="">Все страницы</option></select>
             <select id="auditFilterProject"><option value="">Все проекты</option></select>
-            <button class="btn btn-ghost btn-sm" id="auditResetFilters">Сбросить</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="auditResetFilters">Сбросить</button>
           </div>
         </div>
         <div class="table-scroll"><table class="data-table" id="auditLogTable"></table></div>
@@ -331,7 +340,7 @@
   </main>
 </div>
 
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script src="/static/js/app.js"></script>
 </body>

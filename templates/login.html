@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Диаграммы сгорания (burndown)</title>
+<title>Вход — Burndown</title>
 <link rel="icon" type="image/svg+xml" href="/static/img/favicon.svg">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('burndown-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'));}catch(e){}</script>
+<link rel="preconnect" href="https://api.fontshare.com" crossorigin>
 <link href="https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600,700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/css/style.css">
 </head>
@@ -15,14 +15,10 @@
   <button class="theme-toggle-login" id="themeToggle" aria-label="Переключить тему"></button>
   <div class="login-card">
     <div class="login-brand">
-      <svg viewBox="0 0 32 32" fill="none" aria-label="Логотип">
-        <rect x="4" y="18" width="5" height="10" rx="1" fill="currentColor" opacity="0.5"/>
-        <rect x="13.5" y="10" width="5" height="18" rx="1" fill="currentColor" opacity="0.75"/>
-        <rect x="23" y="4" width="5" height="24" rx="1" fill="currentColor"/>
-      </svg>
+      <svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><rect width="32" height="32" rx="7" fill="currentColor"/><path d="M7 21 L13 14 L17 17 L24 9" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M24 9 L24 13 M24 9 L20 9" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round"/><path d="M7 24 L24 24" stroke="#fff" stroke-width="1.5" opacity="0.5"/></svg>
       <div>
         <div class="login-brand-title">Burndown</div>
-        <div class="login-brand-sub">Трекер сгорания работ</div>
+        <div class="login-brand-sub">Сгорание работ по эпикам</div>
       </div>
     </div>
     <form class="login-form" id="loginForm" autocomplete="off">
@@ -34,7 +30,7 @@
         <label for="password">Пароль</label>
         <input type="password" id="password" name="password" autocomplete="new-password" required>
       </div>
-      <div class="login-error" id="loginError"></div>
+      <div class="login-error" id="loginError" role="alert"></div>
       <button type="submit" class="btn btn-primary login-btn">Войти</button>
     </form>
   </div>
@@ -42,9 +38,7 @@
 <script>
 (function(){
   var root = document.documentElement;
-  var stored = localStorage.getItem('burndown-theme');
-  var themeMode = stored || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-  root.setAttribute('data-theme', themeMode);
+  var themeMode = root.getAttribute('data-theme') || 'light';
   var tt = document.getElementById('themeToggle');
   function setIcon(m){
     tt.innerHTML = m === 'dark'
@@ -74,7 +68,7 @@
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({username: username, password: password})
-    }).then(function(r){ return r.json(); }).then(function(data){
+    }).then(function(r){ return r.json().catch(function(){ return {}; }); }).then(function(data){
       if(data.success){ window.location.href = '/'; }
       else { errEl.textContent = data.error || 'Ошибка входа'; btn.disabled = false; btn.textContent = 'Войти'; }
     }).catch(function(){

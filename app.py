@@ -14,6 +14,7 @@ import sqlite3
 import json
 from functools import wraps
 from datetime import datetime
+from urllib.parse import quote
 
 from flask import (
     Flask, request, jsonify, session, render_template,
@@ -312,6 +313,11 @@ def api_update_project(pid):
 @admin_required
 def api_delete_project(pid):
     db = get_db()
+    project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
+    if not project:
+        return jsonify({'error': 'Проект не найден'}), 404
+    audit_log('projects', 'delete', 'project', pid, pid, [{'field': 'name', 'old': project['name'], 'new': None}],
+              entity_name=project['name'])
     db.execute('DELETE FROM projects WHERE id = ?', (pid,))
     db.commit()
     return jsonify({'success': True})
@@ -383,6 +389,8 @@ def api_create_service(pid):
          1 if data.get('isDone') else 0, data.get('stageGroup', ''))
     )
     db.commit()
+    audit_log('services', 'create', 'service', cur.lastrowid, pid,
+              [{'field': 'name', 'old': None, 'new': data.get('name', '')}], entity_name=data.get('name', ''))
     return jsonify({'id': cur.lastrowid})
 
 
@@ -407,7 +415,7 @@ def api_update_service(sid):
         changes.append({'field': 'targetDate', 'old': svc['target_date'], 'new': data.get('targetDate')})
     if is_done != (1 if svc['is_done'] else 0):
         changes.append({'field': 'isDone', 'old': bool(svc['is_done']), 'new': bool(is_done)})
-    if stage_group != svc['stage_group']:
+    if (stage_group or '') != (svc['stage_group'] or ''):
         changes.append({'field': 'stageGroup', 'old': svc['stage_group'], 'new': stage_group})
     db.execute(
         'UPDATE services SET etap = ?, name = ?, target_date = ?, is_done = ?, stage_group = ? WHERE id = ?',
@@ -431,6 +439,8 @@ def api_delete_service(sid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     db.execute('DELETE FROM services WHERE id = ?', (sid,))
     db.commit()
+    audit_log('services', 'delete', 'service', sid, svc['project_id'],
+              [{'field': 'name', 'old': svc['name'], 'new': None}], entity_name=svc['name'])
     return jsonify({'success': True})
 
 
@@ -463,11 +473,15 @@ def api_create_entry(sid):
     if not can_edit_project(session['user_id'], svc['project_id']):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     data = request.get_json() or {}
+    if not data.get('date'):
+        return jsonify({'error': 'Укажите дату замера'}), 400
     cur = db.execute(
         'INSERT INTO entries (service_id, date, remaining, spent, estimate) VALUES (?, ?, ?, ?, ?)',
         (sid, data.get('date'), data.get('remaining'), data.get('spent'), data.get('estimate'))
     )
     db.commit()
+    audit_log('data', 'create', 'entry', cur.lastrowid, svc['project_id'],
+              [{'field': 'date', 'old': None, 'new': data.get('date')}], entity_name=svc['name'])
     return jsonify({'id': cur.lastrowid})
 
 
@@ -514,6 +528,8 @@ def api_delete_entry(eid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     db.execute('DELETE FROM entries WHERE id = ?', (eid,))
     db.commit()
+    audit_log('data', 'delete', 'entry', eid, svc['project_id'],
+              [{'field': 'date', 'old': entry['date'], 'new': None}], entity_name=svc['name'])
     return jsonify({'success': True})
 
 
@@ -546,6 +562,13 @@ def api_update_stage_target(pid):
 
 
 # ─── API: Settings ──────────────────────────────────────────────
+
+SETTINGS_FIELDS = [
+    ('forecastMethod', 'forecast_method'),
+    ('riskBufferDays', 'risk_buffer_days'),
+    ('burnrateMethod', 'burnrate_method'),
+    ('burnrateWindowDays', 'burnrate_window_days'),
+]
 
 @app.route('/api/projects/<int:pid>/settings', methods=['PUT'])
 @login_required
@@ -582,11 +605,19 @@ def api_update_settings(pid):
             data.get('burnrateWindowDays', 14)
         ))
     db.commit()
-    audit_log('settings', 'update', 'settings', None, pid, [{'field': 'settings', 'old': 'previous', 'new': 'updated'}])
+    changes = []
+    for key, col in SETTINGS_FIELDS:
+        old_val = existing[col] if existing else None
+        if key in data and str(old_val) != str(data[key]):
+            changes.append({'field': key, 'old': None if old_val is None else str(old_val), 'new': str(data[key])})
+    if changes:
+        audit_log('settings', 'update', 'settings', None, pid, changes)
     return jsonify({'success': True})
 
 
 # ─── API: Users (admin only) ─────────────────────────────────────
+
+USER_ROLES = ('user', 'manager', 'admin')
 
 @app.route('/api/users')
 @admin_required
@@ -618,6 +649,8 @@ def api_create_user():
     if existing:
         return jsonify({'error': 'Пользователь с таким логином уже существует'}), 400
 
+    if data.get('role', 'user') not in USER_ROLES:
+        return jsonify({'error': 'Недопустимая роль'}), 400
     cur = db.execute(
         'INSERT INTO users (username, password_hash, display_name, email, position, photo, role) VALUES (?, ?, ?, ?, ?, ?, ?)',
         (username, generate_password_hash(password), data.get('displayName', ''), data.get('email', ''), data.get('position', ''), data.get('photo', ''), data.get('role', 'user'))
@@ -645,6 +678,12 @@ def api_update_user(uid):
     email = data.get('email', user['email'])
     position = data.get('position', user['position'])
     role = data.get('role', user['role'])
+    if role not in USER_ROLES:
+        return jsonify({'error': 'Недопустимая роль'}), 400
+    if not new_username:
+        return jsonify({'error': 'Укажите логин'}), 400
+    if uid == session['user_id'] and role != 'admin':
+        return jsonify({'error': 'Нельзя снять с себя роль администратора'}), 400
     photo = data.get('photo', user['photo'])
     password = data.get('password')
 
@@ -680,6 +719,10 @@ def api_delete_user(uid):
     if uid == session['user_id']:
         return jsonify({'error': 'Нельзя удалить самого себя'}), 400
     db = get_db()
+    user = db.execute('SELECT username FROM users WHERE id = ?', (uid,)).fetchone()
+    if not user:
+        return jsonify({'error': 'Пользователь не найден'}), 404
+    audit_log('users', 'delete', 'user', uid, None, [{'field': 'username', 'old': user['username'], 'new': None}])
     db.execute('DELETE FROM users WHERE id = ?', (uid,))
     db.commit()
     return jsonify({'success': True})
@@ -713,6 +756,8 @@ def api_assign_user_project(uid):
     role = data.get('role', 'user')
     if not project_id:
         return jsonify({'error': 'Укажите проект'}), 400
+    if role not in ('user', 'manager'):
+        return jsonify({'error': 'Недопустимая роль'}), 400
 
     db = get_db()
     existing = db.execute(
@@ -828,7 +873,6 @@ def api_export_project(pid):
         'settings': settings_dict,
     }, ensure_ascii=False, indent=2)
     filename = f"Burndown_export_{datetime.now().strftime('%Y-%m-%d_%H%M')}.json"
-    from urllib.parse import quote
     return Response(payload, mimetype='application/json',
                     headers={'Content-Disposition': f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename)}"})
 
@@ -895,6 +939,8 @@ def api_export_pdf(pid):
     if not can_view_project(session['user_id'], pid):
         return jsonify({'error': 'Нет доступа к проекту'}), 403
     page_type = request.args.get('page', 'dashboard')
+    if page_type not in PDF_PAGES:
+        return jsonify({'error': 'Неизвестный раздел'}), 400
     db = get_db()
     project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
     if not project:
@@ -905,128 +951,36 @@ def api_export_pdf(pid):
     if service_ids:
         placeholders = ','.join('?' * len(service_ids))
         entries = db.execute(f'SELECT * FROM entries WHERE service_id IN ({placeholders}) ORDER BY date', service_ids).fetchall()
-    stage_targets = db.execute('SELECT * FROM stage_targets WHERE project_id = ?', (pid,)).fetchall()
-    settings = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
+    stage_targets = {r['stage_name']: r['target_date'] for r in
+                     db.execute('SELECT * FROM stage_targets WHERE project_id = ?', (pid,)).fetchall()}
 
-    page_titles = {
-        'dashboard': 'Дашборд сгорания',
-        'stages': 'Свод по этапам',
-        'data': 'Данные по датам',
-    }
-    page_title = page_titles.get(page_type, page_type)
+    # Фильтры интерфейса: выбранные эпики дашборда, учёт сданных эпиков в своде по этапам
+    epics_arg = request.args.get('epics')
+    if page_type == 'dashboard' and epics_arg is not None:
+        selected = {int(x) for x in epics_arg.split(',') if x.strip().isdigit()}
+        services = [s for s in services if s['id'] in selected]
+    elif page_type == 'stages' and request.args.get('showDone') != '1':
+        services = [s for s in services if not s['is_done']]
 
-    # Build HTML for PDF
-    html_parts = ['<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">']
-    html_parts.append('<style>')
-    html_parts.append('body{font-family:"Helvetica Neue",Arial,sans-serif;font-size:12px;color:#1c2126;margin:20px;}')
-    html_parts.append('h1{font-size:20px;color:#01696f;margin-bottom:4px;}')
-    html_parts.append('h2{font-size:14px;color:#01696f;margin-top:20px;margin-bottom:8px;}')
-    html_parts.append('.sub{color:#5c6470;font-size:11px;margin-bottom:16px;}')
-    html_parts.append('.meta{color:#5c6470;font-size:10px;margin-bottom:20px;border-bottom:1px solid #dfe2e5;padding-bottom:8px;}')
-    html_parts.append('table{width:100%;border-collapse:collapse;margin-bottom:16px;}')
-    html_parts.append('th{background:#01696f;color:#fff;padding:6px 8px;text-align:left;font-size:11px;}')
-    html_parts.append('td{padding:5px 8px;border-bottom:1px solid #dfe2e5;font-size:11px;}')
-    html_parts.append('.mono{font-family:"Courier New",monospace;}')
-    html_parts.append('.kpi-grid{display:flex;gap:12px;margin-bottom:16px;}')
-    html_parts.append('.kpi-card{flex:1;border:1px solid #dfe2e5;border-radius:6px;padding:8px 12px;}')
-    html_parts.append('.kpi-label{font-size:10px;color:#5c6470;}')
-    html_parts.append('.kpi-value{font-size:18px;font-weight:600;}')
-    html_parts.append('.kpi-note{font-size:10px;color:#5c6470;}')
-    html_parts.append('.total-row td{font-weight:bold;background:#eef0f2;}')
-    html_parts.append('</style></head><body>')
+    by_service = {}
+    for e in entries:
+        by_service.setdefault(e['service_id'], []).append(e)
 
+    def last_value(sid, field):
+        """Последнее заполненное значение поля по эпику (как на дашборде)."""
+        for e in reversed(by_service.get(sid, [])):
+            if e[field] is not None:
+                return e[field]
+        return None
+
+    def sum_last(svcs, field):
+        vals = [last_value(s['id'], field) for s in svcs]
+        vals = [v for v in vals if v is not None]
+        return sum(vals) if vals else None
+
+    page_title = PDF_PAGES[page_type][0]
     now_str = datetime.now().strftime('%d.%m.%Y %H:%M')
-    html_parts.append(f'<h1>{page_title}</h1>')
-    html_parts.append(f'<div class="sub">Проект: {project["name"]} — {project["description"] or ""}</div>')
-    html_parts.append(f'<div class="meta">Сформировано: {now_str}</div>')
 
-    # Build stage groups
-    stage_groups = {}
-    for s in services:
-        stage_groups.setdefault(stage_key(s), []).append(s)
-
-    if page_type == 'dashboard':
-        # KPIs
-        html_parts.append('<h2>Ключевые показатели</h2>')
-        html_parts.append('<div class="kpi-grid">')
-        total_remaining = sum(e['remaining'] or 0 for e in entries if e['remaining'] is not None)
-        total_spent = sum(e['spent'] or 0 for e in entries if e['spent'] is not None)
-        total_estimate = sum(e['estimate'] or 0 for e in entries if e['estimate'] is not None)
-        html_parts.append(f'<div class="kpi-card"><div class="kpi-label">Остаток (всего)</div><div class="kpi-value">{total_remaining:.1f}</div></div>')
-        html_parts.append(f'<div class="kpi-card"><div class="kpi-label">Освоено (всего)</div><div class="kpi-value">{total_spent:.1f}</div></div>')
-        html_parts.append(f'<div class="kpi-card"><div class="kpi-label">Оценка (всего)</div><div class="kpi-value">{total_estimate:.1f}</div></div>')
-        html_parts.append(f'<div class="kpi-card"><div class="kpi-label">Эпиков</div><div class="kpi-value">{len(services)}</div></div>')
-        html_parts.append('</div>')
-
-        # Summary table
-        html_parts.append('<h2>Сводная таблица по эпикам</h2>')
-        html_parts.append('<table><thead><tr><th>Этап</th><th>Эпик</th><th>Целевая дата</th><th>Остаток</th><th>Освоено</th><th>Оценка</th></tr></thead><tbody>')
-        for s in services:
-            svc_entries = [e for e in entries if e['service_id'] == s['id']]
-            last = svc_entries[-1] if svc_entries else None
-            html_parts.append(f'<tr><td>{s["etap"]}</td><td>{s["name"]}</td><td class="mono">{s["target_date"] or "—"}</td><td class="mono">{last["remaining"] if last and last["remaining"] is not None else "—"}</td><td class="mono">{last["spent"] if last and last["spent"] is not None else "—"}</td><td class="mono">{last["estimate"] if last and last["estimate"] is not None else "—"}</td></tr>')
-        html_parts.append(f'<tr class="total-row"><td colspan="3">Итого</td><td class="mono">{total_remaining:.1f}</td><td class="mono">{total_spent:.1f}</td><td class="mono">{total_estimate:.1f}</td></tr>')
-        html_parts.append('</tbody></table>')
-
-        # Burn rate table
-        all_dates = sorted(set(e['date'] for e in entries if e['remaining'] is not None))
-        dates = all_dates[-5:] if len(all_dates) > 5 else all_dates
-        if dates:
-            html_parts.append('<h2>Burn rate по эпикам (последние 5 дат)</h2>')
-            html_parts.append('<table><thead><tr><th>Эпик</th>')
-            for d in dates:
-                html_parts.append(f'<th class="mono">{d[5:]}</th>')
-            html_parts.append('</tr></thead><tbody>')
-            for s in services:
-                html_parts.append(f'<tr><td>{s["etap"]} — {s["name"]}</td>')
-                svc_entries = {e['date']: e['remaining'] for e in entries if e['service_id'] == s['id']}
-                for d in dates:
-                    val = svc_entries.get(d)
-                    html_parts.append(f'<td class="mono">{val if val is not None else "—"}</td>')
-                html_parts.append('</tr>')
-            html_parts.append('<tr class="total-row"><td>Итого</td>')
-            for d in dates:
-                total = sum(e['remaining'] for e in entries if e['date'] == d and e['remaining'] is not None)
-                html_parts.append(f'<td class="mono">{total:.1f}</td>')
-            html_parts.append('</tr></tbody></table>')
-
-    elif page_type == 'stages':
-        html_parts.append('<h2>Сводка по этапам</h2>')
-        html_parts.append('<table><thead><tr><th>Этап</th><th>Эпиков</th><th>Остаток (сумма)</th><th>Цель</th></tr></thead><tbody>')
-        for stage_name, svcs in stage_groups.items():
-            svc_ids = [s['id'] for s in svcs]
-            svc_entries = [e for e in entries if e['service_id'] in svc_ids]
-            last_remaining = sum(e['remaining'] or 0 for e in svc_entries if e['remaining'] is not None)
-            target = next((st['target_date'] for st in stage_targets if st['stage_name'] == stage_name), '—')
-            html_parts.append(f'<tr><td>{stage_name}</td><td class="mono">{len(svcs)}</td><td class="mono">{last_remaining:.1f}</td><td class="mono">{target}</td></tr>')
-        html_parts.append('</tbody></table>')
-
-        # Per-stage details
-        for stage_name, svcs in stage_groups.items():
-            html_parts.append(f'<h2>{stage_name} — детали по эпикам</h2>')
-            html_parts.append('<table><thead><tr><th>Эпик</th><th>Целевая дата</th><th>Остаток</th><th>Освоено</th><th>Оценка</th></tr></thead><tbody>')
-            for s in svcs:
-                svc_entries = [e for e in entries if e['service_id'] == s['id']]
-                last = svc_entries[-1] if svc_entries else None
-                html_parts.append(f'<tr><td>{s["name"]}</td><td class="mono">{s["target_date"] or "—"}</td><td class="mono">{last["remaining"] if last and last["remaining"] is not None else "—"}</td><td class="mono">{last["spent"] if last and last["spent"] is not None else "—"}</td><td class="mono">{last["estimate"] if last and last["estimate"] is not None else "—"}</td></tr>')
-            html_parts.append('</tbody></table>')
-
-    elif page_type == 'data':
-        html_parts.append('<h2>Замеры по датам</h2>')
-        for s in services:
-            svc_entries = [e for e in entries if e['service_id'] == s['id']]
-            if not svc_entries:
-                continue
-            html_parts.append(f'<h2>{s["etap"]} — {s["name"]}</h2>')
-            html_parts.append('<table><thead><tr><th>Дата</th><th>Остаток</th><th>Освоено</th><th>Оценка</th></tr></thead><tbody>')
-            for e in svc_entries:
-                html_parts.append(f'<tr><td class="mono">{e["date"]}</td><td class="mono">{e["remaining"] if e["remaining"] is not None else "—"}</td><td class="mono">{e["spent"] if e["spent"] is not None else "—"}</td><td class="mono">{e["estimate"] if e["estimate"] is not None else "—"}</td></tr>')
-            html_parts.append('</tbody></table>')
-
-    html_parts.append('</body></html>')
-    html_content = ''.join(html_parts)
-
-    # Generate PDF with fpdf2
     from fpdf import FPDF
     font_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'fonts')
     pdf = FPDF(orientation='L', unit='mm', format='A4')
@@ -1035,165 +989,113 @@ def api_export_pdf(pid):
     pdf.add_font('DejaVu', 'B', os.path.join(font_dir, 'dejavu_bold.ttf'))
     pdf.add_page()
     pdf.set_font('DejaVu', 'B', 16)
-    pdf.set_text_color(1, 105, 111)  # #01696f
+    pdf.set_text_color(*PDF_PRIMARY)
     pdf.cell(0, 8, page_title, new_x='LMARGIN', new_y='NEXT')
     pdf.set_font('DejaVu', '', 10)
-    pdf.set_text_color(92, 100, 112)
-    pdf.cell(0, 5, f"Проект: {project['name']} — {project['description'] or ''}", new_x='LMARGIN', new_y='NEXT')
+    pdf.set_text_color(*PDF_MUTED)
+    subtitle = f"Проект: {project['name']}" + (f" — {project['description']}" if project['description'] else '')
+    pdf.cell(0, 5, subtitle, new_x='LMARGIN', new_y='NEXT')
     pdf.cell(0, 5, f"Сформировано: {now_str}", new_x='LMARGIN', new_y='NEXT')
     pdf.ln(3)
-    pdf.set_draw_color(223, 226, 229)
-    pdf.line(10, pdf.get_y(), pdf.w-10, pdf.get_y())
+    pdf.set_draw_color(*PDF_DIVIDER)
+    pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
     pdf.ln(3)
 
-    pdf.set_text_color(28, 33, 38)
-
-    # Render tables
-    # Build stage groups
-    stage_groups_pdf = {}
-    for s in services:
-        stage_groups_pdf.setdefault(stage_key(s), []).append(s)
-
     if page_type == 'dashboard':
-        # KPIs
-        total_remaining = sum(e['remaining'] or 0 for e in entries if e['remaining'] is not None)
-        total_spent = sum(e['spent'] or 0 for e in entries if e['spent'] is not None)
-        total_estimate = sum(e['estimate'] or 0 for e in entries if e['estimate'] is not None)
+        total_remaining = sum_last(services, 'remaining')
+        total_spent = sum_last(services, 'spent')
+        total_estimate = sum_last(services, 'estimate')
 
-        pdf.set_font('DejaVu', 'B', 11)
-        pdf.set_text_color(1, 105, 111)
-        pdf.cell(0, 6, 'Ключевые показатели', new_x='LMARGIN', new_y='NEXT')
-        pdf.ln(1)
-        pdf.set_font('DejaVu', '', 9)
-        pdf.set_text_color(28, 33, 38)
+        _pdf_heading(pdf, 'Ключевые показатели')
         kpi_data = [
-            ('Остаток (всего)', f'{total_remaining:.1f}'),
-            ('Освоено (всего)', f'{total_spent:.1f}'),
-            ('Оценка (всего)', f'{total_estimate:.1f}'),
+            ('Остаток, ч', _fmt_num(total_remaining)),
+            ('Затрачено, ч', _fmt_num(total_spent)),
+            ('Оценка, ч', _fmt_num(total_estimate)),
             ('Эпиков', str(len(services))),
         ]
-        col_w = (pdf.w - 20) / 4
-        for label, val in kpi_data:
-            pdf.set_font('DejaVu', '', 8)
-            pdf.set_text_color(92, 100, 112)
+        col_w = (pdf.w - pdf.l_margin - pdf.r_margin) / len(kpi_data)
+        pdf.set_font('DejaVu', '', 8)
+        pdf.set_text_color(*PDF_MUTED)
+        for label, _ in kpi_data:
             pdf.cell(col_w, 4, label)
         pdf.ln(4)
-        for label, val in kpi_data:
-            pdf.set_font('DejaVu', 'B', 14)
-            pdf.set_text_color(28, 33, 38)
-            pdf.cell(col_w, 6, val)
-        pdf.ln(6)
+        pdf.set_font('DejaVu', 'B', 14)
+        pdf.set_text_color(*PDF_TEXT)
+        for _, val in kpi_data:
+            pdf.cell(col_w, 7, val)
+        pdf.ln(9)
 
-        # Summary table
-        pdf.ln(2)
-        pdf.set_font('DejaVu', 'B', 11)
-        pdf.set_text_color(1, 105, 111)
-        pdf.cell(0, 6, 'Сводная таблица по эпикам', new_x='LMARGIN', new_y='NEXT')
-        pdf.ln(1)
+        _pdf_heading(pdf, 'Сводная таблица по эпикам (последний замер)')
+        rows = [[s['etap'], s['name'], _fmt_date(s['target_date']),
+                 _fmt_num(last_value(s['id'], 'remaining')),
+                 _fmt_num(last_value(s['id'], 'spent')),
+                 _fmt_num(last_value(s['id'], 'estimate'))] for s in services]
+        rows.append(['Итого', '', '', _fmt_num(total_remaining), _fmt_num(total_spent), _fmt_num(total_estimate)])
+        _pdf_table(pdf, ['Этап', 'Эпик', 'Целевая дата', 'Остаток, ч', 'Затрачено, ч', 'Оценка, ч'], rows,
+                   widths=[1.2, 3.5, 1.2, 1, 1, 1], total_row=True)
 
-        headers = ['Этап', 'Эпик', 'Целевая дата', 'Остаток', 'Освоено', 'Оценка']
-        rows = []
-        for s in services:
-            svc_e = [e for e in entries if e['service_id'] == s['id']]
-            last = svc_e[-1] if svc_e else None
-            rows.append([
-                s['etap'], s['name'][:35], s['target_date'] or '—',
-                _fmt_num(last['remaining']) if last and last['remaining'] is not None else '—',
-                _fmt_num(last['spent']) if last and last['spent'] is not None else '—',
-                _fmt_num(last['estimate']) if last and last['estimate'] is not None else '—',
-            ])
-        rows.append(['', 'Итого', '', _fmt_num(total_remaining), _fmt_num(total_spent), _fmt_num(total_estimate)])
-        _pdf_table(pdf, headers, rows, total_row=True)
-
-        # Burn rate table
-        all_dates = sorted(set(e['date'] for e in entries if e['remaining'] is not None))
-        dates = all_dates[-5:] if len(all_dates) > 5 else all_dates
+        all_dates = sorted({e['date'] for e in entries
+                            if e['remaining'] is not None and e['service_id'] in {s['id'] for s in services}})
+        dates = all_dates[-5:]
         if dates:
-            pdf.ln(2)
-            pdf.set_font('DejaVu', 'B', 11)
-            pdf.set_text_color(1, 105, 111)
-            pdf.cell(0, 6, 'Burn rate по эпикам (последние 5 дат)', new_x='LMARGIN', new_y='NEXT')
-            pdf.ln(1)
-            br_headers = ['Эпик'] + [d[5:].replace('-', '.') for d in dates]
-            br_rows = []
+            _pdf_heading(pdf, 'Burn rate по эпикам, ч/день (последние 5 дат)')
+            br_rows, all_rates = [], []
             for s in services:
-                svc_entries = {e['date']: e['remaining'] for e in entries if e['service_id'] == s['id']}
-                row = [f"{s['etap']} — {s['name'][:25]}"]
-                for d in dates:
-                    val = svc_entries.get(d)
-                    row.append(_fmt_num(val) if val is not None else '—')
-                br_rows.append(row)
-            # Total row
-            total_row = ['Итого']
-            for d in dates:
-                total = sum(e['remaining'] for e in entries if e['date'] == d and e['remaining'] is not None)
-                total_row.append(_fmt_num(total))
-            br_rows.append(total_row)
-            _pdf_table(pdf, br_headers, br_rows, total_row=True)
+                rates = _daily_rates(by_service.get(s['id'], []), dates)
+                all_rates.append(rates)
+                br_rows.append([f"{s['etap']} — {s['name']}"] + [_fmt_num(r) for r in rates])
+            totals = []
+            for i in range(len(dates)):
+                vals = [r[i] for r in all_rates if r[i] is not None]
+                totals.append(sum(vals) if vals else None)
+            br_rows.append(['Итого по проекту'] + [_fmt_num(t) for t in totals])
+            _pdf_table(pdf, ['Эпик'] + [_fmt_date(d)[:5] for d in dates], br_rows,
+                       widths=[4] + [1] * len(dates), total_row=True)
 
     elif page_type == 'stages':
-        pdf.set_font('DejaVu', 'B', 11)
-        pdf.set_text_color(1, 105, 111)
-        pdf.cell(0, 6, 'Сводка по этапам', new_x='LMARGIN', new_y='NEXT')
-        pdf.ln(1)
-        st_headers = ['Этап', 'Эпиков', 'Остаток (сумма)', 'Цель']
-        st_rows = []
-        for stage_name, svcs in stage_groups_pdf.items():
-            svc_ids = [s['id'] for s in svcs]
-            svc_e = [e for e in entries if e['service_id'] in svc_ids]
-            last_remaining = sum(e['remaining'] or 0 for e in svc_e if e['remaining'] is not None)
-            target = next((st['target_date'] for st in stage_targets if st['stage_name'] == stage_name), '—')
-            st_rows.append([stage_name, str(len(svcs)), _fmt_num(last_remaining), target])
-        _pdf_table(pdf, st_headers, st_rows)
+        stage_groups = {}
+        for s in services:
+            stage_groups.setdefault(stage_key(s), []).append(s)
+        _pdf_heading(pdf, 'Сводка по этапам')
+        st_rows = [[name, str(len(svcs)), _fmt_num(sum_last(svcs, 'remaining')), _fmt_date(stage_targets.get(name))]
+                   for name, svcs in stage_groups.items()]
+        _pdf_table(pdf, ['Этап', 'Эпиков', 'Остаток (сумма), ч', 'Цель'], st_rows, widths=[3, 1, 1.5, 1.5])
 
-        for stage_name, svcs in stage_groups_pdf.items():
-            pdf.ln(2)
-            pdf.set_font('DejaVu', 'B', 11)
-            pdf.set_text_color(1, 105, 111)
-            pdf.cell(0, 6, f'{stage_name} — детали по эпикам', new_x='LMARGIN', new_y='NEXT')
-            pdf.ln(1)
-            d_headers = ['Эпик', 'Целевая дата', 'Остаток', 'Освоено', 'Оценка']
-            d_rows = []
-            for s in svcs:
-                svc_e = [e for e in entries if e['service_id'] == s['id']]
-                last = svc_e[-1] if svc_e else None
-                d_rows.append([
-                    s['name'][:40], s['target_date'] or '—',
-                    _fmt_num(last['remaining']) if last and last['remaining'] is not None else '—',
-                    _fmt_num(last['spent']) if last and last['spent'] is not None else '—',
-                    _fmt_num(last['estimate']) if last and last['estimate'] is not None else '—',
-                ])
-            _pdf_table(pdf, d_headers, d_rows)
+        for stage_name, svcs in stage_groups.items():
+            _pdf_heading(pdf, f'{stage_name} — детали по эпикам')
+            d_rows = [[s['name'], _fmt_date(s['target_date']),
+                       _fmt_num(last_value(s['id'], 'remaining')),
+                       _fmt_num(last_value(s['id'], 'spent')),
+                       _fmt_num(last_value(s['id'], 'estimate'))] for s in svcs]
+            _pdf_table(pdf, ['Эпик', 'Целевая дата', 'Остаток, ч', 'Затрачено, ч', 'Оценка, ч'], d_rows,
+                       widths=[4, 1.2, 1, 1, 1])
 
     elif page_type == 'data':
         for s in services:
-            svc_e = [e for e in entries if e['service_id'] == s['id']]
+            svc_e = by_service.get(s['id'], [])
             if not svc_e:
                 continue
-            pdf.set_font('DejaVu', 'B', 11)
-            pdf.set_text_color(1, 105, 111)
-            pdf.cell(0, 6, f"{s['etap']} — {s['name']}", new_x='LMARGIN', new_y='NEXT')
-            pdf.ln(1)
-            d_headers = ['Дата', 'Остаток', 'Освоено', 'Оценка']
-            d_rows = []
-            for e in svc_e:
-                d_rows.append([
-                    e['date'],
-                    _fmt_num(e['remaining']) if e['remaining'] is not None else '—',
-                    _fmt_num(e['spent']) if e['spent'] is not None else '—',
-                    _fmt_num(e['estimate']) if e['estimate'] is not None else '—',
-                ])
-            _pdf_table(pdf, d_headers, d_rows)
+            _pdf_heading(pdf, f"{s['etap']} — {s['name']}")
+            d_rows = [[_fmt_date(e['date']), _fmt_num(e['remaining']), _fmt_num(e['spent']), _fmt_num(e['estimate'])]
+                      for e in svc_e]
+            _pdf_table(pdf, ['Дата', 'Остаток, ч', 'Затрачено, ч', 'Оценка, ч'], d_rows)
 
     pdf_bytes = pdf.output()
-    page_names = {'dashboard': 'дашборд', 'stages': 'свод_по_этапам', 'data': 'данные_по_датам'}
-    filename_page = page_names.get(page_type, page_type)
-    filename = f"Burndown_{filename_page}_{datetime.now().strftime('%Y-%m-%d_%H%M')}.pdf"
-    from urllib.parse import quote
+    filename = f"Burndown_{PDF_PAGES[page_type][1]}_{datetime.now().strftime('%Y-%m-%d_%H%M')}.pdf"
     filename_ascii = filename.encode('ascii', 'replace').decode('ascii')
-    filename_quoted = quote(filename)
     return Response(bytes(pdf_bytes), mimetype='application/pdf',
-                    headers={'Content-Disposition': f"attachment; filename=\"{filename_ascii}\"; filename*=UTF-8''{filename_quoted}"})
+                    headers={'Content-Disposition': f"attachment; filename=\"{filename_ascii}\"; filename*=UTF-8''{quote(filename)}"})
+
+
+PDF_PAGES = {
+    'dashboard': ('Дашборд сгорания', 'дашборд'),
+    'stages': ('Свод по этапам', 'свод_по_этапам'),
+    'data': ('Данные по датам', 'данные_по_датам'),
+}
+PDF_PRIMARY = (1, 105, 111)    # #01696f
+PDF_TEXT = (28, 33, 38)
+PDF_MUTED = (92, 100, 112)
+PDF_DIVIDER = (223, 226, 229)
 
 
 def _fmt_num(v):
@@ -1205,29 +1107,77 @@ def _fmt_num(v):
         return str(v)
 
 
-def _pdf_table(pdf, headers, rows, total_row=False):
-    col_count = len(headers)
-    page_w = pdf.w - 20
-    col_w = page_w / col_count
-    # Header
-    pdf.set_font('DejaVu', 'B', 8)
-    pdf.set_fill_color(1, 105, 111)
-    pdf.set_text_color(255, 255, 255)
-    for i, h in enumerate(headers):
-        pdf.cell(col_w, 5, str(h), border=1, fill=True)
-    pdf.ln(5)
-    # Rows
-    pdf.set_text_color(28, 33, 38)
+def _fmt_date(d):
+    """YYYY-MM-DD → DD.MM.YYYY."""
+    if not d:
+        return '—'
+    parts = str(d).split('-')
+    return '.'.join(reversed(parts)) if len(parts) == 3 else str(d)
+
+
+def _daily_rates(svc_entries, dates):
+    """Дневной burn rate эпика на каждую дату: (предыдущий заполненный остаток − текущий) / дней."""
+    filled = [e for e in svc_entries if e['remaining'] is not None]
+    rates = []
+    for d in dates:
+        idx = next((i for i, e in enumerate(filled) if e['date'] == d), -1)
+        if idx <= 0:
+            rates.append(None)
+            continue
+        prev = filled[idx - 1]
+        days = (datetime.strptime(d, '%Y-%m-%d') - datetime.strptime(prev['date'], '%Y-%m-%d')).days
+        rates.append((prev['remaining'] - filled[idx]['remaining']) / days if days > 0 else None)
+    return rates
+
+
+def _pdf_heading(pdf, text):
+    pdf.ln(2)
+    pdf.set_font('DejaVu', 'B', 11)
+    pdf.set_text_color(*PDF_PRIMARY)
+    pdf.cell(0, 6, text, new_x='LMARGIN', new_y='NEXT')
+    pdf.ln(1)
+
+
+def _pdf_fit(pdf, text, width):
+    """Обрезает текст с многоточием под ширину ячейки."""
+    text = str(text)
+    if pdf.get_string_width(text) <= width:
+        return text
+    while text and pdf.get_string_width(text + '…') > width:
+        text = text[:-1]
+    return text + '…'
+
+
+def _pdf_table(pdf, headers, rows, widths=None, total_row=False):
+    """Таблица на всю ширину страницы; widths — относительные доли колонок, числовые колонки выравниваются вправо."""
+    page_w = pdf.w - pdf.l_margin - pdf.r_margin
+    widths = widths or [1] * len(headers)
+    col_w = [page_w * w / sum(widths) for w in widths]
+    row_h = 6
+
+    def header():
+        pdf.set_font('DejaVu', 'B', 8)
+        pdf.set_fill_color(*PDF_PRIMARY)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_draw_color(*PDF_DIVIDER)
+        for w, h in zip(col_w, headers):
+            pdf.cell(w, row_h, _pdf_fit(pdf, h, w - 2), border=1, fill=True)
+        pdf.ln(row_h)
+
+    header()
     for ri, row in enumerate(rows):
+        if pdf.will_page_break(row_h):
+            pdf.add_page()
+            header()
         is_total = total_row and ri == len(rows) - 1
         pdf.set_font('DejaVu', 'B' if is_total else '', 8)
-        if is_total:
-            pdf.set_fill_color(238, 240, 242)
-        else:
-            pdf.set_fill_color(255, 255, 255)
-        for i, cell in enumerate(row):
-            pdf.cell(col_w, 5, str(cell), border=1, fill=True)
-        pdf.ln(5)
+        pdf.set_text_color(*PDF_TEXT)
+        pdf.set_fill_color(*((238, 240, 242) if is_total else (255, 255, 255)))
+        for ci, (w, cell) in enumerate(zip(col_w, row)):
+            text = str(cell)
+            numeric = ci > 0 and (text == '—' or re.fullmatch(r'-?\d+(\.\d+)?', text) is not None)
+            pdf.cell(w, row_h, _pdf_fit(pdf, text, w - 2), border=1, fill=True, align='R' if numeric else 'L')
+        pdf.ln(row_h)
 
 
 if __name__ == '__main__':
