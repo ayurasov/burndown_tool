@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+# новый push в ту же ветку отменяет устаревший прогон
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   tests:
     runs-on: ubuntu-latest
@@ -23,7 +28,9 @@ jobs:
           python -m playwright install --with-deps chromium
 
       - name: Тесты API и PDF
+        timeout-minutes: 5
         run: pytest tests/test_api.py tests/test_pdf.py -v
 
       - name: Браузерные тесты (e2e)
+        timeout-minutes: 10
         run: pytest tests/test_e2e.py -v

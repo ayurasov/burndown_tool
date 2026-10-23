@@ -494,7 +494,7 @@ def test_non_string_fields_do_not_crash(client, admin):
     ('javascript:alert(1)', 400),
     ('https://example.com/a.png', 400),
     ('data:image/png;base64,' + 'A' * 2_300_000, 400),
-])
+], ids=['png', 'empty', 'javascript-url', 'http-url', 'too-big'])  # короткие имена: огромная строка в имени теста раздувает лог
 def test_photo_validation(make_user, photo, status):
     c = make_user('u1')
     assert c.put('/api/profile', json={'photo': photo}).status_code == status
