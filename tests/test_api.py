@@ -462,3 +462,88 @@ def test_migrate_old_database_keeps_data(db_path, monkeypatch):
     assert conn.execute('SELECT COUNT(*) FROM entries').fetchone()[0] == 24
     assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_entries_service_date'").fetchone()[0] == 1
     conn.close()
+
+
+# ─── Устойчивость к некорректным запросам ────────────────────────
+
+def test_deleted_user_session_is_invalidated(admin, make_user):
+    c = make_user('temp', project_id=1)
+    assert c.get('/api/projects').status_code == 200
+    admin.delete(f'/api/users/{c.user_id}')
+    assert c.get('/api/projects').status_code == 401
+    assert c.get('/api/projects/1/data').status_code == 401
+
+
+def test_deleted_admin_session_is_invalidated(admin, flask_app):
+    other = flask_app.test_client()
+    uid = admin.post('/api/users', json={'username': 'admin2', 'password': 'p', 'role': 'admin'}).get_json()['id']
+    assert login(other, 'admin2', 'p').status_code == 200
+    admin.delete(f'/api/users/{uid}')
+    assert other.get('/api/users').status_code == 401
+
+
+def test_non_string_fields_do_not_crash(client, admin):
+    assert client.post('/api/auth/login', json={'username': 123, 'password': 456}).status_code in (400, 401)
+    assert admin.post('/api/projects', json={'name': 42}).get_json()['name'] == '42'
+    assert admin.post('/api/users', json={'username': 7, 'password': 8}).status_code == 400
+
+
+@pytest.mark.parametrize('photo, status', [
+    ('data:image/png;base64,AAAA', 200),
+    ('', 200),
+    ('javascript:alert(1)', 400),
+    ('https://example.com/a.png', 400),
+    ('data:image/png;base64,' + 'A' * 2_300_000, 400),
+])
+def test_photo_validation(make_user, photo, status):
+    c = make_user('u1')
+    assert c.put('/api/profile', json={'photo': photo}).status_code == status
+
+
+def test_profile_personal_fields_only_for_admin(make_user, admin):
+    c = make_user('u1')
+    c.put('/api/profile', json={'displayName': 'Взлом', 'email': 'x@y'})
+    user = next(u for u in admin.get('/api/users').get_json() if u['username'] == 'u1')
+    assert user['displayName'] == '' and user['email'] == ''
+    admin.put('/api/profile', json={'displayName': 'Главный'})
+    assert admin.get('/api/auth/me').get_json()['user']['displayName'] == 'Главный'
+
+
+def test_assign_to_missing_project_or_user(admin):
+    uid = admin.post('/api/users', json={'username': 'u1', 'password': 'p'}).get_json()['id']
+    assert admin.post(f'/api/users/{uid}/projects', json={'projectId': 999}).status_code == 404
+    assert admin.post('/api/users/999/projects', json={'projectId': 1}).status_code == 404
+
+
+@pytest.mark.parametrize('orders', [None, 'x', [{'id': 1}], [{'id': '1', 'sortOrder': 1}]])
+def test_reorder_validation(admin, orders):
+    assert admin.post('/api/projects/1/services/reorder', json={'orders': orders}).status_code == 400
+
+
+def test_settings_null_values_are_ignored(admin, db_path):
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.execute('UPDATE settings SET risk_buffer_days = NULL WHERE project_id = 1')
+    conn.commit()
+    conn.close()
+    # пустое значение из БД не отдаётся фронтенду (там подставится значение по умолчанию)
+    assert 'riskBufferDays' not in admin.get('/api/projects/1/data').get_json()['settings']
+    # и null в запросе не ломает сохранение остальных настроек
+    r = admin.put('/api/projects/1/settings', json={'forecastMethod': 'average', 'riskBufferDays': None})
+    assert r.status_code == 200
+    assert admin.get('/api/projects/1/data').get_json()['settings']['forecastMethod'] == 'average'
+
+
+def test_export_matches_project_data(admin):
+    exported = admin.get('/api/projects/1/export').get_json()
+    data = admin.get('/api/projects/1/data').get_json()
+    assert {k: exported[k] for k in data} == data
+    assert admin.get('/api/projects/999/export').status_code == 404
+
+
+def test_index_redirects_deleted_user(admin, make_user):
+    c = make_user('temp')
+    assert c.get('/').status_code == 200
+    admin.delete(f'/api/users/{c.user_id}')
+    r = c.get('/')
+    assert r.status_code == 302 and r.headers['Location'].endswith('/login')

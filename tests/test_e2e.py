@@ -365,9 +365,9 @@ def test_add_user_duplicate_shows_server_error(admin_ui):
     page.fill('#newPassword', 'secret')
     page.click('#addUserForm button[type=submit]')
     admin_ui.expect_toast('Пользователь добавлен')
-    assert 'ivan' in admin_ui.cells('#usersTable tbody td:first-child')
-    # новый пользователь сразу выбран для настройки доступа
-    assert page.is_visible('#userProjectsMgmt [data-toggle="1"]')
+    page.wait_for_selector('#usersTable tbody td:first-child:text-is("ivan")')  # список перезагружается после ответа
+    # новый пользователь сразу выбран для настройки доступа (блок дорисовывается после загрузки проектов)
+    page.wait_for_selector('#userProjectsMgmt [data-toggle="1"]')
 
 
 def test_edit_user_with_quotes_in_name(admin_ui, admin):
@@ -641,3 +641,37 @@ def test_audit_load_more(admin_ui, admin):
     page.wait_for_function(f"document.querySelectorAll('#auditLogTable tbody tr').length === {app_module.AUDIT_PAGE_SIZE + 5}")
     assert admin_ui.text('#auditCount') == f'Показано записей: {app_module.AUDIT_PAGE_SIZE + 5} (все)'
     assert not page.is_visible('#auditLoadMore')
+
+
+# ─── Устойчивость интерфейса ─────────────────────────────────────
+
+def test_network_failure_message_and_rollback(admin_ui):
+    page = admin_ui.page
+    admin_ui.go('data')
+    page.route('**/api/entries/*', lambda route: route.abort())
+    cell = '#entriesTable tbody tr:last-child input[data-field="spent"]'
+    page.fill(cell, '999')
+    page.dispatch_event(cell, 'change')
+    admin_ui.expect_toast('Нет связи с сервером — изменения не сохранены')
+    page.wait_for_function(f"document.querySelector('{cell}').value === '258'")
+
+
+def test_epic_without_stage_grouped_as_no_stage(admin_ui, admin):
+    admin.put('/api/services/6', json={'etap': ''})
+    admin_ui.page.reload()
+    admin_ui.page.wait_for_selector('#summaryTable tbody tr')
+    admin_ui.go('stages')
+    assert 'Без этапа' in admin_ui.cells('#stageSummaryTable tbody td:first-child')
+    target = '#stageChartsContainer input[data-stage="Без этапа"]'
+    admin_ui.page.fill(target, '2026-09-30')
+    admin_ui.expect_toast('Целевая дата «Без этапа» обновлена')
+    assert admin.get('/api/projects/1/data').get_json()['stageTargets']['Без этапа'] == '2026-09-30'
+
+
+def test_deleted_user_is_sent_to_login(ui, make_user, admin):
+    c = make_user('temp', project_id=1)
+    ui.login('temp', 'pw-12345')
+    admin.delete(f'/api/users/{c.user_id}')
+    ui.page.click('.nav-item[data-view="stages"]')
+    ui.page.reload()
+    ui.page.wait_for_url(ui.base + '/login')

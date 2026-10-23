@@ -101,6 +101,9 @@ def close_db(error):
         db.close()
 
 
+NO_STAGE = 'Без этапа'
+
+
 def stage_key(s):
     """Ключ группировки для «Свода по этапам»: явная группа эпика или этап без подсетапа."""
     try:
@@ -109,9 +112,9 @@ def stage_key(s):
         sg = ''
     if sg:
         return sg
-    etap = s['etap'] or ''
+    etap = (s['etap'] or '').strip()
     m = re.match(r'^(Этап\s+\d+)(\.\d+)?$', etap, re.IGNORECASE)
-    return m.group(1) if m else etap
+    return m.group(1) if m else (etap or NO_STAGE)
 
 
 class ValidationError(ValueError):
@@ -151,27 +154,53 @@ def handle_validation_error(err):
     return jsonify({'error': str(err)}), 400
 
 
+def text_value(value):
+    """Строковое поле запроса: None и нестроковые значения приводятся к строке без пробелов по краям."""
+    return '' if value is None else str(value).strip()
+
+
+MAX_PHOTO_CHARS = 2_200_000  # ~1,5 МБ изображения в base64 (как ограничение в интерфейсе)
+
+
+def parse_photo(value):
+    """Фото — data:image/... URL не больше лимита; пустая строка удаляет фото."""
+    if value is None or value == '':
+        return value
+    if not isinstance(value, str) or not value.startswith('data:image/'):
+        raise ValidationError('Фото должно быть изображением')
+    if len(value) > MAX_PHOTO_CHARS:
+        raise ValidationError('Файл слишком большой (макс. 1,5 МБ)')
+    return value
+
+
 HOUR_FIELDS = {'remaining': 'Остаток', 'spent': 'Затрачено', 'estimate': 'Оценка'}
+SETTINGS_FIELDS = [
+    ('forecastMethod', 'forecast_method'),
+    ('riskBufferDays', 'risk_buffer_days'),
+    ('burnrateMethod', 'burnrate_method'),
+    ('burnrateWindowDays', 'burnrate_window_days'),
+]
 
 
 def parse_entry_values(data):
     return {f: parse_hours(data.get(f), label) for f, label in HOUR_FIELDS.items()}
 
 
-def row_to_dict(row):
-    return dict(row) if row else None
-
-
-def rows_to_dict(rows):
-    return [dict(r) for r in rows]
-
-
 # ─── Auth helpers ────────────────────────────────────────────────
+
+def get_current_user():
+    if 'user_id' not in session:
+        return None
+    db = get_db()
+    return db.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],)).fetchone()
+
 
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if 'user_id' not in session:
+        # сессия удалённого пользователя больше не действует
+        if not get_current_user():
+            session.clear()
             return jsonify({'error': 'Не авторизован'}), 401
         return f(*args, **kwargs)
     return decorated
@@ -180,21 +209,14 @@ def login_required(f):
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if 'user_id' not in session:
+        user = get_current_user()
+        if not user:
+            session.clear()
             return jsonify({'error': 'Не авторизован'}), 401
-        db = get_db()
-        user = db.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],)).fetchone()
-        if not user or user['role'] != 'admin':
+        if user['role'] != 'admin':
             return jsonify({'error': 'Доступ запрещён. Требуется роль администратора.'}), 403
         return f(*args, **kwargs)
     return decorated
-
-
-def get_current_user():
-    if 'user_id' not in session:
-        return None
-    db = get_db()
-    return db.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],)).fetchone()
 
 
 def user_project_role(user_id, project_id):
@@ -252,7 +274,8 @@ def can_view_project(user_id, project_id):
 
 @app.route('/')
 def index():
-    if 'user_id' not in session:
+    if not get_current_user():
+        session.clear()
         return redirect('/login')
     return render_template('index.html')
 
@@ -267,9 +290,9 @@ def login_page():
 @app.route('/api/auth/login', methods=['POST'])
 def api_login():
     data = request.get_json() or {}
-    username = data.get('username', '').strip()
-    password = data.get('password', '')
-    if not username or not password:
+    username = text_value(data.get('username'))
+    password = data.get('password') or ''
+    if not username or not password or not isinstance(password, str):
         return jsonify({'error': 'Введите логин и пароль'}), 400
 
     db = get_db()
@@ -351,7 +374,7 @@ def api_get_projects():
 @admin_required
 def api_create_project():
     data = request.get_json() or {}
-    name = data.get('name', '').strip()
+    name = text_value(data.get('name'))
     if not name:
         return jsonify({'error': 'Укажите название проекта'}), 400
 
@@ -376,7 +399,7 @@ def api_update_project(pid):
     project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
     if not project:
         return jsonify({'error': 'Проект не найден'}), 404
-    name = data.get('name', project['name']).strip()
+    name = text_value(data.get('name', project['name']))
     description = data.get('description', project['description'])
     if not name:
         return jsonify({'error': 'Укажите название проекта'}), 400
@@ -406,54 +429,38 @@ def api_delete_project(pid):
     return jsonify({'success': True})
 
 
+def project_payload(db, pid):
+    """Эпики, замеры, цели этапов и настройки проекта в формате фронтенда (camelCase)."""
+    services = db.execute('SELECT * FROM services WHERE project_id = ? ORDER BY sort_order, id', (pid,)).fetchall()
+    entries = db.execute(
+        'SELECT e.* FROM entries e JOIN services s ON s.id = e.service_id '
+        'WHERE s.project_id = ? ORDER BY e.date, e.id', (pid,)).fetchall()
+    stage_targets = db.execute('SELECT * FROM stage_targets WHERE project_id = ?', (pid,)).fetchall()
+    settings = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
+    return {
+        'services': [{
+            'id': s['id'], 'project_id': s['project_id'],
+            'etap': s['etap'], 'name': s['name'],
+            'targetDate': s['target_date'], 'sortOrder': s['sort_order'] if s['sort_order'] is not None else 0,
+            'isDone': bool(s['is_done']), 'stageGroup': s['stage_group'] or ''
+        } for s in services],
+        'entries': [{
+            'id': e['id'], 'service_id': e['service_id'],
+            'date': e['date'], 'remaining': e['remaining'],
+            'spent': e['spent'], 'estimate': e['estimate']
+        } for e in entries],
+        'stageTargets': {r['stage_name']: r['target_date'] for r in stage_targets},
+        # пустые значения в БД не передаём — фронтенд подставит значения по умолчанию
+        'settings': {key: settings[col] for key, col in SETTINGS_FIELDS if settings and settings[col] is not None},
+    }
+
+
 @app.route('/api/projects/<int:pid>/data')
 @login_required
 def api_get_project_data(pid):
     if not can_view_project(session['user_id'], pid):
         return jsonify({'error': 'Нет доступа к проекту'}), 403
-
-    db = get_db()
-    services = db.execute('SELECT * FROM services WHERE project_id = ? ORDER BY sort_order, id', (pid,)).fetchall()
-    service_ids = [s['id'] for s in services]
-    entries = []
-    if service_ids:
-        placeholders = ','.join('?' * len(service_ids))
-        entries = db.execute(
-            f'SELECT * FROM entries WHERE service_id IN ({placeholders}) ORDER BY date', service_ids
-        ).fetchall()
-    stage_targets = db.execute('SELECT * FROM stage_targets WHERE project_id = ?', (pid,)).fetchall()
-    settings = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
-
-    # Convert snake_case to camelCase for frontend compatibility
-    svc_list = []
-    for s in services:
-        svc_list.append({
-            'id': s['id'], 'project_id': s['project_id'],
-            'etap': s['etap'], 'name': s['name'],
-            'targetDate': s['target_date'], 'sortOrder': s['sort_order'] if s['sort_order'] is not None else 0,
-            'isDone': bool(s['is_done']), 'stageGroup': s['stage_group'] or ''
-        })
-    ent_list = []
-    for e in entries:
-        ent_list.append({
-            'id': e['id'], 'service_id': e['service_id'],
-            'date': e['date'], 'remaining': e['remaining'],
-            'spent': e['spent'], 'estimate': e['estimate']
-        })
-    settings_dict = {}
-    if settings:
-        settings_dict = {
-            'forecastMethod': settings['forecast_method'],
-            'riskBufferDays': settings['risk_buffer_days'],
-            'burnrateMethod': settings['burnrate_method'],
-            'burnrateWindowDays': settings['burnrate_window_days'],
-        }
-    return jsonify({
-        'services': svc_list,
-        'entries': ent_list,
-        'stageTargets': {r['stage_name']: r['target_date'] for r in stage_targets},
-        'settings': settings_dict,
-    })
+    return jsonify(project_payload(get_db(), pid))
 
 
 # ─── API: Services (epics) ───────────────────────────────────────
@@ -539,6 +546,9 @@ def api_reorder_services(pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     data = request.get_json() or {}
     orders = data.get('orders', [])  # list of {id, sortOrder}
+    if not isinstance(orders, list) or not all(
+            isinstance(o, dict) and isinstance(o.get('id'), int) and isinstance(o.get('sortOrder'), int) for o in orders):
+        return jsonify({'error': 'Некорректный порядок эпиков'}), 400
     db = get_db()
     for item in orders:
         db.execute('UPDATE services SET sort_order = ? WHERE id = ? AND project_id = ?',
@@ -698,19 +708,12 @@ def api_update_stage_target(pid):
 
 # ─── API: Settings ──────────────────────────────────────────────
 
-SETTINGS_FIELDS = [
-    ('forecastMethod', 'forecast_method'),
-    ('riskBufferDays', 'risk_buffer_days'),
-    ('burnrateMethod', 'burnrate_method'),
-    ('burnrateWindowDays', 'burnrate_window_days'),
-]
-
 @app.route('/api/projects/<int:pid>/settings', methods=['PUT'])
 @login_required
 def api_update_settings(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
-    data = request.get_json() or {}
+    data = {k: v for k, v in (request.get_json() or {}).items() if v is not None}  # null — не менять
     if 'forecastMethod' in data and data['forecastMethod'] not in ('linear', 'average'):
         raise ValidationError('Недопустимый метод прогноза')
     if 'burnrateMethod' in data and data['burnrateMethod'] not in ('all', 'rolling'):
@@ -782,10 +785,11 @@ def api_get_users():
 @admin_required
 def api_create_user():
     data = request.get_json() or {}
-    username = data.get('username', '').strip()
-    password = data.get('password', '')
-    if not username or not password:
+    username = text_value(data.get('username'))
+    password = data.get('password') or ''
+    if not username or not password or not isinstance(password, str):
         return jsonify({'error': 'Укажите логин и пароль'}), 400
+    parse_photo(data.get('photo'))
 
     db = get_db()
     existing = db.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
@@ -812,7 +816,7 @@ def api_update_user(uid):
     if not user:
         return jsonify({'error': 'Пользователь не найден'}), 404
 
-    new_username = data.get('username', user['username']).strip()
+    new_username = text_value(data.get('username', user['username']))
     if new_username != user['username']:
         existing_un = db.execute('SELECT id FROM users WHERE username = ? AND id != ?', (new_username, uid)).fetchone()
         if existing_un:
@@ -827,7 +831,7 @@ def api_update_user(uid):
         return jsonify({'error': 'Укажите логин'}), 400
     if uid == session['user_id'] and role != 'admin':
         return jsonify({'error': 'Нельзя снять с себя роль администратора'}), 400
-    photo = data.get('photo', user['photo'])
+    photo = parse_photo(data.get('photo', user['photo']))
     password = data.get('password')
 
     if password:
@@ -903,6 +907,10 @@ def api_assign_user_project(uid):
         return jsonify({'error': 'Недопустимая роль'}), 400
 
     db = get_db()
+    if not db.execute('SELECT 1 FROM users WHERE id = ?', (uid,)).fetchone():
+        return jsonify({'error': 'Пользователь не найден'}), 404
+    if not db.execute('SELECT 1 FROM projects WHERE id = ?', (project_id,)).fetchone():
+        return jsonify({'error': 'Проект не найден'}), 404
     existing = db.execute(
         'SELECT * FROM user_projects WHERE user_id = ? AND project_id = ?',
         (uid, project_id)
@@ -938,12 +946,13 @@ def api_update_profile():
     user = db.execute('SELECT * FROM users WHERE id = ?', (uid,)).fetchone()
     if not user:
         return jsonify({'error': 'Пользователь не найден'}), 404
-    photo = data.get('photo', user['photo'])
+    photo = parse_photo(data.get('photo', user['photo']))
     password = data.get('password')
-    # Admin can edit own display_name, email, position via profile too
-    display_name = data.get('displayName', user['display_name'])
-    email = data.get('email', user['email'])
-    position = data.get('position', user['position'])
+    # ФИО, email и должность меняет только администратор (как в интерфейсе); остальным — фото и пароль
+    is_admin = user['role'] == 'admin'
+    display_name = data.get('displayName', user['display_name']) if is_admin else user['display_name']
+    email = data.get('email', user['email']) if is_admin else user['email']
+    position = data.get('position', user['position']) if is_admin else user['position']
     if password:
         db.execute('UPDATE users SET photo = ?, display_name = ?, email = ?, position = ?, password_hash = ? WHERE id = ?',
                    (photo, display_name, email, position, generate_password_hash(password), uid))
@@ -972,49 +981,11 @@ def api_export_project(pid):
     if not can_view_project(session['user_id'], pid):
         return jsonify({'error': 'Нет доступа'}), 403
     db = get_db()
-    services = db.execute('SELECT * FROM services WHERE project_id = ? ORDER BY sort_order, id', (pid,)).fetchall()
-    service_ids = [s['id'] for s in services]
-    entries = []
-    if service_ids:
-        placeholders = ','.join('?' * len(service_ids))
-        entries = db.execute(
-            f'SELECT * FROM entries WHERE service_id IN ({placeholders}) ORDER BY date', service_ids
-        ).fetchall()
-    stage_targets = db.execute('SELECT * FROM stage_targets WHERE project_id = ?', (pid,)).fetchall()
-    settings = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
     project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
-
-    # Convert to camelCase for frontend
-    svc_list = []
-    for s in services:
-        svc_list.append({
-            'id': s['id'], 'project_id': s['project_id'],
-            'etap': s['etap'], 'name': s['name'],
-            'targetDate': s['target_date'], 'sortOrder': s['sort_order'] if s['sort_order'] is not None else 0,
-            'isDone': bool(s['is_done']), 'stageGroup': s['stage_group'] or ''
-        })
-    ent_list = []
-    for e in entries:
-        ent_list.append({
-            'id': e['id'], 'service_id': e['service_id'],
-            'date': e['date'], 'remaining': e['remaining'],
-            'spent': e['spent'], 'estimate': e['estimate']
-        })
-    settings_dict = {}
-    if settings:
-        settings_dict = {
-            'forecastMethod': settings['forecast_method'],
-            'riskBufferDays': settings['risk_buffer_days'],
-            'burnrateMethod': settings['burnrate_method'],
-            'burnrateWindowDays': settings['burnrate_window_days'],
-        }
-    payload = json.dumps({
-        'project': {'name': project['name'], 'description': project['description']},
-        'services': svc_list,
-        'entries': ent_list,
-        'stageTargets': {r['stage_name']: r['target_date'] for r in stage_targets},
-        'settings': settings_dict,
-    }, ensure_ascii=False, indent=2)
+    if not project:
+        return jsonify({'error': 'Проект не найден'}), 404
+    payload = json.dumps(dict({'project': {'name': project['name'], 'description': project['description']}},
+                              **project_payload(db, pid)), ensure_ascii=False, indent=2)
     filename = f"Burndown_export_{datetime.now().strftime('%Y-%m-%d_%H%M')}.json"
     return Response(payload, mimetype='application/json',
                     headers={'Content-Disposition': f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename)}"})

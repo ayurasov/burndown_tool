@@ -110,3 +110,8 @@ def test_daily_rates_skip_empty_measurements():
 ])
 def test_stage_key(stage_group, etap, expected):
     assert app_module.stage_key({'stage_group': stage_group, 'etap': etap}) == expected
+
+
+def test_stage_key_empty_etap():
+    assert app_module.stage_key({'stage_group': '', 'etap': ''}) == 'Без этапа'
+    assert app_module.stage_key({'stage_group': None, 'etap': '  Этап 2.1 '}) == 'Этап 2'

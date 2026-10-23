@@ -16,7 +16,8 @@ var selectedAdminUser = null;
 function localIsoDate(d){
   return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
 }
-var TODAY = localIsoDate(new Date());
+/* «Сегодня» вычисляется при каждом обращении — вкладка может быть открыта после полуночи */
+function todayIso(){ return localIsoDate(new Date()); }
 
 var dashboardFilter = { hideDone:false, epics:null }; /* epics: {id:bool} выбор эпиков для дашборда; null = видны все */
 var stageShowDone = false; /* показывать сданные эпики в своде по этапам */
@@ -32,7 +33,12 @@ function api(url, opts){
   opts = opts || {};
   opts.headers = opts.headers || {};
   opts.headers['Content-Type'] = 'application/json';
-  return fetch(url, Object.assign({credentials:'same-origin'}, opts)).then(function(r){
+  return fetch(url, Object.assign({credentials:'same-origin'}, opts)).catch(function(){
+    toast('Нет связи с сервером — изменения не сохранены');
+    var err = new Error('network');
+    err.handled = true;
+    throw err;
+  }).then(function(r){
     if(r.status === 401){ window.location.href = '/login'; throw new Error('Unauthorized'); }
     return r.json().catch(function(){ return {}; }).then(function(data){
       if(!r.ok){
@@ -277,9 +283,9 @@ function stageKeyOf(s){
   /* Ключ группы в «Своде по этапам»: явная группа эпика, иначе этап без подсетапа */
   var sg = (s.stageGroup || '').trim();
   if(sg) return sg;
-  var etap = s.etap || '';
+  var etap = (s.etap || '').trim();
   var match = etap.match(/^(Этап\s+\d+)(\.\d+)?$/i);
-  return match ? match[1] : etap;
+  return match ? match[1] : (etap || 'Без этапа');
 }
 
 function computeStageGroups(){
@@ -945,7 +951,7 @@ var todayLinePlugin = {
     var x = chart.scales && chart.scales.x;
     var area = chart.chartArea;
     if(!x || !area || x.type !== 'time') return;
-    var t = Date.parse(TODAY + 'T00:00:00');
+    var t = Date.parse(todayIso() + 'T00:00:00');
     if(t < x.min || t > x.max) return;
     var px = x.getPixelForValue(t);
     var ctx = chart.ctx;
@@ -1043,6 +1049,8 @@ function saveService(svc){
 
 /* Enter / Shift+Enter — переход к тому же полю в следующей / предыдущей строке таблицы */
 function enableEnterNavigation(table){
+  if(table.dataset.enterNav) return;  /* таблица перерисовывается, а обработчик на ней — один */
+  table.dataset.enterNav = '1';
   table.addEventListener('keydown', function(e){
     if(e.key !== 'Enter' || e.target.tagName !== 'INPUT') return;
     e.preventDefault();
@@ -1496,9 +1504,6 @@ function renderProjectsMgmtTable(){
 function renderUsersView(){
   loadUsers().then(renderUserProjectsMgmt);
 }
-function renderProjectsView(){
-  renderProjectsMgmtTable();
-}
 
 /* ════════════════════════════════════════════════════════════════
    Role-based UI
@@ -1690,7 +1695,8 @@ document.getElementById('btnAddRow').addEventListener('click', function(){
   var rows = entriesForService(currentDataServiceId);
   /* сегодняшняя дата, если она позже последнего замера; иначе — следующий день после последнего */
   var lastDate = rows.length ? rows[rows.length-1].date : null;
-  var newDate = (!lastDate || TODAY > lastDate) ? TODAY : addDays(lastDate, 1);
+  var today = todayIso();
+  var newDate = (!lastDate || today > lastDate) ? today : addDays(lastDate, 1);
   var sid = currentDataServiceId;
   apiPost('/api/services/'+sid+'/entries', {date:newDate, remaining:null, spent:null, estimate:null}).then(function(data){
     STATE.entries.push({id:data.id, service_id:sid, date:newDate, remaining:null, spent:null, estimate:null});
@@ -1715,18 +1721,19 @@ function openBulkMeasurement(){
   if(!services.length) services = STATE.services.slice();
   if(!services.length){ toast('Сначала добавьте эпик'); return; }
   var fields = ['remaining', 'spent', 'estimate'];
+  var FIELD_LABELS = {remaining:'Остаток, ч', spent:'Затрачено, ч', estimate:'Оценка, ч'};
   openModal({
     title: 'Замер по всем эпикам', okLabel: 'Сохранить', wide: true,
     html:
       '<div class="bulk-head">'+
-        '<label class="small" for="bulkDate">Дата замера</label><input type="date" id="bulkDate" value="'+TODAY+'">'+
+        '<label class="small" for="bulkDate">Дата замера</label><input type="date" id="bulkDate" value="'+todayIso()+'">'+
         '<button type="button" class="btn btn-ghost btn-sm" id="bulkFillPrev" title="Заполнить пустые поля значениями предыдущего замера">Подставить прошлые значения</button>'+
       '</div>'+
       '<p class="bulk-note">Пустые строки не сохраняются. Если замер на эту дату уже есть, он будет обновлён. Серым показаны значения предыдущего замера; сданные эпики не выводятся.</p>'+
       '<div class="table-scroll"><table class="data-table compact-table bulk-table" id="bulkTable"><thead><tr><th>Эпик</th><th class="num">Остаток, ч</th><th class="num">Затрачено, ч</th><th class="num">Оценка, ч</th></tr></thead><tbody>'+
       services.map(function(s){
         return '<tr data-sid="'+s.id+'"><td><span class="bulk-etap">'+escapeHtml(s.etap)+'</span> '+escapeHtml(s.name)+'</td>'+
-          fields.map(function(f){ return '<td><input type="number" step="0.01" min="0" data-field="'+f+'"></td>'; }).join('')+'</tr>';
+          fields.map(function(f){ return '<td data-label="'+FIELD_LABELS[f]+'"><input type="number" step="0.01" min="0" data-field="'+f+'" aria-label="'+FIELD_LABELS[f]+'"></td>'; }).join('')+'</tr>';
       }).join('')+
       '</tbody></table></div>',
     onOk: function(){
@@ -1771,7 +1778,7 @@ function openBulkMeasurement(){
       tr.querySelectorAll('input').forEach(function(inp){
         var f = inp.dataset.field;
         inp.value = existing && isNum(existing[f]) ? existing[f] : '';
-        inp.placeholder = isNum(prev[f]) ? fmtNum(prev[f]) : '';
+        inp.placeholder = isNum(prev[f]) ? (Math.round(prev[f]*100)/100).toLocaleString('ru-RU', {maximumFractionDigits:2, useGrouping:false}) : '';
         inp.dataset.prev = isNum(prev[f]) ? prev[f] : '';
       });
     });
@@ -1790,7 +1797,7 @@ document.getElementById('btnBulkMeasure').addEventListener('click', openBulkMeas
 document.getElementById('btnAddService').addEventListener('click', function(){
   if(!canEdit()){ toast('Нет прав на редактирование'); return; }
   var last = STATE.services[STATE.services.length-1];
-  var svc = {etap: last ? last.etap : 'Этап 1', name: 'Новый эпик', targetDate: TODAY};
+  var svc = {etap: last ? last.etap : 'Этап 1', name: 'Новый эпик', targetDate: todayIso()};
   apiPost('/api/projects/'+currentProjectId+'/services', svc).then(function(data){
     var maxOrder = STATE.services.reduce(function(m, s){ return Math.max(m, s.sortOrder||0); }, 0);
     STATE.services.push(Object.assign(svc, {id:data.id, project_id:currentProjectId, isDone:false, stageGroup:'', sortOrder:maxOrder+1}));
@@ -1979,6 +1986,8 @@ function switchProject(pid){
   currentProjectId = pid;
   currentProjectRole = proj ? proj.role : null;
   currentDataServiceId = null;
+  /* данные прежнего проекта не должны быть видны (и редактируемы) под новым, пока грузятся новые */
+  STATE = { services:[], entries:[], stageTargets:{}, settings:Object.assign({}, DEFAULT_SETTINGS) };
   dashboardFilter = { hideDone: dashboardFilter.hideDone, epics: null };
   stageShowDone = false;
   resetBurnRanges();

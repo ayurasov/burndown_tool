@@ -378,6 +378,17 @@ table.bulk-table{min-width:520px;}
 .bulk-table input{width:100%;text-align:right;font-family:var(--font-mono);}
 .bulk-table input::placeholder{color:var(--color-text-faint);}
 .bulk-etap{color:var(--color-text-muted);font-size:var(--text-xs);white-space:nowrap;}
+/* на узком экране строки превращаются в карточки: эпик и три поля с подписями */
+@media (max-width:560px){
+  table.bulk-table{min-width:0;}
+  .bulk-table thead{display:none;}
+  .bulk-table tbody tr{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--space-1) var(--space-2);padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider);}
+  .bulk-table tbody tr:last-child{border-bottom:none;}
+  .bulk-table tbody td{border:none;padding:0 var(--space-2);}
+  .bulk-table tbody td:first-child{grid-column:1/-1;min-width:0;}
+  .bulk-table tbody td[data-label]::before{content:attr(data-label);display:block;font-size:10px;color:var(--color-text-muted);margin-bottom:2px;}
+  .bulk-table tbody tr:hover td{background:none;}
+}
 
 /* ── Print ────────────────────────────────────────────────────── */
 @media print{
