@@ -1,8 +1,8 @@
 """Браузерные (e2e) тесты интерфейса на Playwright.
 
 Требуют установленный Chromium для Playwright (`playwright install chromium`)
-или путь к браузеру в переменной окружения CHROMIUM_PATH. Chart.js грузится с CDN,
-поэтому нужен доступ в интернет; без браузера или CDN тесты пропускаются.
+или путь к браузеру в переменной окружения CHROMIUM_PATH; без браузера тесты пропускаются.
+Chart.js и шрифты подключаются локально (static/vendor), доступ в интернет не нужен.
 """
 
 import os
@@ -42,8 +42,7 @@ class App:
         self.page.fill('#password', password)
         self.page.click('button[type=submit]')
         self.page.wait_for_url(self.base + '/')
-        if not self.page.evaluate('typeof Chart !== "undefined"'):
-            pytest.skip('Chart.js (CDN) недоступен')
+        assert self.page.evaluate('typeof Chart !== "undefined"'), 'Chart.js не загрузился'
         self.page.wait_for_selector('#summaryTable tbody tr, #view-empty.active, #view-projects.active')
         return self
 
@@ -432,3 +431,183 @@ def test_audit_log_shows_changes(admin_ui):
     page.select_option('#auditFilterPage', 'services')
     page.wait_for_load_state('networkidle')
     assert set(admin_ui.cells('#auditLogTable tbody td:nth-child(4)')) == {'Эпики'}
+
+
+# ─── Статусы, рост оценки, burn rate ─────────────────────────────
+
+def test_status_without_target_and_non_burning_epic(admin_ui, admin):
+    admin.put('/api/services/3', json={'targetDate': ''})
+    admin_ui.page.reload()
+    admin_ui.page.wait_for_selector('#summaryTable tbody tr')
+    ksbo = admin_ui.cells('#summaryTable tbody tr:has-text("КСБО") td')
+    assert ksbo[-1] == 'Нет цели'
+    # остаток «Планирования закупок» растёт (55 → 86) — прогноз не достигает нуля
+    plan = admin_ui.cells('#summaryTable tbody tr:has-text("Планирование закупок") td')
+    assert plan[-2] == 'не сгорает' and plan[-1] == '✗ Не успеваем'
+
+
+def test_scope_change_and_negative_burn_highlight(admin_ui):
+    row = '#summaryTable tbody tr:has-text("Работа с жалобами")'
+    scope = admin_ui.page.locator(f'{row} td:nth-child(5)')
+    assert scope.text_content() == '+251 ч'  # оценка 150 → 401
+    assert 'scope-up' in scope.get_attribute('class')
+    neg = admin_ui.page.locator('#burnRateTable td.neg')
+    assert neg.count() > 0 and neg.first.get_attribute('title') == 'Остаток вырос'
+    assert admin_ui.page.locator('#burnRateTable tbody tr:first-child td:nth-child(4)').text_content() == '-56,25'
+
+
+def test_today_line_plugin_registered(admin_ui):
+    assert admin_ui.page.evaluate("!!Chart.registry.plugins.get('todayLine')")
+
+
+def test_stage_sum_carries_forward_last_values(admin_ui, admin):
+    """Замер только по одному эпику этапа не «проваливает» сумму: второй эпик берётся по последнему значению."""
+    admin.post('/api/services/1/entries', json={'date': '2026-07-30', 'remaining': 300})
+    admin_ui.page.reload()
+    admin_ui.page.wait_for_selector('#summaryTable tbody tr')
+    admin_ui.go('stages')
+    stage4 = admin_ui.cells('#stageSummaryTable tbody tr:has-text("Этап 4") td')
+    assert stage4[2] == '514,34 ч'  # 300 + 214,34 (последний остаток КЦД), а не 300
+
+
+# ─── Данные: новый замер, клавиатура, откат ──────────────────────
+
+def test_new_row_defaults_to_today(admin_ui):
+    import datetime
+    admin_ui.go('data')
+    admin_ui.page.click('#btnAddRow')
+    admin_ui.expect_toast('Добавлена новая дата')
+    dates = [admin_ui.page.input_value(f'#entriesTable tbody tr:nth-child({i}) input[data-field="date"]') for i in range(1, 6)]
+    assert dates[-1] == datetime.date.today().isoformat()
+
+
+def test_enter_moves_to_next_row(admin_ui):
+    page = admin_ui.page
+    admin_ui.go('data')
+    page.focus('#entriesTable tbody tr:nth-child(1) input[data-field="spent"]')
+    page.keyboard.press('Enter')
+    assert page.evaluate("document.activeElement.closest('tr').rowIndex") == 2
+    assert page.evaluate("document.activeElement.dataset.field") == 'spent'
+    page.keyboard.press('Shift+Enter')
+    assert page.evaluate("document.activeElement.closest('tr').rowIndex") == 1
+
+
+def test_failed_save_rolls_back(admin_ui):
+    page = admin_ui.page
+    admin_ui.go('data')
+    page.route('**/api/entries/*', lambda route: route.fulfill(status=500, content_type='application/json',
+                                                               body='{"error": "База недоступна"}'))
+    cell = '#entriesTable tbody tr:last-child input[data-field="remaining"]'
+    page.fill(cell, '1')
+    page.dispatch_event(cell, 'change')
+    admin_ui.expect_toast('База недоступна')
+    page.wait_for_function(f"document.querySelector('{cell}').value === '346'")
+    page.unroute('**/api/entries/*')
+    admin_ui.go('dashboard')
+    assert admin_ui.cells('#summaryTable tbody tr:first-child td')[2] == '346 ч'
+
+
+def test_negative_value_rejected_in_table(admin_ui):
+    page = admin_ui.page
+    admin_ui.go('data')
+    cell = '#entriesTable tbody tr:last-child input[data-field="remaining"]'
+    page.fill(cell, '-5')
+    page.dispatch_event(cell, 'change')
+    admin_ui.expect_toast('Введите число не меньше 0')
+    assert page.input_value(cell) == '346'
+
+
+# ─── Замер по всем эпикам ────────────────────────────────────────
+
+def test_bulk_measurement_modal(admin_ui, admin):
+    page = admin_ui.page
+    admin_ui.go('data')
+    page.click('#btnBulkMeasure')
+    assert admin_ui.text('#confirmTitle') == 'Замер по всем эпикам'
+    assert page.locator('#bulkTable tbody tr').count() == 6
+    # на существующую дату подставляются сохранённые значения
+    page.fill('#bulkDate', '2026-07-29')
+    assert page.input_value('#bulkTable tr[data-sid="1"] input[data-field="remaining"]') == '346'
+    # на новую дату — пустые поля с подсказкой прошлого замера
+    page.fill('#bulkDate', '2026-07-30')
+    first = '#bulkTable tr[data-sid="1"] input[data-field="estimate"]'
+    assert page.input_value(first) == '' and page.get_attribute(first, 'placeholder') == '401'
+    page.click('#bulkFillPrev')
+    assert page.input_value(first) == '401'
+    page.fill('#bulkTable tr[data-sid="1"] input[data-field="remaining"]', '320')
+    page.fill('#bulkTable tr[data-sid="2"] input[data-field="remaining"]', '200')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Сохранено замеров: 6')  # остальные строки заполнены прошлыми значениями
+    page.wait_for_selector('#confirmModal:not(.show)', state='attached')
+    entries = [e for e in admin.get('/api/projects/1/data').get_json()['entries'] if e['date'] == '2026-07-30']
+    assert {e['service_id']: e['remaining'] for e in entries}[1] == 320
+    admin_ui.go('dashboard')
+    assert admin_ui.cells('#kpiGrid .kpi-value')[4] == '1 194 ч'  # 320 + 200 + 109 + 201 + 278 + 86
+
+
+def test_bulk_measurement_requires_values(admin_ui):
+    admin_ui.go('data')
+    admin_ui.page.click('#btnBulkMeasure')
+    admin_ui.page.click('#confirmOk')
+    admin_ui.expect_toast('Заполните хотя бы одно значение')
+    assert admin_ui.page.is_visible('#confirmModal.show')
+
+
+def test_bulk_measurement_hidden_for_viewer(ui, make_user):
+    make_user('viewer', project_id=1)
+    ui.login('viewer', 'pw-12345')
+    ui.go('data')
+    assert not ui.page.is_visible('#btnBulkMeasure')
+
+
+# ─── Дашборд: сворачиваемый блок, печать, офлайн ─────────────────
+
+def test_all_epics_block_collapse_is_remembered(admin_ui):
+    page = admin_ui.page
+    assert page.evaluate("!!Chart.getChart('chartRemainingAll')")
+    page.click('#allEpicsBlock > summary')
+    assert not page.is_visible('#chartRemainingAll')
+    page.reload()
+    page.wait_for_selector('#summaryTable tbody tr')
+    assert page.evaluate("document.getElementById('allEpicsBlock').open") is False
+    assert page.evaluate("!Chart.getChart('chartRemainingAll')")
+    page.click('#allEpicsBlock > summary')
+    page.wait_for_function("!!Chart.getChart('chartRemainingAll')")
+
+
+def test_print_layout_hides_navigation(admin_ui):
+    page = admin_ui.page
+    assert page.is_visible('#btnPrint')
+    page.emulate_media(media='print')
+    assert not page.is_visible('.sidebar') and not page.is_visible('#btnPdf')
+    assert page.is_visible('#kpiGrid') and page.is_visible('#chartRemaining')
+    page.emulate_media(media='screen')
+    admin_ui.go('data')
+    assert not page.is_visible('#btnPrint')
+
+
+def test_no_external_requests(browser, live_server):
+    ctx = browser.new_context()
+    page = ctx.new_page()
+    external = []
+    page.on('request', lambda r: None if r.url.startswith(live_server) or r.url.startswith('data:') else external.append(r.url))
+    app = App(page, live_server).login(*ADMIN)
+    app.go('stages')
+    assert external == [], f'Внешние запросы: {external}'
+    ctx.close()
+
+
+# ─── Реестр: «Показать ещё» ──────────────────────────────────────
+
+def test_audit_load_more(admin_ui, admin):
+    import app as app_module
+    for i in range(app_module.AUDIT_PAGE_SIZE + 5):
+        admin.put('/api/services/1', json={'name': f'Имя {i}'})
+    page = admin_ui.page
+    admin_ui.go('audit')
+    assert page.locator('#auditLogTable tbody tr').count() == app_module.AUDIT_PAGE_SIZE
+    assert admin_ui.text('#auditCount') == f'Показано записей: {app_module.AUDIT_PAGE_SIZE}'
+    page.click('#auditLoadMore')
+    page.wait_for_function(f"document.querySelectorAll('#auditLogTable tbody tr').length === {app_module.AUDIT_PAGE_SIZE + 5}")
+    assert admin_ui.text('#auditCount') == f'Показано записей: {app_module.AUDIT_PAGE_SIZE + 5} (все)'
+    assert not page.is_visible('#auditLoadMore')

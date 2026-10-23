@@ -6,13 +6,9 @@
 <title>Диаграммы сгорания (burndown)</title>
 <link rel="icon" type="image/svg+xml" href="/static/img/favicon.svg">
 <script>try{document.documentElement.setAttribute('data-theme',localStorage.getItem('burndown-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'));}catch(e){}</script>
-<link rel="preconnect" href="https://api.fontshare.com" crossorigin>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600,700&display=swap" rel="stylesheet">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<link rel="stylesheet" href="/static/vendor/fonts/fonts.css">
+<script src="/static/vendor/chart.umd.min.js"></script>
+<script src="/static/vendor/chartjs-adapter-date-fns.bundle.min.js"></script>
 <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
@@ -79,7 +75,8 @@
         </div>
       </div>
       <div class="topbar-actions">
-        <button type="button" class="btn btn-ghost btn-sm" id="btnPdf" style="display:none;" title="Выгрузить раздел в PDF с учётом фильтров">⬇ PDF</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="btnPrint" style="display:none;" title="Печать раздела с графиками (в т.ч. сохранение в PDF через диалог печати)">🖶 Печать</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="btnPdf" style="display:none;" title="Выгрузить таблицы раздела в PDF с учётом фильтров">⬇ PDF</button>
         <button type="button" class="theme-toggle" id="themeToggle" aria-label="Переключить тему"></button>
       </div>
     </div>
@@ -129,28 +126,33 @@
           <div class="chart-wrap chart-wrap-sm"><canvas id="chartEstimateEpic"></canvas></div>
         </div>
       </div>
-      <div class="panel">
-        <div class="panel-head">
-          <div>
-            <div class="panel-title">Оставшееся время — все эпики</div>
-            <div class="section-note">Сравнение динамики остатка по выбранным эпикам</div>
+      <details class="collapsible" id="allEpicsBlock" open>
+        <summary class="collapsible-summary">Графики по всем выбранным эпикам <span class="collapsible-hint">остаток, затраченное время и оценка</span></summary>
+        <div class="view-stack">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="panel-title">Оставшееся время — все эпики</div>
+                <div class="section-note">Сравнение динамики остатка по выбранным эпикам</div>
+              </div>
+            </div>
+            <div class="legend-row" id="legendRemainingAll"></div>
+            <div class="chart-wrap"><canvas id="chartRemainingAll"></canvas></div>
+          </div>
+          <div class="chart-grid">
+            <div class="panel">
+              <div class="panel-head"><div class="panel-title">Затраченное время — все эпики</div></div>
+              <div class="legend-row" id="legendSpent"></div>
+              <div class="chart-wrap chart-wrap-sm"><canvas id="chartSpent"></canvas></div>
+            </div>
+            <div class="panel">
+              <div class="panel-head"><div class="panel-title">Первоначальная оценка — все эпики</div></div>
+              <div class="legend-row" id="legendEstimate"></div>
+              <div class="chart-wrap chart-wrap-sm"><canvas id="chartEstimate"></canvas></div>
+            </div>
           </div>
         </div>
-        <div class="legend-row" id="legendRemainingAll"></div>
-        <div class="chart-wrap"><canvas id="chartRemainingAll"></canvas></div>
-      </div>
-      <div class="chart-grid">
-        <div class="panel">
-          <div class="panel-head"><div class="panel-title">Затраченное время — все эпики</div></div>
-          <div class="legend-row" id="legendSpent"></div>
-          <div class="chart-wrap chart-wrap-sm"><canvas id="chartSpent"></canvas></div>
-        </div>
-        <div class="panel">
-          <div class="panel-head"><div class="panel-title">Первоначальная оценка — все эпики</div></div>
-          <div class="legend-row" id="legendEstimate"></div>
-          <div class="chart-wrap chart-wrap-sm"><canvas id="chartEstimate"></canvas></div>
-        </div>
-      </div>
+      </details>
       <div class="panel">
         <div class="panel-head"><div class="panel-title">Сводка по всем эпикам</div></div>
         <div class="table-scroll"><table class="data-table" id="summaryTable"></table></div>
@@ -215,7 +217,8 @@
           <div class="panel-controls">
             <label class="small" for="dataServiceSelect">Эпик</label>
             <select id="dataServiceSelect" class="filter-input select-wide"></select>
-            <button type="button" class="btn btn-primary btn-sm" id="btnAddRow">+ Новая дата</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="btnAddRow">+ Новая дата</button>
+            <button type="button" class="btn btn-primary btn-sm" id="btnBulkMeasure" title="Ввести замер на одну дату сразу по всем эпикам">Замер по всем эпикам</button>
           </div>
         </div>
         <div class="table-scroll"><table class="data-table compact-table entries-table" id="entriesTable"></table></div>
@@ -334,7 +337,11 @@
             <button type="button" class="btn btn-ghost btn-sm" id="auditResetFilters">Сбросить</button>
           </div>
         </div>
-        <div class="table-scroll"><table class="data-table" id="auditLogTable"></table></div>
+        <div class="table-scroll table-scroll-tall"><table class="data-table" id="auditLogTable"></table></div>
+        <div class="load-more" id="auditMore" hidden>
+          <span class="small" id="auditCount"></span>
+          <button type="button" class="btn btn-ghost btn-sm" id="auditLoadMore">Показать ещё</button>
+        </div>
       </div>
     </section>
   </main>

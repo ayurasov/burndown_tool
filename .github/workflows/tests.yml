@@ -1,0 +1,29 @@
+name: Тесты
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Установка зависимостей
+        run: |
+          pip install -r requirements-dev.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Тесты API и PDF
+        run: pytest tests/test_api.py tests/test_pdf.py -v
+
+      - name: Браузерные тесты (e2e)
+        run: pytest tests/test_e2e.py -v

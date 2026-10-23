@@ -14,6 +14,13 @@ from werkzeug.security import generate_password_hash
 DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'burndown.db'))
 
 
+def create_indexes(conn):
+    """Индексы для частых выборок; создаются идемпотентно и не меняют данные."""
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_entries_service_date ON entries(service_id, date)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_services_project ON services(project_id)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_audit_project ON audit_log(project_id)')
+
+
 def init_db():
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
@@ -219,6 +226,8 @@ def init_db():
         INSERT INTO settings (project_id)
         VALUES (2)
     ''')
+
+    create_indexes(conn)
 
     conn.commit()
     conn.close()

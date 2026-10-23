@@ -10,6 +10,8 @@
 
 import os
 import re
+import math
+import secrets
 import sqlite3
 import json
 from functools import wraps
@@ -22,13 +24,48 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
+from init_db import create_indexes
+
 app = Flask(__name__, static_folder='static', template_folder='templates')
-app.secret_key = os.environ.get('SECRET_KEY', 'burndown-secret-key-change-in-production')
 DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'burndown.db'))
 
 
+def load_secret_key():
+    """SECRET_KEY из окружения; иначе случайный ключ, сохраняемый рядом с БД (общий для всех воркеров)."""
+    env_key = os.environ.get('SECRET_KEY')
+    if env_key:
+        return env_key
+    key_path = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), '.secret_key')
+    try:
+        with open(key_path, encoding='utf-8') as f:
+            key = f.read().strip()
+            if key:
+                return key
+    except FileNotFoundError:
+        pass
+    key = secrets.token_hex(32)
+    try:
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(key)
+    except FileExistsError:
+        # другой воркер успел создать файл — используем его ключ
+        with open(key_path, encoding='utf-8') as f:
+            return f.read().strip()
+    return key
+
+
+app.secret_key = load_secret_key()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    # при работе по HTTPS включите: SESSION_COOKIE_SECURE=1
+    SESSION_COOKIE_SECURE=os.environ.get('SESSION_COOKIE_SECURE', '').lower() in ('1', 'true', 'yes'),
+)
+
+
 def migrate_db():
-    """Дополняет таблицу services полями is_done и stage_group для старых баз."""
+    """Дополняет таблицу services полями is_done и stage_group для старых баз и создаёт индексы."""
     if not os.path.exists(DB_PATH):
         return
     conn = sqlite3.connect(DB_PATH)
@@ -38,6 +75,7 @@ def migrate_db():
             conn.execute('ALTER TABLE services ADD COLUMN is_done INTEGER DEFAULT 0')
         if 'stage_group' not in cols:
             conn.execute('ALTER TABLE services ADD COLUMN stage_group TEXT')
+        create_indexes(conn)
         conn.commit()
     finally:
         conn.close()
@@ -74,6 +112,50 @@ def stage_key(s):
     etap = s['etap'] or ''
     m = re.match(r'^(Этап\s+\d+)(\.\d+)?$', etap, re.IGNORECASE)
     return m.group(1) if m else etap
+
+
+class ValidationError(ValueError):
+    pass
+
+
+def parse_hours(value, field):
+    """Часы: пусто → None; иначе конечное число ≥ 0."""
+    if value is None or value == '':
+        return None
+    if isinstance(value, bool):
+        raise ValidationError(f'Поле «{field}»: ожидается число')
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        raise ValidationError(f'Поле «{field}»: ожидается число')
+    if not math.isfinite(num) or num < 0:
+        raise ValidationError(f'Поле «{field}»: число должно быть не меньше 0')
+    return num
+
+
+def parse_date(value, field, required=True):
+    """Дата в формате ГГГГ-ММ-ДД; пусто допустимо, если required=False."""
+    if value is None or value == '':
+        if required:
+            raise ValidationError(f'Укажите поле «{field}»')
+        return value
+    try:
+        datetime.strptime(str(value), '%Y-%m-%d')
+    except ValueError:
+        raise ValidationError(f'Поле «{field}»: некорректная дата')
+    return str(value)
+
+
+@app.errorhandler(ValidationError)
+def handle_validation_error(err):
+    return jsonify({'error': str(err)}), 400
+
+
+HOUR_FIELDS = {'remaining': 'Остаток', 'spent': 'Затрачено', 'estimate': 'Оценка'}
+
+
+def parse_entry_values(data):
+    return {f: parse_hours(data.get(f), label) for f, label in HOUR_FIELDS.items()}
 
 
 def row_to_dict(row):
@@ -135,7 +217,7 @@ def can_edit_project(user_id, project_id):
     return role in ('admin', 'manager')
 
 
-def audit_log(page, action, entity_type=None, entity_id=None, project_id=None, changes=None, entity_name=None):
+def audit_log(page, action, entity_type=None, entity_id=None, project_id=None, changes=None, entity_name=None, commit=True):
     """Log a change to audit_log table. changes is a list of {field, old, new} dicts."""
     db = get_db()
     uid = session.get('user_id')
@@ -158,7 +240,8 @@ def audit_log(page, action, entity_type=None, entity_id=None, project_id=None, c
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (uid, username, project_id, project_name, page, action,
              entity_type, entity_id, entity_name, ch.get('field'), ch.get('old'), ch.get('new')))
-    db.commit()
+    if commit:
+        db.commit()
 
 
 def can_view_project(user_id, project_id):
@@ -381,6 +464,7 @@ def api_create_service(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     data = request.get_json() or {}
+    parse_date(data.get('targetDate'), 'Целевая дата', required=False)
     db = get_db()
     max_order = db.execute('SELECT COALESCE(MAX(sort_order), 0) FROM services WHERE project_id = ?', (pid,)).fetchone()[0]
     cur = db.execute(
@@ -404,6 +488,8 @@ def api_update_service(sid):
     if not can_edit_project(session['user_id'], svc['project_id']):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     data = request.get_json() or {}
+    if 'targetDate' in data:
+        parse_date(data['targetDate'], 'Целевая дата', required=False)
     is_done = 1 if data.get('isDone', bool(svc['is_done'])) else 0
     stage_group = data.get('stageGroup', svc['stage_group'])
     changes = []
@@ -473,11 +559,13 @@ def api_create_entry(sid):
     if not can_edit_project(session['user_id'], svc['project_id']):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     data = request.get_json() or {}
-    if not data.get('date'):
-        return jsonify({'error': 'Укажите дату замера'}), 400
+    date = parse_date(data.get('date'), 'Дата замера')
+    vals = parse_entry_values(data)
+    if db.execute('SELECT 1 FROM entries WHERE service_id = ? AND date = ?', (sid, date)).fetchone():
+        return jsonify({'error': 'Замер на эту дату уже есть'}), 400
     cur = db.execute(
         'INSERT INTO entries (service_id, date, remaining, spent, estimate) VALUES (?, ?, ?, ?, ?)',
-        (sid, data.get('date'), data.get('remaining'), data.get('spent'), data.get('estimate'))
+        (sid, date, vals['remaining'], vals['spent'], vals['estimate'])
     )
     db.commit()
     audit_log('data', 'create', 'entry', cur.lastrowid, svc['project_id'],
@@ -496,24 +584,71 @@ def api_update_entry(eid):
     if not svc or not can_edit_project(session['user_id'], svc['project_id']):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     data = request.get_json() or {}
+    date = parse_date(data.get('date', entry['date']), 'Дата замера')
+    vals = parse_entry_values(data)
+    if date != entry['date'] and db.execute(
+            'SELECT 1 FROM entries WHERE service_id = ? AND date = ? AND id != ?',
+            (entry['service_id'], date, eid)).fetchone():
+        return jsonify({'error': 'Замер на эту дату уже есть'}), 400
     changes = []
-    for field, old_val, new_val in [
-        ('date', entry['date'], data.get('date', entry['date'])),
-        ('remaining', entry['remaining'], data.get('remaining')),
-        ('spent', entry['spent'], data.get('spent')),
-        ('estimate', entry['estimate'], data.get('estimate')),
-    ]:
-        if str(old_val) != str(new_val):
-            changes.append({'field': field, 'old': str(old_val), 'new': str(new_val)})
+    for field, old_val, new_val in [('date', entry['date'], date)] + [(f, entry[f], vals[f]) for f in HOUR_FIELDS]:
+        if old_val != new_val:
+            changes.append({'field': field, 'old': None if old_val is None else str(old_val),
+                            'new': None if new_val is None else str(new_val)})
     db.execute(
         'UPDATE entries SET date = ?, remaining = ?, spent = ?, estimate = ? WHERE id = ?',
-        (data.get('date', entry['date']),
-         data.get('remaining'), data.get('spent'), data.get('estimate'), eid)
+        (date, vals['remaining'], vals['spent'], vals['estimate'], eid)
     )
     db.commit()
     if changes:
         audit_log('data', 'update', 'entry', eid, svc['project_id'], changes, entity_name=svc['name'])
     return jsonify({'success': True})
+
+
+@app.route('/api/projects/<int:pid>/measurements', methods=['POST'])
+@login_required
+def api_bulk_measurements(pid):
+    """Замер на одну дату сразу по нескольким эпикам: существующие записи на дату обновляются, новые — создаются."""
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    data = request.get_json() or {}
+    date = parse_date(data.get('date'), 'Дата замера')
+    items = data.get('items') or []
+    if not isinstance(items, list) or not items:
+        return jsonify({'error': 'Нет данных для сохранения'}), 400
+    db = get_db()
+    services = {s['id']: s for s in db.execute('SELECT * FROM services WHERE project_id = ?', (pid,)).fetchall()}
+    parsed = []
+    for item in items:
+        sid = item.get('serviceId') if isinstance(item, dict) else None
+        if sid not in services:
+            return jsonify({'error': 'Эпик не найден в проекте'}), 400
+        vals = parse_entry_values(item)
+        if all(v is None for v in vals.values()):
+            continue  # пустые строки формы пропускаем
+        parsed.append((sid, vals))
+    if not parsed:
+        return jsonify({'error': 'Заполните хотя бы одно значение'}), 400
+
+    result = []
+    for sid, vals in parsed:
+        existing = db.execute('SELECT * FROM entries WHERE service_id = ? AND date = ?', (sid, date)).fetchone()
+        if existing:
+            db.execute('UPDATE entries SET remaining = ?, spent = ?, estimate = ? WHERE id = ?',
+                       (vals['remaining'], vals['spent'], vals['estimate'], existing['id']))
+            eid, action = existing['id'], 'update'
+        else:
+            eid = db.execute('INSERT INTO entries (service_id, date, remaining, spent, estimate) VALUES (?, ?, ?, ?, ?)',
+                             (sid, date, vals['remaining'], vals['spent'], vals['estimate'])).lastrowid
+            action = 'create'
+        result.append(dict(id=eid, service_id=sid, date=date, **vals))
+        changes = [{'field': f, 'old': None if not existing or existing[f] is None else str(existing[f]),
+                    'new': None if vals[f] is None else str(vals[f])}
+                   for f in HOUR_FIELDS if not existing or existing[f] != vals[f]]
+        if changes:
+            audit_log('data', action, 'entry', eid, pid, changes, entity_name=services[sid]['name'], commit=False)
+    db.commit()
+    return jsonify({'entries': result})
 
 
 @app.route('/api/entries/<int:eid>', methods=['DELETE'])
@@ -542,7 +677,7 @@ def api_update_stage_target(pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     data = request.get_json() or {}
     stage_name = data.get('stageName')
-    target_date = data.get('targetDate')
+    target_date = parse_date(data.get('targetDate'), 'Целевая дата', required=False)
     if not stage_name:
         return jsonify({'error': 'Укажите название этапа'}), 400
     db = get_db()
@@ -576,6 +711,14 @@ def api_update_settings(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     data = request.get_json() or {}
+    if 'forecastMethod' in data and data['forecastMethod'] not in ('linear', 'average'):
+        raise ValidationError('Недопустимый метод прогноза')
+    if 'burnrateMethod' in data and data['burnrateMethod'] not in ('all', 'rolling'):
+        raise ValidationError('Недопустимый метод расчёта burn rate')
+    for key, minimum in (('riskBufferDays', 0), ('burnrateWindowDays', 1)):
+        if key in data:
+            if isinstance(data[key], bool) or not isinstance(data[key], int) or data[key] < minimum:
+                raise ValidationError(f'Поле «{key}»: целое число не меньше {minimum}')
     db = get_db()
     existing = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
     if existing:
@@ -879,6 +1022,9 @@ def api_export_project(pid):
 
 # ─── API: Audit log (admin only) ─────────────────────────────────
 
+AUDIT_PAGE_SIZE = 200
+
+
 @app.route('/api/audit')
 @admin_required
 def api_get_audit_log():
@@ -895,14 +1041,22 @@ def api_get_audit_log():
     if page:
         conditions.append('page = ?')
         params.append(page)
-    if project_id:
+    if project_id.isdigit():
         conditions.append('project_id = ?')
         params.append(int(project_id))
+    before_id = request.args.get('beforeId', '').strip()
+    if before_id.isdigit():
+        conditions.append('id < ?')
+        params.append(int(before_id))
+    limit = request.args.get('limit', '')
+    limit = min(max(int(limit), 1), 1000) if limit.isdigit() else AUDIT_PAGE_SIZE
     where_clause = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
     rows = db.execute(
-        f'SELECT * FROM audit_log{where_clause} ORDER BY id DESC LIMIT 500',
-        params
+        f'SELECT * FROM audit_log{where_clause} ORDER BY id DESC LIMIT ?',
+        params + [limit + 1]
     ).fetchall()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
     # Get unique values for filters
     usernames = [r['username'] for r in db.execute('SELECT DISTINCT username FROM audit_log ORDER BY username').fetchall()]
     pages = [r['page'] for r in db.execute('SELECT DISTINCT page FROM audit_log ORDER BY page').fetchall()]
@@ -923,6 +1077,7 @@ def api_get_audit_log():
             'newValue': r['new_value'],
             'createdAt': r['created_at'],
         } for r in rows],
+        'hasMore': has_more,
         'filters': {
             'usernames': usernames,
             'pages': pages,
