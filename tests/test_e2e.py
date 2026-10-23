@@ -15,6 +15,21 @@ from conftest import ADMIN
 sync_api = pytest.importorskip('playwright.sync_api')
 
 VIEWS = ['dashboard', 'stages', 'data', 'services', 'settings', 'users', 'projects', 'audit']
+# Разделы, которые при открытии загружают данные с сервера: ждём ответа, а не «тишины в сети»
+VIEW_REQUESTS = {
+    'users': ('/api/users', '#usersTable tbody tr'),
+    'projects': ('/api/projects', '#projectsMgmtTable tbody tr'),
+    'audit': ('/api/audit', '#auditLogTable tbody tr'),
+}
+
+# Счётчик показов уведомлений: позволяет отличить новое уведомление от ещё не скрытого старого
+TOAST_COUNTER_SCRIPT = """
+document.addEventListener('DOMContentLoaded', function(){
+  window.__toastCount = 0;
+  var el = document.getElementById('toast');
+  if(el) new MutationObserver(function(){ window.__toastCount++; }).observe(el, {childList: true});
+});
+"""
 
 
 @pytest.fixture(scope='module')
@@ -34,7 +49,10 @@ class App:
     def __init__(self, page, base):
         self.page, self.base = page, base
         self.errors = []
+        self.toasts_seen = 0
+        page.add_init_script(TOAST_COUNTER_SCRIPT)
         page.on('pageerror', lambda e: self.errors.append(str(e)))
+        page.on('load', lambda _: setattr(self, 'toasts_seen', 0))
 
     def login(self, username, password):
         self.page.goto(self.base + '/login')
@@ -47,13 +65,20 @@ class App:
         return self
 
     def go(self, view):
-        self.page.click(f'.nav-item[data-view="{view}"]')
+        if view in VIEW_REQUESTS:
+            url, rows = VIEW_REQUESTS[view]
+            with self.page.expect_response(lambda r: url in r.url):
+                self.page.click(f'.nav-item[data-view="{view}"]')
+            self.page.wait_for_selector(rows)  # таблица отрисована по ответу сервера
+        else:
+            self.page.click(f'.nav-item[data-view="{view}"]')
         self.page.wait_for_selector(f'#view-{view}.active')
-        self.page.wait_for_load_state('networkidle')
 
     def project(self, pid):
+        name = self.text(f'.nav-project[data-pid="{pid}"]')
         self.page.click(f'.nav-project[data-pid="{pid}"]')
-        self.page.wait_for_load_state('networkidle')
+        # подзаголовок раздела обновляется после загрузки данных проекта
+        self.page.wait_for_function('n => document.getElementById("pageSub").textContent.endsWith(" · " + n)', arg=name)
 
     def text(self, selector):
         return re.sub(r'\s+', ' ', self.page.text_content(selector)).strip()
@@ -62,10 +87,11 @@ class App:
         return [re.sub(r'\s+', ' ', t).strip() for t in self.page.locator(selector).all_text_contents()]
 
     def expect_toast(self, text):
-        """Ждёт уведомление с заданным текстом (предыдущее может ещё висеть на экране)."""
+        """Ждёт новое уведомление с заданным текстом (предыдущее может ещё висеть на экране)."""
         self.page.wait_for_function(
-            'text => { const t = document.getElementById("toast"); return t.classList.contains("show") && t.textContent === text; }',
-            arg=text)
+            '([text, seen]) => window.__toastCount > seen && document.getElementById("toast").textContent === text',
+            arg=[text, self.toasts_seen])
+        self.toasts_seen = self.page.evaluate('window.__toastCount')
 
 
 @pytest.fixture
@@ -272,8 +298,8 @@ def test_stage_show_done_toggle(admin_ui):
     page = admin_ui.page
     admin_ui.go('services')
     page.check('#servicesTable tr[data-id="1"] input[data-field="isDone"]')
-    page.check('#servicesTable tr[data-id="2"] input[data-field="isDone"]')
-    page.wait_for_load_state('networkidle')
+    with page.expect_response(lambda r: '/api/services/2' in r.url):
+        page.check('#servicesTable tr[data-id="2"] input[data-field="isDone"]')
     admin_ui.go('stages')
     assert admin_ui.cells('#stageSummaryTable tbody td:first-child') == ['Этап 3']
     page.check('#stageShowDone')
@@ -373,8 +399,8 @@ def test_project_assignment_ui(admin_ui, admin):
     page.click('#userProjectsMgmt [data-toggle="1"]')
     admin_ui.expect_toast('Доступ добавлен')
     page.wait_for_selector('#userProjectsMgmt select[data-pid="1"]:not([disabled])')
-    page.select_option('#userProjectsMgmt select[data-pid="1"]', 'manager')
-    page.wait_for_load_state('networkidle')
+    with page.expect_response(lambda r: r.request.method == 'POST' and '/projects' in r.url):
+        page.select_option('#userProjectsMgmt select[data-pid="1"]', 'manager')
     uid = next(u['id'] for u in admin.get('/api/users').get_json() if u['username'] == 'ivan')
     assert admin.get(f'/api/users/{uid}/projects').get_json()[0]['role'] == 'manager'
 
@@ -398,7 +424,7 @@ def test_profile_photo_upload_and_delete(admin_ui, admin, tmp_path):
     page.click('#confirmOk')
     admin_ui.expect_toast('Профиль обновлён')
     assert admin.get('/api/auth/me').get_json()['user']['photo'] == ''
-    assert not page.is_visible('#userInfo img')
+    page.wait_for_selector('#userInfo img', state='detached')
 
 
 def test_create_and_rename_project(admin_ui):
@@ -429,8 +455,10 @@ def test_audit_log_shows_changes(admin_ui):
     assert 'Изменение' in row and 'КСБО-2' in row and 'Эпики' in row
     assert re.match(r'\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}', admin_ui.cells('#auditLogTable tbody tr:first-child td')[0])
     page.select_option('#auditFilterPage', 'services')
-    page.wait_for_load_state('networkidle')
-    assert set(admin_ui.cells('#auditLogTable tbody td:nth-child(4)')) == {'Эпики'}
+    page.wait_for_function("""() => {
+        const cells = [...document.querySelectorAll('#auditLogTable tbody td:nth-child(4)')];
+        return cells.length > 0 && cells.every(c => c.textContent === 'Эпики');
+    }""")
 
 
 # ─── Статусы, рост оценки, burn rate ─────────────────────────────
@@ -567,6 +595,8 @@ def test_all_epics_block_collapse_is_remembered(admin_ui):
     assert page.evaluate("!!Chart.getChart('chartRemainingAll')")
     page.click('#allEpicsBlock > summary')
     assert not page.is_visible('#chartRemainingAll')
+    # состояние сохраняется в обработчике события toggle, которое приходит асинхронно
+    page.wait_for_function("localStorage.getItem('burndown-all-epics-open') === '0'")
     page.reload()
     page.wait_for_selector('#summaryTable tbody tr')
     assert page.evaluate("document.getElementById('allEpicsBlock').open") is False
