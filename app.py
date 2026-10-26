@@ -173,6 +173,16 @@ def parse_photo(value):
     return value
 
 
+def text_change(old, new, field=None):
+    """Изменение текстового поля для реестра: пустое значение и None считаются одинаковыми,
+    в реестр пишется None вместо строки «None»."""
+    old_s = '' if old is None else str(old)
+    new_s = '' if new is None else str(new)
+    if field is None:
+        return old_s != new_s
+    return {'field': field, 'old': old_s or None, 'new': new_s or None}
+
+
 HOUR_FIELDS = {'remaining': 'Остаток', 'spent': 'Затрачено', 'estimate': 'Оценка'}
 SETTINGS_FIELDS = [
     ('forecastMethod', 'forecast_method'),
@@ -702,7 +712,10 @@ def api_update_stage_target(pid):
         db.execute('INSERT INTO stage_targets (project_id, stage_name, target_date) VALUES (?, ?, ?)',
                     (pid, stage_name, target_date))
     db.commit()
-    audit_log('stages', 'update', 'stage_target', None, pid, [{'field': stage_name, 'old': existing['target_date'] if existing else None, 'new': target_date}], entity_name=stage_name)
+    old_target = existing['target_date'] if existing else None
+    if text_change(old_target, target_date):
+        audit_log('stages', 'update', 'stage_target', None, pid, [text_change(old_target, target_date, stage_name)],
+                  entity_name=stage_name)
     return jsonify({'success': True})
 
 
@@ -853,8 +866,8 @@ def api_update_user(uid):
         ('position', user['position'], position),
         ('role', user['role'], role),
     ]:
-        if str(old_val) != str(new_val):
-            changes.append({'field': field, 'old': str(old_val), 'new': str(new_val)})
+        if text_change(old_val, new_val):
+            changes.append(text_change(old_val, new_val, field))
     if changes:
         audit_log('users', 'update', 'user', uid, None, changes)
     return jsonify({'success': True})
@@ -966,8 +979,8 @@ def api_update_profile():
         ('email', user['email'], email),
         ('position', user['position'], position),
     ]:
-        if str(old_val) != str(new_val):
-            changes.append({'field': field, 'old': str(old_val), 'new': str(new_val)})
+        if text_change(old_val, new_val):
+            changes.append(text_change(old_val, new_val, field))
     if changes:
         audit_log('profile', 'update', 'user', uid, None, changes)
     return jsonify({'success': True})

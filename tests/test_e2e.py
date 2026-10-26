@@ -453,6 +453,7 @@ def test_audit_log_shows_changes(admin_ui):
     admin_ui.go('audit')
     row = admin_ui.text('#auditLogTable tbody tr:first-child')
     assert 'Изменение' in row and 'КСБО-2' in row and 'Эпики' in row
+    assert 'Эпик «КСБО»' in row and 'Название' in row  # тип записи и поле — по-русски
     assert re.match(r'\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}', admin_ui.cells('#auditLogTable tbody tr:first-child td')[0])
     page.select_option('#auditFilterPage', 'services')
     page.wait_for_function("""() => {
