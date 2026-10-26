@@ -1,5 +1,7 @@
 """Тесты REST API: авторизация, права доступа, CRUD, валидация и реестр изменений."""
 
+import pytest
+
 from conftest import ADMIN, login
 
 
@@ -298,3 +300,250 @@ def test_audit_filters(admin):
     assert {e['page'] for e in audit(admin, page='settings')} == {'settings'}
     assert all(e['projectId'] == 1 for e in audit(admin, projectId='1'))
     assert audit(admin, projectId='2') == []
+
+
+# ─── Валидация значений ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize('payload', [
+    {'date': '2026-07-30', 'remaining': 'abc'},
+    {'date': '2026-07-30', 'remaining': -1},
+    {'date': '2026-07-30', 'spent': True},
+    {'date': '2026-07-30', 'estimate': float('inf')},
+    {'date': '30.07.2026'},
+    {'date': '2026-02-30'},
+])
+def test_entry_invalid_values_rejected(admin, payload):
+    r = admin.post('/api/services/1/entries', json=payload)
+    assert r.status_code == 400 and r.get_json()['error']
+
+
+def test_entry_numeric_strings_accepted(admin):
+    eid = admin.post('/api/services/1/entries', json={'date': '2026-07-30', 'remaining': '12.5', 'spent': ''}).get_json()['id']
+    entry = next(e for e in admin.get('/api/projects/1/data').get_json()['entries'] if e['id'] == eid)
+    assert (entry['remaining'], entry['spent']) == (12.5, None)
+
+
+def test_entry_duplicate_date_rejected(admin):
+    r = admin.post('/api/services/1/entries', json={'date': '2026-07-29'})
+    assert r.status_code == 400 and 'уже есть' in r.get_json()['error']
+    # перенос существующего замера на занятую дату
+    r = admin.put('/api/entries/1', json={'date': '2026-07-24', 'remaining': 509, 'spent': 186, 'estimate': 150})
+    assert r.status_code == 400
+    # тот же замер с прежней датой сохраняется
+    assert admin.put('/api/entries/1', json={'date': '2026-07-17', 'remaining': 500, 'spent': 186, 'estimate': 150}).status_code == 200
+
+
+def test_entry_update_audit_without_noise(admin):
+    admin.put('/api/entries/1', json={'date': '2026-07-17', 'remaining': 509, 'spent': 186, 'estimate': 150})
+    assert audit(admin, page='data') == []  # 509 и 509.0 — одно и то же значение
+    admin.put('/api/entries/1', json={'date': '2026-07-17', 'remaining': 500, 'spent': 186, 'estimate': 150})
+    assert [(e['fieldName'], e['oldValue'], e['newValue']) for e in audit(admin, page='data')] == [('remaining', '509.0', '500.0')]
+
+
+def test_service_target_date_validation(admin):
+    assert admin.put('/api/services/1', json={'targetDate': '31.08.2026'}).status_code == 400
+    assert admin.put('/api/services/1', json={'targetDate': ''}).status_code == 200
+    assert admin.post('/api/projects/1/services', json={'name': 'x', 'targetDate': 'завтра'}).status_code == 400
+    assert admin.put('/api/projects/1/stage_targets', json={'stageName': 'Этап 4', 'targetDate': '2026-13-01'}).status_code == 400
+
+
+@pytest.mark.parametrize('payload', [
+    {'forecastMethod': 'magic'},
+    {'burnrateMethod': 'median'},
+    {'riskBufferDays': -1},
+    {'riskBufferDays': 'три'},
+    {'burnrateWindowDays': 0},
+])
+def test_settings_validation(admin, payload):
+    assert admin.put('/api/projects/1/settings', json=payload).status_code == 400
+
+
+# ─── Замер по всем эпикам ────────────────────────────────────────
+
+def test_bulk_measurement_creates_and_updates(admin):
+    r = admin.post('/api/projects/1/measurements', json={'date': '2026-07-29', 'items': [
+        {'serviceId': 1, 'remaining': 340, 'spent': 260, 'estimate': 401},   # замер на дату уже есть → обновление
+        {'serviceId': 2, 'remaining': None, 'spent': None, 'estimate': None},  # пустая строка пропускается
+    ]})
+    assert r.status_code == 200
+    assert [(e['id'], e['remaining']) for e in r.get_json()['entries']] == [(19, 340)]
+
+    r = admin.post('/api/projects/1/measurements', json={'date': '2026-07-31', 'items': [
+        {'serviceId': 3, 'remaining': 100},
+        {'serviceId': 4, 'remaining': '190.5', 'spent': 2010, 'estimate': 1310},
+    ]})
+    saved = r.get_json()['entries']
+    assert [(e['service_id'], e['date'], e['remaining']) for e in saved] == [(3, '2026-07-31', 100), (4, '2026-07-31', 190.5)]
+    entries = admin.get('/api/projects/1/data').get_json()['entries']
+    assert len(entries) == 26
+    log = audit(admin, page='data')
+    assert {e['action'] for e in log} == {'create', 'update'}
+
+
+def test_bulk_measurement_validation(admin, make_user):
+    url = '/api/projects/1/measurements'
+    assert admin.post(url, json={'items': [{'serviceId': 1, 'remaining': 1}]}).status_code == 400  # нет даты
+    assert admin.post(url, json={'date': '2026-07-31', 'items': []}).status_code == 400
+    assert admin.post(url, json={'date': '2026-07-31', 'items': [{'serviceId': 1}]}).status_code == 400  # всё пусто
+    assert admin.post(url, json={'date': '2026-07-31', 'items': [{'serviceId': 999, 'remaining': 1}]}).status_code == 400
+    # одна некорректная строка — не сохраняется ничего
+    r = admin.post(url, json={'date': '2026-07-31', 'items': [{'serviceId': 1, 'remaining': 1}, {'serviceId': 2, 'remaining': -5}]})
+    assert r.status_code == 400
+    assert len(admin.get('/api/projects/1/data').get_json()['entries']) == 24
+    viewer = make_user('viewer', project_id=1)
+    assert viewer.post(url, json={'date': '2026-07-31', 'items': [{'serviceId': 1, 'remaining': 1}]}).status_code == 403
+
+
+def test_bulk_measurement_rejects_service_from_other_project(admin):
+    sid = admin.post('/api/projects/2/services', json={'name': 'Чужой'}).get_json()['id']
+    r = admin.post('/api/projects/1/measurements', json={'date': '2026-07-31', 'items': [{'serviceId': sid, 'remaining': 1}]})
+    assert r.status_code == 400
+
+
+# ─── Реестр: постраничная загрузка ───────────────────────────────
+
+def test_audit_pagination(admin):
+    for i in range(5):
+        admin.put('/api/services/1', json={'name': f'Имя {i}'})
+    first = admin.get('/api/audit?limit=2').get_json()
+    assert len(first['entries']) == 2 and first['hasMore'] is True
+    last_id = first['entries'][-1]['id']
+    rest = admin.get(f'/api/audit?limit=10&beforeId={last_id}').get_json()
+    assert len(rest['entries']) == 3 and rest['hasMore'] is False
+    assert all(e['id'] < last_id for e in rest['entries'])
+    assert admin.get('/api/audit?projectId=abc').status_code == 200  # мусор в фильтре игнорируется
+
+
+# ─── Безопасность и инфраструктура ───────────────────────────────
+
+def test_session_cookie_flags(client):
+    r = login(client, *ADMIN)
+    cookie = r.headers['Set-Cookie']
+    assert 'HttpOnly' in cookie and 'SameSite=Lax' in cookie
+
+
+def test_secret_key_persisted_next_to_db(tmp_path, monkeypatch):
+    import app as app_module
+    monkeypatch.delenv('SECRET_KEY', raising=False)
+    monkeypatch.setattr(app_module, 'DB_PATH', str(tmp_path / 'x.db'))
+    key1 = app_module.load_secret_key()
+    key_file = tmp_path / '.secret_key'
+    assert key_file.read_text() == key1 and len(key1) == 64
+    assert oct(key_file.stat().st_mode & 0o777) == '0o600'
+    assert app_module.load_secret_key() == key1  # повторный запуск — тот же ключ
+    monkeypatch.setenv('SECRET_KEY', 'from-env')
+    assert app_module.load_secret_key() == 'from-env'
+
+
+def test_indexes_created(db_path):
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+    conn.close()
+    assert {'idx_entries_service_date', 'idx_services_project', 'idx_audit_project'} <= names
+
+
+def test_migrate_old_database_keeps_data(db_path, monkeypatch):
+    """Старая база без новых колонок и индексов дополняется без потери данных."""
+    import sqlite3
+    import app as app_module
+    conn = sqlite3.connect(db_path)
+    for idx in ('idx_entries_service_date', 'idx_services_project', 'idx_audit_project'):
+        conn.execute(f'DROP INDEX {idx}')
+    conn.execute('ALTER TABLE services DROP COLUMN is_done')
+    conn.execute('ALTER TABLE services DROP COLUMN stage_group')
+    conn.commit()
+    conn.close()
+    app_module.migrate_db()
+    conn = sqlite3.connect(db_path)
+    cols = [r[1] for r in conn.execute('PRAGMA table_info(services)')]
+    assert 'is_done' in cols and 'stage_group' in cols
+    assert conn.execute('SELECT COUNT(*) FROM entries').fetchone()[0] == 24
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_entries_service_date'").fetchone()[0] == 1
+    conn.close()
+
+
+# ─── Устойчивость к некорректным запросам ────────────────────────
+
+def test_deleted_user_session_is_invalidated(admin, make_user):
+    c = make_user('temp', project_id=1)
+    assert c.get('/api/projects').status_code == 200
+    admin.delete(f'/api/users/{c.user_id}')
+    assert c.get('/api/projects').status_code == 401
+    assert c.get('/api/projects/1/data').status_code == 401
+
+
+def test_deleted_admin_session_is_invalidated(admin, flask_app):
+    other = flask_app.test_client()
+    uid = admin.post('/api/users', json={'username': 'admin2', 'password': 'p', 'role': 'admin'}).get_json()['id']
+    assert login(other, 'admin2', 'p').status_code == 200
+    admin.delete(f'/api/users/{uid}')
+    assert other.get('/api/users').status_code == 401
+
+
+def test_non_string_fields_do_not_crash(client, admin):
+    assert client.post('/api/auth/login', json={'username': 123, 'password': 456}).status_code in (400, 401)
+    assert admin.post('/api/projects', json={'name': 42}).get_json()['name'] == '42'
+    assert admin.post('/api/users', json={'username': 7, 'password': 8}).status_code == 400
+
+
+@pytest.mark.parametrize('photo, status', [
+    ('data:image/png;base64,AAAA', 200),
+    ('', 200),
+    ('javascript:alert(1)', 400),
+    ('https://example.com/a.png', 400),
+    ('data:image/png;base64,' + 'A' * 2_300_000, 400),
+], ids=['png', 'empty', 'javascript-url', 'http-url', 'too-big'])  # короткие имена: огромная строка в имени теста раздувает лог
+def test_photo_validation(make_user, photo, status):
+    c = make_user('u1')
+    assert c.put('/api/profile', json={'photo': photo}).status_code == status
+
+
+def test_profile_personal_fields_only_for_admin(make_user, admin):
+    c = make_user('u1')
+    c.put('/api/profile', json={'displayName': 'Взлом', 'email': 'x@y'})
+    user = next(u for u in admin.get('/api/users').get_json() if u['username'] == 'u1')
+    assert user['displayName'] == '' and user['email'] == ''
+    admin.put('/api/profile', json={'displayName': 'Главный'})
+    assert admin.get('/api/auth/me').get_json()['user']['displayName'] == 'Главный'
+
+
+def test_assign_to_missing_project_or_user(admin):
+    uid = admin.post('/api/users', json={'username': 'u1', 'password': 'p'}).get_json()['id']
+    assert admin.post(f'/api/users/{uid}/projects', json={'projectId': 999}).status_code == 404
+    assert admin.post('/api/users/999/projects', json={'projectId': 1}).status_code == 404
+
+
+@pytest.mark.parametrize('orders', [None, 'x', [{'id': 1}], [{'id': '1', 'sortOrder': 1}]])
+def test_reorder_validation(admin, orders):
+    assert admin.post('/api/projects/1/services/reorder', json={'orders': orders}).status_code == 400
+
+
+def test_settings_null_values_are_ignored(admin, db_path):
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.execute('UPDATE settings SET risk_buffer_days = NULL WHERE project_id = 1')
+    conn.commit()
+    conn.close()
+    # пустое значение из БД не отдаётся фронтенду (там подставится значение по умолчанию)
+    assert 'riskBufferDays' not in admin.get('/api/projects/1/data').get_json()['settings']
+    # и null в запросе не ломает сохранение остальных настроек
+    r = admin.put('/api/projects/1/settings', json={'forecastMethod': 'average', 'riskBufferDays': None})
+    assert r.status_code == 200
+    assert admin.get('/api/projects/1/data').get_json()['settings']['forecastMethod'] == 'average'
+
+
+def test_export_matches_project_data(admin):
+    exported = admin.get('/api/projects/1/export').get_json()
+    data = admin.get('/api/projects/1/data').get_json()
+    assert {k: exported[k] for k in data} == data
+    assert admin.get('/api/projects/999/export').status_code == 404
+
+
+def test_index_redirects_deleted_user(admin, make_user):
+    c = make_user('temp')
+    assert c.get('/').status_code == 200
+    admin.delete(f'/api/users/{c.user_id}')
+    r = c.get('/')
+    assert r.status_code == 302 and r.headers['Location'].endswith('/login')

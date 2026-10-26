@@ -16,7 +16,8 @@ var selectedAdminUser = null;
 function localIsoDate(d){
   return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
 }
-var TODAY = localIsoDate(new Date());
+/* «Сегодня» вычисляется при каждом обращении — вкладка может быть открыта после полуночи */
+function todayIso(){ return localIsoDate(new Date()); }
 
 var dashboardFilter = { hideDone:false, epics:null }; /* epics: {id:bool} выбор эпиков для дашборда; null = видны все */
 var stageShowDone = false; /* показывать сданные эпики в своде по этапам */
@@ -32,7 +33,12 @@ function api(url, opts){
   opts = opts || {};
   opts.headers = opts.headers || {};
   opts.headers['Content-Type'] = 'application/json';
-  return fetch(url, Object.assign({credentials:'same-origin'}, opts)).then(function(r){
+  return fetch(url, Object.assign({credentials:'same-origin'}, opts)).catch(function(){
+    toast('Нет связи с сервером — изменения не сохранены');
+    var err = new Error('network');
+    err.handled = true;
+    throw err;
+  }).then(function(r){
     if(r.status === 401){ window.location.href = '/login'; throw new Error('Unauthorized'); }
     return r.json().catch(function(){ return {}; }).then(function(data){
       if(!r.ok){
@@ -86,6 +92,7 @@ function openModal(opts){
   (first || confirmOk).focus();
 }
 function closeModal(){
+  confirmOk.disabled = false;
   confirmModal.classList.remove('show');
   modalOkHandler = null;
 }
@@ -123,7 +130,7 @@ function escapeAttr(str){
 
 /* ── Sorting helpers ─────────────────────────────────────────── */
 var tableSortState = {};
-var STATUS_RANK = {danger:0, risk:1, ok:2, unknown:3};
+var STATUS_RANK = {danger:0, risk:1, ok:2, notarget:3, unknown:4};
 function compareValues(av, bv, dir){
   /* Пустые значения — всегда в конце; числа сравниваются как числа */
   var aEmpty = av === null || av === undefined || av === '';
@@ -191,6 +198,19 @@ function fmtDate(d){
 }
 function fmtShortDate(d){ return d.slice(5).split('-').reverse().join('.'); }
 function isNum(v){ return v !== null && v !== undefined && !isNaN(v); }
+/* Ячейка burn rate: отрицательное значение = остаток вырос */
+function rateCell(v, suffix){
+  if(!isNum(v)) return '<td class="num">—</td>';
+  var neg = Math.round(v*100) < 0;
+  return '<td class="num'+(neg?' neg':'')+'"'+(neg?' title="Остаток вырос"':'')+'>'+fmtNum(v)+(suffix||'')+'</td>';
+}
+/* Ячейка изменения оценки: рост объёма подсвечивается */
+function scopeCell(v){
+  if(!isNum(v)) return '<td class="num">—</td>';
+  var r = Math.round(v*100)/100;
+  return '<td class="num'+(r>0?' scope-up':'')+'"'+(r>0?' title="Оценка выросла с первого замера"':'')+'>'+(r>0?'+':'')+fmtNum(r)+' ч</td>';
+}
+function forecastText(row){ return row.forecastZero ? fmtDate(row.forecastZero) : (row.noBurn ? 'не сгорает' : '—'); }
 var ROLE_LABELS = {admin:'Администратор', manager:'Руководитель', user:'Пользователь'};
 var ICON_EDIT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
 var ICON_DELETE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0l-1 14a2 2 0 01-2 2H7a2 2 0 01-2-2L4 6h16z"/></svg>';
@@ -263,9 +283,9 @@ function stageKeyOf(s){
   /* Ключ группы в «Своде по этапам»: явная группа эпика, иначе этап без подсетапа */
   var sg = (s.stageGroup || '').trim();
   if(sg) return sg;
-  var etap = s.etap || '';
+  var etap = (s.etap || '').trim();
   var match = etap.match(/^(Этап\s+\d+)(\.\d+)?$/i);
-  return match ? match[1] : etap;
+  return match ? match[1] : (etap || 'Без этапа');
 }
 
 function computeStageGroups(){
@@ -320,31 +340,42 @@ function linearForecast(points){
   return {slope:slope, intercept:intercept};
 }
 
+/* Сумма по этапу на каждую дату замеров. Для эпика без замера в эту дату берётся его последнее
+   известное значение (если эпик ещё не замерялся — он не учитывается), чтобы замеры в разные дни
+   не давали ложных провалов на графике. */
 function aggregateStageSeries(stageName, stageGroups){
   var services = servicesInStage(stageName, stageGroups);
-  var dateSet = new Set();
-  services.forEach(function(s){ entriesForService(s.id).forEach(function(e){ dateSet.add(e.date); }); });
-  var dates = Array.from(dateSet).sort();
-  var remaining = [], spent = [], estimate = [];
+  var rowsBySvc = services.map(function(s){ return entriesForService(s.id); });
+  var dateSet = {};
+  rowsBySvc.forEach(function(rows){ rows.forEach(function(e){ dateSet[e.date] = true; }); });
+  var dates = Object.keys(dateSet).sort();
+  var series = {remaining:[], spent:[], estimate:[]};
+  var last = rowsBySvc.map(function(){ return {remaining:null, spent:null, estimate:null}; });
+  var pos = rowsBySvc.map(function(){ return 0; });
   dates.forEach(function(date){
-    var rSum=null, sSum=null, eSum=null, rHas=false, sHas=false, eHas=false;
-    services.forEach(function(s){
-      var row = STATE.entries.find(function(e){ return e.service_id === s.id && e.date === date; });
-      if(row){
-        if(row.remaining !== null && row.remaining !== undefined){ rSum=(rSum||0)+row.remaining; rHas=true; }
-        if(row.spent !== null && row.spent !== undefined){ sSum=(sSum||0)+row.spent; sHas=true; }
-        if(row.estimate !== null && row.estimate !== undefined){ eSum=(eSum||0)+row.estimate; eHas=true; }
+    rowsBySvc.forEach(function(rows, i){
+      while(pos[i] < rows.length && rows[pos[i]].date <= date){
+        var row = rows[pos[i]++];
+        Object.keys(series).forEach(function(f){ if(isNum(row[f])) last[i][f] = row[f]; });
       }
     });
-    remaining.push(rHas ? rSum : null);
-    spent.push(sHas ? sSum : null);
-    estimate.push(eHas ? eSum : null);
+    Object.keys(series).forEach(function(f){
+      var sum = 0, has = false;
+      last.forEach(function(l){ if(l[f] !== null){ sum += l[f]; has = true; } });
+      series[f].push(has ? sum : null);
+    });
   });
-  return {dates:dates, remaining:remaining, spent:spent, estimate:estimate};
+  return {dates:dates, remaining:series.remaining, spent:series.spent, estimate:series.estimate};
+}
+
+/* Изменение оценки (объёма работ) от первого до последнего заполненного значения */
+function scopeChange(values){
+  var filled = values.filter(isNum);
+  return filled.length >= 2 ? filled[filled.length-1] - filled[0] : null;
 }
 
 function computeStatus(dates, remainingVals, targetDate){
-  if(!dates.length) return {status:'unknown', forecastZeroDate:null, burnRate:null, lastRemaining:null, reg:null, baseDate:null, lastDate:null};
+  if(!dates.length) return {status:'unknown', forecastZeroDate:null, noBurn:false, burnRate:null, lastRemaining:null, reg:null, baseDate:null, lastDate:null};
   var baseDate = dates[0];
   var lastDate = dates[dates.length-1];
   var pts = dates.map(function(d,i){ return {x:daysBetween(baseDate, d), y:remainingVals[i]}; }).filter(function(p){ return p.y !== null && p.y !== undefined; });
@@ -365,7 +396,9 @@ function computeStatus(dates, remainingVals, targetDate){
     reg = linearForecast(pts);
   }
   var targetX = targetDate ? daysBetween(baseDate, targetDate) : null;
-  var status = 'unknown', forecastZeroDate = null;
+  /* есть замеры, но нет цели — отдельный статус; «нет данных» — только когда нечего прогнозировать */
+  var status = (pts.length && targetX === null) ? 'notarget' : 'unknown', forecastZeroDate = null;
+  var noBurn = !!(reg && reg.slope >= 0);
   if(reg && reg.slope < 0){
     var zeroX = -reg.intercept / reg.slope;
     forecastZeroDate = addDays(baseDate, Math.round(zeroX));
@@ -375,10 +408,10 @@ function computeStatus(dates, remainingVals, targetDate){
       else if(zeroX <= targetX + buffer) status = 'risk';
       else status = 'danger';
     }
-  } else if(reg && reg.slope >= 0){
-    status = targetX !== null ? 'danger' : 'unknown';
+  } else if(noBurn && targetX !== null){
+    status = 'danger';
   }
-  return {status:status, forecastZeroDate:forecastZeroDate, burnRate:burnRate, lastRemaining:lastRemaining, reg:reg, baseDate:baseDate, lastDate:lastDate};
+  return {status:status, forecastZeroDate:forecastZeroDate, noBurn:noBurn, burnRate:burnRate, lastRemaining:lastRemaining, reg:reg, baseDate:baseDate, lastDate:lastDate};
 }
 
 function computeServiceStatus(serviceId){
@@ -386,20 +419,22 @@ function computeServiceStatus(serviceId){
   var rows = entriesForService(serviceId);
   var dates = rows.map(function(r){ return r.date; });
   var remVals = rows.map(function(r){ return r.remaining; });
-  return computeStatus(dates, remVals, svc ? svc.targetDate : null);
+  return Object.assign(computeStatus(dates, remVals, svc ? svc.targetDate : null),
+    {scope: scopeChange(rows.map(function(r){ return r.estimate; }))});
 }
 
 function computeStageStatus(stageName, stageGroups){
   var agg = aggregateStageSeries(stageName, stageGroups);
   var targetDate = STATE.stageTargets[stageName];
-  return Object.assign(computeStatus(agg.dates, agg.remaining, targetDate), {agg:agg});
+  return Object.assign(computeStatus(agg.dates, agg.remaining, targetDate), {agg:agg, scope:scopeChange(agg.estimate)});
 }
 
 function statusBadge(status){
   if(status === 'ok') return '<span class="badge badge-ok">✓ Успеваем</span>';
   if(status === 'risk') return '<span class="badge badge-risk">⚠ Риск</span>';
   if(status === 'danger') return '<span class="badge badge-danger">✗ Не успеваем</span>';
-  return '<span class="badge" style="background:var(--color-surface-offset);color:var(--color-text-muted);">Нет данных</span>';
+  if(status === 'notarget') return '<span class="badge badge-muted" title="Укажите целевую дату, чтобы оценить сроки">Нет цели</span>';
+  return '<span class="badge badge-muted">Нет данных</span>';
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -632,7 +667,16 @@ function renderEpicEstimateChart(){
   charts.epicEstimate = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions('Часы')});
 }
 
+var allEpicsBlock = document.getElementById('allEpicsBlock');
+try { if(localStorage.getItem('burndown-all-epics-open') === '0') allEpicsBlock.open = false; } catch(e){}
+allEpicsBlock.addEventListener('toggle', function(){
+  try { localStorage.setItem('burndown-all-epics-open', allEpicsBlock.open ? '1' : '0'); } catch(e){}
+  if(allEpicsBlock.open && currentView === 'dashboard') renderAllEpicsCharts();
+});
+
 function renderAllEpicsCharts(){
+  ['allRemaining','allSpent','allEstimate'].forEach(destroyChart);
+  if(!allEpicsBlock.open) return;  /* свёрнутый блок не рисуем — графики построятся при раскрытии */
   destroyChart('allRemaining');
   var ids = visibleDashboardServices().map(function(s){ return s.id; });
   var datasets = buildDatasetsForMetric('remaining', ids);
@@ -690,25 +734,27 @@ function renderSummaryTable(){
     '<th class="sortable" data-sort="name">Эпик</th>'+
     '<th class="sortable num" data-sort="remaining">Остаток</th>'+
     '<th class="sortable num" data-sort="burnRate">Burn rate, ч/день</th>'+
+    '<th class="sortable num" data-sort="scope" title="Изменение первоначальной оценки с первого замера">Δ оценки</th>'+
     '<th class="sortable" data-sort="targetDate">Цель</th>'+
     '<th class="sortable" data-sort="forecastZero">Прогноз «0»</th>'+
     '<th class="sortable" data-sort="status">Статус</th>'+
     '</tr></thead><tbody>';
-  var totalRemaining = 0, totalBurnRate = 0, hasRemaining=false, hasBurn=false;
+  var totalRemaining = 0, totalBurnRate = 0, totalScope = 0, hasRemaining=false, hasBurn=false, hasScope=false;
   var rows = visibleDashboardServices().map(function(s){
     var stat = computeServiceStatus(s.id);
     if(isNum(stat.lastRemaining)){ totalRemaining += stat.lastRemaining; hasRemaining = true; }
     if(isNum(stat.burnRate)){ totalBurnRate += stat.burnRate; hasBurn = true; }
-    return {etap:s.etap, name:s.name, isDone:s.isDone, remaining:stat.lastRemaining, burnRate:stat.burnRate, targetDate:s.targetDate||'', forecastZero:stat.forecastZeroDate||'', status:stat.status};
+    if(isNum(stat.scope)){ totalScope += stat.scope; hasScope = true; }
+    return {etap:s.etap, name:s.name, isDone:s.isDone, remaining:stat.lastRemaining, burnRate:stat.burnRate, scope:stat.scope, targetDate:s.targetDate||'', forecastZero:stat.forecastZeroDate||'', noBurn:stat.noBurn, status:stat.status};
   });
   if(!rows.length){
-    html += '<tr><td colspan="7" class="empty-cell">Нет эпиков для отображения — проверьте фильтр выше.</td></tr>';
+    html += '<tr><td colspan="8" class="empty-cell">Нет эпиков для отображения — проверьте фильтр выше.</td></tr>';
   }
   applyTableSort('summaryTable', rows).forEach(function(r){
-    html += '<tr'+(r.isDone?' class="done-row"':'')+'><td class="nowrap">'+escapeHtml(r.etap)+'</td><td>'+escapeHtml(r.name)+'</td><td class="num">'+hoursToStr(r.remaining)+'</td><td class="num">'+hoursToStr(r.burnRate)+'</td><td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+fmtDate(r.forecastZero)+'</td><td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
+    html += '<tr'+(r.isDone?' class="done-row"':'')+'><td class="nowrap">'+escapeHtml(r.etap)+'</td><td>'+escapeHtml(r.name)+'</td><td class="num">'+hoursToStr(r.remaining)+'</td>'+rateCell(r.burnRate,' ч')+scopeCell(r.scope)+'<td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+forecastText(r)+'</td><td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
   });
   if(rows.length){
-    html += '<tr class="total-row"><td colspan="2">Итого</td><td class="num">'+(hasRemaining?hoursToStr(totalRemaining):'—')+'</td><td class="num">'+(hasBurn?hoursToStr(totalBurnRate):'—')+'</td><td colspan="3"></td></tr>';
+    html += '<tr class="total-row"><td colspan="2">Итого</td><td class="num">'+(hasRemaining?hoursToStr(totalRemaining):'—')+'</td>'+rateCell(hasBurn?totalBurnRate:null,' ч')+scopeCell(hasScope?totalScope:null)+'<td colspan="3"></td></tr>';
   }
   html += '</tbody>';
   table.innerHTML = html;
@@ -756,7 +802,7 @@ function sumRates(rateLists, len){
 
 function burnRateTableHtml(firstHeader, dates, rows){
   /* rows: [{label, rates}] — последняя строка «Итого по проекту» добавляется автоматически */
-  var rateCells = function(rates){ return rates.map(function(r){ return '<td class="num">'+(r===null?'—':fmtNum(r))+'</td>'; }).join(''); };
+  var rateCells = function(rates){ return rates.map(function(r){ return rateCell(r); }).join(''); };
   var html = '<thead><tr><th>'+firstHeader+'</th>' + dates.map(function(d){ return '<th class="num">'+fmtShortDate(d)+'</th>'; }).join('') + '</tr></thead><tbody>';
   rows.forEach(function(r){ html += '<tr><td>'+escapeHtml(r.label)+'</td>'+rateCells(r.rates)+'</tr>'; });
   var totals = sumRates(rows.map(function(r){ return r.rates; }), dates.length);
@@ -805,16 +851,17 @@ function renderStageSummaryTable(){
     '<th class="sortable num" data-sort="count">Эпиков</th>'+
     '<th class="sortable num" data-sort="remaining">Остаток (сумма)</th>'+
     '<th class="sortable num" data-sort="burnRate">Burn rate, ч/день</th>'+
+    '<th class="sortable num" data-sort="scope" title="Изменение суммарной оценки с первого замера">Δ оценки</th>'+
     '<th class="sortable" data-sort="targetDate">Цель</th>'+
     '<th class="sortable" data-sort="forecastZero">Прогноз «0»</th>'+
     '<th class="sortable" data-sort="status">Статус</th>'+
     '</tr></thead><tbody>';
   var rows = stageNames.map(function(name){
     var stat = computeStageStatus(name, stageGroups);
-    return {name:name, count:stageGroups[name].length, remaining:stat.lastRemaining, burnRate:stat.burnRate, targetDate:STATE.stageTargets[name]||'', forecastZero:stat.forecastZeroDate||'', status:stat.status};
+    return {name:name, count:stageGroups[name].length, remaining:stat.lastRemaining, burnRate:stat.burnRate, scope:stat.scope, targetDate:STATE.stageTargets[name]||'', forecastZero:stat.forecastZeroDate||'', noBurn:stat.noBurn, status:stat.status};
   });
   applyTableSort('stageSummaryTable', rows).forEach(function(r){
-    html += '<tr><td>'+escapeHtml(r.name)+'</td><td class="num">'+r.count+'</td><td class="num">'+hoursToStr(r.remaining)+'</td><td class="num">'+hoursToStr(r.burnRate)+'</td><td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+fmtDate(r.forecastZero)+'</td><td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
+    html += '<tr><td>'+escapeHtml(r.name)+'</td><td class="num">'+r.count+'</td><td class="num">'+hoursToStr(r.remaining)+'</td>'+rateCell(r.burnRate,' ч')+scopeCell(r.scope)+'<td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+forecastText(r)+'</td><td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
   });
   html += '</tbody>';
   table.innerHTML = html;
@@ -849,13 +896,17 @@ function buildStagePanelsSkeleton(){
     var stageName = inp.dataset.stage;
     inp.value = STATE.stageTargets[stageName] || '';
     inp.addEventListener('change', function(e){
+      var prev = STATE.stageTargets[stageName];
+      var refresh = function(){ renderStageCharts(); renderStageKpis(); renderStageSummaryTable(); };
       STATE.stageTargets[stageName] = e.target.value;
       apiPut('/api/projects/'+currentProjectId+'/stage_targets', {stageName:stageName, targetDate:e.target.value}).then(function(){
         toast('Целевая дата «'+stageName+'» обновлена');
+      }).catch(function(){
+        STATE.stageTargets[stageName] = prev;
+        inp.value = prev || '';
+        refresh();
       });
-      renderStageCharts();
-      renderStageKpis();
-      renderStageSummaryTable();
+      refresh();
     });
   });
   applyReadonlyToView('view-stages');
@@ -892,6 +943,34 @@ var epicTargetLabelPlugin = {
     ctx.restore();
   }
 };
+
+/* Вертикальная отметка «Сегодня» на всех графиках с осью времени (если сегодня попадает в диапазон оси) */
+var todayLinePlugin = {
+  id: 'todayLine',
+  afterDatasetsDraw: function(chart){
+    var x = chart.scales && chart.scales.x;
+    var area = chart.chartArea;
+    if(!x || !area || x.type !== 'time') return;
+    var t = Date.parse(todayIso() + 'T00:00:00');
+    if(t < x.min || t > x.max) return;
+    var px = x.getPixelForValue(t);
+    var ctx = chart.ctx;
+    ctx.save();
+    ctx.strokeStyle = getCss('--color-text-faint');
+    ctx.setLineDash([4, 4]);
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(px, area.top); ctx.lineTo(px, area.bottom); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = getCss('--color-text-muted');
+    ctx.font = '600 10px "General Sans", Arial, sans-serif';
+    ctx.textBaseline = 'bottom';
+    var label = 'Сегодня';
+    var w = ctx.measureText(label).width;
+    ctx.fillText(label, Math.min(px + 4, area.right - w), area.bottom - 4);
+    ctx.restore();
+  }
+};
+if(window.Chart) Chart.register(todayLinePlugin);
 
 function renderStageCharts(){
   destroyChartsByPrefix('stage_');
@@ -964,6 +1043,26 @@ function populateServiceSelects(){
   document.getElementById('navServiceCount').textContent = STATE.services.length;
 }
 
+function saveService(svc){
+  return apiPut('/api/services/'+svc.id, {etap:svc.etap, name:svc.name, targetDate:svc.targetDate, isDone:svc.isDone, stageGroup:svc.stageGroup});
+}
+
+/* Enter / Shift+Enter — переход к тому же полю в следующей / предыдущей строке таблицы */
+function enableEnterNavigation(table){
+  if(table.dataset.enterNav) return;  /* таблица перерисовывается, а обработчик на ней — один */
+  table.dataset.enterNav = '1';
+  table.addEventListener('keydown', function(e){
+    if(e.key !== 'Enter' || e.target.tagName !== 'INPUT') return;
+    e.preventDefault();
+    var field = e.target.dataset.field;
+    var rows = Array.from(table.querySelectorAll('tbody tr'));
+    var idx = rows.indexOf(e.target.closest('tr')) + (e.shiftKey ? -1 : 1);
+    var next = rows[idx] && rows[idx].querySelector('input[data-field="'+field+'"]');
+    if(next){ next.focus(); if(next.select) next.select(); }
+    else e.target.blur();  /* последняя строка — фиксируем значение */
+  });
+}
+
 function refreshDashboardParts(){
   refreshCharts();
   renderSummaryTable();
@@ -1026,14 +1125,26 @@ function renderDataView(){
           return;
         }
       }
-      entry[field] = field === 'date' ? inp.value : (inp.value === '' ? null : parseFloat(inp.value));
+      var newVal = field === 'date' ? inp.value : (inp.value === '' ? null : parseFloat(inp.value));
+      if(field !== 'date' && newVal !== null && (isNaN(newVal) || newVal < 0)){
+        toast('Введите число не меньше 0');
+        inp.value = entry[field] ?? '';
+        return;
+      }
+      var prev = entry[field];
+      entry[field] = newVal;
       apiPut('/api/entries/'+id, {date:entry.date, remaining:entry.remaining, spent:entry.spent, estimate:entry.estimate}).then(function(){
         toast('Сохранено');
+      }).catch(function(){
+        entry[field] = prev;   /* сервер не принял изменение — возвращаем прежнее значение */
+        if(currentView === 'data') renderDataView();
+        refreshDashboardParts();
       });
       if(field === 'date') renderDataView();
       refreshDashboardParts();
     });
   });
+  enableEnterNavigation(table);
   table.querySelectorAll('[data-action="delete"]').forEach(function(btn){
     btn.addEventListener('click', function(){
       var id = parseInt(btn.closest('tr').dataset.id, 10);
@@ -1097,11 +1208,17 @@ function renderServicesView(){
       var svc = serviceById(id);
       if(!svc) return;
       var field = inp.dataset.field;
+      var prev = svc[field];
       if(field === 'isDone') svc.isDone = inp.checked;
       else if(field === 'etap' || field === 'name') svc[field] = inp.value.trim();
       else svc[field] = inp.value;
-      apiPut('/api/services/'+id, {etap:svc.etap, name:svc.name, targetDate:svc.targetDate, isDone:svc.isDone, stageGroup:svc.stageGroup}).then(function(){
+      saveService(svc).then(function(){
         toast('Сохранено');
+      }).catch(function(){
+        svc[field] = prev;
+        renderServicesView();
+        populateServiceSelects();
+        renderDashboardFilterBar();
       });
       if(field === 'isDone') inp.closest('tr').classList.toggle('done-row', svc.isDone);
       populateServiceSelects();
@@ -1143,8 +1260,9 @@ function renderSettingsView(){
 
   var bind = function(id, apply){
     document.getElementById(id).addEventListener('change', function(e){
+      var prev = Object.assign({}, st);
       apply(e.target);
-      saveSettings();
+      saveSettings(prev);
       renderSettingsView();
     });
   };
@@ -1155,14 +1273,19 @@ function renderSettingsView(){
   applyReadonlyToView('view-settings');
 }
 
-function saveSettings(){
+function saveSettings(prevSettings){
   if(!canEdit()) return;
   apiPut('/api/projects/'+currentProjectId+'/settings', {
     forecastMethod: STATE.settings.forecastMethod,
     riskBufferDays: STATE.settings.riskBufferDays,
     burnrateMethod: STATE.settings.burnrateMethod,
     burnrateWindowDays: STATE.settings.burnrateWindowDays
-  }).then(function(){ toast('Настройки сохранены'); });
+  }).then(function(){ toast('Настройки сохранены'); }).catch(function(){
+    if(prevSettings){
+      STATE.settings = prevSettings;
+      if(currentView === 'settings') renderSettingsView();
+    }
+  });
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -1381,9 +1504,6 @@ function renderProjectsMgmtTable(){
 function renderUsersView(){
   loadUsers().then(renderUserProjectsMgmt);
 }
-function renderProjectsView(){
-  renderProjectsMgmtTable();
-}
 
 /* ════════════════════════════════════════════════════════════════
    Role-based UI
@@ -1461,9 +1581,11 @@ function navigate(view){
     pageSub.textContent = titles[view][1] + (ADMIN_VIEWS.indexOf(view) === -1 ? projectTitleSuffix() : '');
   }
   var renderers = {dashboard:renderDashboard, stages:renderStagesView, data:renderDataView, services:renderServicesView,
-    settings:renderSettingsView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:renderAuditTable};
+    settings:renderSettingsView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); }};
   if(renderers[view] && (currentProjectId || ADMIN_VIEWS.indexOf(view) !== -1)) renderers[view]();
-  document.getElementById('btnPdf').style.display = (PDF_VIEWS.indexOf(view) !== -1 && currentProjectId) ? '' : 'none';
+  var reportView = PDF_VIEWS.indexOf(view) !== -1 && currentProjectId;
+  document.getElementById('btnPdf').style.display = reportView ? '' : 'none';
+  document.getElementById('btnPrint').style.display = (reportView && view !== 'data') ? '' : 'none';
   if(window.matchMedia('(max-width: 900px)').matches) setSidebarCollapsed(true);
 }
 
@@ -1543,13 +1665,17 @@ document.getElementById('epicTargetDate').addEventListener('change', function(e)
   var sid = parseInt(document.getElementById('chartServiceSelect').value, 10);
   var svc = serviceById(sid);
   if(!svc || !canEdit()) return;
+  var prev = svc.targetDate;
+  var refresh = function(){ renderEpicCharts(); renderSummaryTable(); renderKpis(); };
   svc.targetDate = e.target.value;
-  apiPut('/api/services/'+sid, {etap:svc.etap, name:svc.name, targetDate:svc.targetDate, isDone:svc.isDone, stageGroup:svc.stageGroup}).then(function(){
+  saveService(svc).then(function(){
     toast('Целевая дата обновлена');
+  }).catch(function(){
+    svc.targetDate = prev;
+    e.target.value = prev || '';
+    refresh();
   });
-  renderEpicCharts();
-  renderSummaryTable();
-  renderKpis();
+  refresh();
 });
 document.getElementById('dataServiceSelect').addEventListener('change', function(e){
   currentDataServiceId = parseInt(e.target.value, 10) || null;
@@ -1567,7 +1693,10 @@ document.getElementById('btnAddRow').addEventListener('click', function(){
   if(!canEdit()){ toast('Нет прав на редактирование'); return; }
   if(!currentDataServiceId){ toast('Сначала добавьте эпик'); return; }
   var rows = entriesForService(currentDataServiceId);
-  var newDate = rows.length ? addDays(rows[rows.length-1].date, 1) : TODAY;
+  /* сегодняшняя дата, если она позже последнего замера; иначе — следующий день после последнего */
+  var lastDate = rows.length ? rows[rows.length-1].date : null;
+  var today = todayIso();
+  var newDate = (!lastDate || today > lastDate) ? today : addDays(lastDate, 1);
   var sid = currentDataServiceId;
   apiPost('/api/services/'+sid+'/entries', {date:newDate, remaining:null, spent:null, estimate:null}).then(function(data){
     STATE.entries.push({id:data.id, service_id:sid, date:newDate, remaining:null, spent:null, estimate:null});
@@ -1576,10 +1705,99 @@ document.getElementById('btnAddRow').addEventListener('click', function(){
   });
 });
 
+/* Замер на одну дату сразу по всем эпикам проекта */
+function lastValuesBefore(serviceId, date){
+  var res = {remaining:null, spent:null, estimate:null};
+  entriesForService(serviceId).forEach(function(e){
+    if(e.date >= date) return;
+    Object.keys(res).forEach(function(f){ if(isNum(e[f])) res[f] = e[f]; });
+  });
+  return res;
+}
+
+function openBulkMeasurement(){
+  if(!canEdit()){ toast('Нет прав на редактирование'); return; }
+  var services = STATE.services.filter(function(s){ return !s.isDone; });
+  if(!services.length) services = STATE.services.slice();
+  if(!services.length){ toast('Сначала добавьте эпик'); return; }
+  var fields = ['remaining', 'spent', 'estimate'];
+  var FIELD_LABELS = {remaining:'Остаток, ч', spent:'Затрачено, ч', estimate:'Оценка, ч'};
+  openModal({
+    title: 'Замер по всем эпикам', okLabel: 'Сохранить', wide: true,
+    html:
+      '<div class="bulk-head">'+
+        '<label class="small" for="bulkDate">Дата замера</label><input type="date" id="bulkDate" value="'+todayIso()+'">'+
+        '<button type="button" class="btn btn-ghost btn-sm" id="bulkFillPrev" title="Заполнить пустые поля значениями предыдущего замера">Подставить прошлые значения</button>'+
+      '</div>'+
+      '<p class="bulk-note">Пустые строки не сохраняются. Если замер на эту дату уже есть, он будет обновлён. Серым показаны значения предыдущего замера; сданные эпики не выводятся.</p>'+
+      '<div class="table-scroll"><table class="data-table compact-table bulk-table" id="bulkTable"><thead><tr><th>Эпик</th><th class="num">Остаток, ч</th><th class="num">Затрачено, ч</th><th class="num">Оценка, ч</th></tr></thead><tbody>'+
+      services.map(function(s){
+        return '<tr data-sid="'+s.id+'"><td><span class="bulk-etap">'+escapeHtml(s.etap)+'</span> '+escapeHtml(s.name)+'</td>'+
+          fields.map(function(f){ return '<td data-label="'+FIELD_LABELS[f]+'"><input type="number" step="0.01" min="0" data-field="'+f+'" aria-label="'+FIELD_LABELS[f]+'"></td>'; }).join('')+'</tr>';
+      }).join('')+
+      '</tbody></table></div>',
+    onOk: function(){
+      var date = document.getElementById('bulkDate').value;
+      if(!date){ toast('Укажите дату замера'); return false; }
+      var items = [], invalid = false;
+      document.querySelectorAll('#bulkTable tbody tr').forEach(function(tr){
+        var item = {serviceId: parseInt(tr.dataset.sid, 10)}, filled = false;
+        tr.querySelectorAll('input').forEach(function(inp){
+          var v = inp.value === '' ? null : parseFloat(inp.value);
+          if(v !== null && (isNaN(v) || v < 0)) invalid = true;
+          if(v !== null) filled = true;
+          item[inp.dataset.field] = v;
+        });
+        if(filled) items.push(item);
+      });
+      if(invalid){ toast('Значения должны быть числами не меньше 0'); return false; }
+      if(!items.length){ toast('Заполните хотя бы одно значение'); return false; }
+      confirmOk.disabled = true;
+      apiPost('/api/projects/'+currentProjectId+'/measurements', {date:date, items:items}).then(function(data){
+        data.entries.forEach(function(saved){
+          var existing = STATE.entries.find(function(e){ return e.id === saved.id; });
+          if(existing) Object.assign(existing, saved); else STATE.entries.push(saved);
+        });
+        closeModal();
+        renderDataView();
+        refreshDashboardParts();
+        toast('Сохранено замеров: ' + data.entries.length);
+      }).catch(function(){}).then(function(){ confirmOk.disabled = false; });
+      return false;
+    }
+  });
+
+  var dateEl = document.getElementById('bulkDate');
+  /* при смене даты подставляем уже существующие значения на эту дату и подсказки с прошлого замера */
+  var fill = function(){
+    var date = dateEl.value;
+    document.querySelectorAll('#bulkTable tbody tr').forEach(function(tr){
+      var sid = parseInt(tr.dataset.sid, 10);
+      var existing = STATE.entries.find(function(e){ return e.service_id === sid && e.date === date; });
+      var prev = lastValuesBefore(sid, date || '9999-12-31');
+      tr.querySelectorAll('input').forEach(function(inp){
+        var f = inp.dataset.field;
+        inp.value = existing && isNum(existing[f]) ? existing[f] : '';
+        inp.placeholder = isNum(prev[f]) ? (Math.round(prev[f]*100)/100).toLocaleString('ru-RU', {maximumFractionDigits:2, useGrouping:false}) : '';
+        inp.dataset.prev = isNum(prev[f]) ? prev[f] : '';
+      });
+    });
+  };
+  dateEl.addEventListener('change', fill);
+  fill();
+  document.getElementById('bulkFillPrev').addEventListener('click', function(){
+    document.querySelectorAll('#bulkTable input[data-field]').forEach(function(inp){
+      if(inp.value === '' && inp.dataset.prev !== '') inp.value = inp.dataset.prev;
+    });
+  });
+  enableEnterNavigation(document.getElementById('bulkTable'));
+}
+document.getElementById('btnBulkMeasure').addEventListener('click', openBulkMeasurement);
+
 document.getElementById('btnAddService').addEventListener('click', function(){
   if(!canEdit()){ toast('Нет прав на редактирование'); return; }
   var last = STATE.services[STATE.services.length-1];
-  var svc = {etap: last ? last.etap : 'Этап 1', name: 'Новый эпик', targetDate: TODAY};
+  var svc = {etap: last ? last.etap : 'Этап 1', name: 'Новый эпик', targetDate: todayIso()};
   apiPost('/api/projects/'+currentProjectId+'/services', svc).then(function(data){
     var maxOrder = STATE.services.reduce(function(m, s){ return Math.max(m, s.sortOrder||0); }, 0);
     STATE.services.push(Object.assign(svc, {id:data.id, project_id:currentProjectId, isDone:false, stageGroup:'', sortOrder:maxOrder+1}));
@@ -1768,6 +1986,8 @@ function switchProject(pid){
   currentProjectId = pid;
   currentProjectRole = proj ? proj.role : null;
   currentDataServiceId = null;
+  /* данные прежнего проекта не должны быть видны (и редактируемы) под новым, пока грузятся новые */
+  STATE = { services:[], entries:[], stageTargets:{}, settings:Object.assign({}, DEFAULT_SETTINGS) };
   dashboardFilter = { hideDone: dashboardFilter.hideDone, epics: null };
   stageShowDone = false;
   resetBurnRanges();
@@ -1844,7 +2064,9 @@ function fillSelect(sel, allLabel, items){
   }).join('');
   sel.value = items.some(function(it){ return String(it.value) === cur; }) ? cur : '';
 }
-function renderAuditTable(){
+/* Реестр подгружается страницами (сначала новые); сортировка — по уже загруженным записям */
+var auditState = {entries:[], hasMore:false};
+function renderAuditTable(append){
   var selU = document.getElementById('auditFilterUser');
   var selP = document.getElementById('auditFilterPage');
   var selPr = document.getElementById('auditFilterProject');
@@ -1852,34 +2074,47 @@ function renderAuditTable(){
   if(selU.value) params.set('username', selU.value);
   if(selP.value) params.set('page', selP.value);
   if(selPr.value) params.set('projectId', selPr.value);
-  api('/api/audit' + (params.toString() ? '?' + params.toString() : '')).then(function(data){
-    var table = document.getElementById('auditLogTable');
+  if(append === true && auditState.entries.length){
+    params.set('beforeId', auditState.entries.reduce(function(m, e){ return Math.min(m, e.id); }, Infinity));
+  }
+  return api('/api/audit?' + params.toString()).then(function(data){
     fillSelect(selU, 'Все авторы', data.filters.usernames.map(function(u){ return {value:u, label:u}; }));
     fillSelect(selP, 'Все страницы', data.filters.pages.map(function(p){ return {value:p, label:auditPageLabels[p] || p}; }));
     fillSelect(selPr, 'Все проекты', data.filters.projects.map(function(p){ return {value:p.id, label:p.name}; }));
-    if(!data.entries.length){ emptyTable(table, 'Нет данных', 'Изменений пока не зафиксировано.'); return; }
-    var html = '<thead><tr><th class="sortable" data-sort="createdAt">Дата/время</th><th class="sortable" data-sort="username">Автор</th><th class="sortable" data-sort="projectName">Проект</th><th class="sortable" data-sort="page">Страница</th><th class="sortable" data-sort="action">Действие</th><th>Сущность</th><th class="sortable" data-sort="fieldName">Поле</th><th class="sortable" data-sort="oldValue">Было</th><th class="sortable" data-sort="newValue">Стало</th></tr></thead><tbody>';
-    applyTableSort('auditLogTable', data.entries).forEach(function(e){
-      var entityStr = e.entityType ? escapeHtml(e.entityType) + (e.entityName ? ' / ' + escapeHtml(e.entityName) : '') + (e.entityId ? ' #' + e.entityId : '') : '—';
-      html += '<tr>'+
-        '<td class="mono nowrap">'+fmtDateTime(e.createdAt)+'</td>'+
-        '<td>'+escapeHtml(e.username||'')+'</td>'+
-        '<td>'+escapeHtml(e.projectName||'—')+'</td>'+
-        '<td>'+escapeHtml(auditPageLabels[e.page]||e.page||'')+'</td>'+
-        '<td>'+escapeHtml(auditActionLabels[e.action]||e.action||'')+'</td>'+
-        '<td>'+entityStr+'</td>'+
-        '<td>'+escapeHtml(e.fieldName||'—')+'</td>'+
-        '<td class="muted-cell">'+escapeHtml(e.oldValue||'—')+'</td>'+
-        '<td class="strong-cell">'+escapeHtml(e.newValue||'—')+'</td>'+
-      '</tr>';
-    });
-    html += '</tbody>';
-    table.innerHTML = html;
-    initTableSort(table, renderAuditTable);
+    auditState.entries = append === true ? auditState.entries.concat(data.entries) : data.entries;
+    auditState.hasMore = data.hasMore;
+    renderAuditRows();
   });
 }
+function renderAuditRows(){
+  var table = document.getElementById('auditLogTable');
+  var more = document.getElementById('auditMore');
+  more.hidden = !auditState.entries.length;
+  document.getElementById('auditCount').textContent = 'Показано записей: ' + auditState.entries.length + (auditState.hasMore ? '' : ' (все)');
+  document.getElementById('auditLoadMore').hidden = !auditState.hasMore;
+  if(!auditState.entries.length){ emptyTable(table, 'Нет данных', 'Изменений пока не зафиксировано.'); return; }
+  var html = '<thead><tr><th class="sortable" data-sort="createdAt">Дата/время</th><th class="sortable" data-sort="username">Автор</th><th class="sortable" data-sort="projectName">Проект</th><th class="sortable" data-sort="page">Страница</th><th class="sortable" data-sort="action">Действие</th><th>Сущность</th><th class="sortable" data-sort="fieldName">Поле</th><th class="sortable" data-sort="oldValue">Было</th><th class="sortable" data-sort="newValue">Стало</th></tr></thead><tbody>';
+  applyTableSort('auditLogTable', auditState.entries).forEach(function(e){
+    var entityStr = e.entityType ? escapeHtml(e.entityType) + (e.entityName ? ' / ' + escapeHtml(e.entityName) : '') + (e.entityId ? ' #' + e.entityId : '') : '—';
+    html += '<tr>'+
+      '<td class="mono nowrap">'+fmtDateTime(e.createdAt)+'</td>'+
+      '<td>'+escapeHtml(e.username||'')+'</td>'+
+      '<td>'+escapeHtml(e.projectName||'—')+'</td>'+
+      '<td>'+escapeHtml(auditPageLabels[e.page]||e.page||'')+'</td>'+
+      '<td>'+escapeHtml(auditActionLabels[e.action]||e.action||'')+'</td>'+
+      '<td>'+entityStr+'</td>'+
+      '<td>'+escapeHtml(e.fieldName||'—')+'</td>'+
+      '<td class="muted-cell">'+escapeHtml(e.oldValue||'—')+'</td>'+
+      '<td class="strong-cell">'+escapeHtml(e.newValue||'—')+'</td>'+
+    '</tr>';
+  });
+  html += '</tbody>';
+  table.innerHTML = html;
+  initTableSort(table, renderAuditRows);
+}
+document.getElementById('auditLoadMore').addEventListener('click', function(){ renderAuditTable(true); });
 ['auditFilterUser','auditFilterPage','auditFilterProject'].forEach(function(id){
-  document.getElementById(id).addEventListener('change', renderAuditTable);
+  document.getElementById(id).addEventListener('change', function(){ renderAuditTable(); });
 });
 document.getElementById('auditResetFilters').addEventListener('click', function(){
   ['auditFilterUser','auditFilterPage','auditFilterProject'].forEach(function(id){ document.getElementById(id).value = ''; });
@@ -1889,6 +2124,14 @@ document.getElementById('auditResetFilters').addEventListener('click', function(
 /* ════════════════════════════════════════════════════════════════
    PDF export — учитывает текущие фильтры дашборда и свода по этапам
 ════════════════════════════════════════════════════════════════ */
+/* Печать раздела с графиками: перед печатью раскрываем свёрнутый блок, графики подгоняются под ширину листа */
+document.getElementById('btnPrint').addEventListener('click', function(){
+  if(!allEpicsBlock.open && currentView === 'dashboard'){ allEpicsBlock.open = true; renderAllEpicsCharts(); }
+  setTimeout(function(){ window.print(); }, 150);
+});
+window.addEventListener('beforeprint', function(){ Object.keys(charts).forEach(function(k){ charts[k].resize(); }); });
+window.addEventListener('afterprint', function(){ Object.keys(charts).forEach(function(k){ charts[k].resize(); }); });
+
 document.getElementById('btnPdf').addEventListener('click', function(){
   if(!currentProjectId) return;
   var params = new URLSearchParams({page: currentView});
