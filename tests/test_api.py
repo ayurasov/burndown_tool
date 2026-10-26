@@ -547,3 +547,20 @@ def test_index_redirects_deleted_user(admin, make_user):
     admin.delete(f'/api/users/{c.user_id}')
     r = c.get('/')
     assert r.status_code == 302 and r.headers['Location'].endswith('/login')
+
+
+def test_audit_text_changes_without_none_strings(admin):
+    admin.put('/api/profile', json={'email': 'a@b.ru', 'position': ''})
+    log = audit(admin, page='profile')
+    assert [(e['fieldName'], e['oldValue'], e['newValue']) for e in log] == [('email', None, 'a@b.ru')]
+    uid = admin.post('/api/users', json={'username': 'u1', 'password': 'p'}).get_json()['id']
+    admin.put(f'/api/users/{uid}', json={'position': 'Аналитик', 'email': ''})
+    changes = [(e['fieldName'], e['oldValue'], e['newValue']) for e in audit(admin, page='users') if e['action'] == 'update']
+    assert changes == [('position', None, 'Аналитик')]
+
+
+def test_unchanged_stage_target_not_logged(admin):
+    admin.put('/api/projects/1/stage_targets', json={'stageName': 'Этап 4', 'targetDate': '2026-08-31'})
+    assert audit(admin, page='stages') == []
+    admin.put('/api/projects/1/stage_targets', json={'stageName': 'Этап 4', 'targetDate': '2026-09-02'})
+    assert [(e['oldValue'], e['newValue']) for e in audit(admin, page='stages')] == [('2026-08-31', '2026-09-02')]

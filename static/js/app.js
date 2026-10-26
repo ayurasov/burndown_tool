@@ -2050,6 +2050,13 @@ var auditPageLabels = {
   projects: 'Проекты', profile: 'Профиль'
 };
 var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление' };
+var auditEntityLabels = { project: 'Проект', service: 'Эпик', entry: 'Замер', user: 'Пользователь', stage_target: 'Цель этапа', settings: 'Настройки' };
+var auditFieldLabels = {
+  name: 'Название', description: 'Описание', etap: 'Этап', targetDate: 'Целевая дата', isDone: 'Сдано', stageGroup: 'Группа в своде',
+  date: 'Дата', remaining: 'Остаток', spent: 'Затрачено', estimate: 'Оценка',
+  username: 'Логин', displayName: 'Имя', email: 'Email', position: 'Должность', role: 'Роль',
+  forecastMethod: 'Метод прогноза', riskBufferDays: 'Буфер риска', burnrateMethod: 'Метод burn rate', burnrateWindowDays: 'Окно burn rate'
+};
 /* В БД время хранится в UTC (CURRENT_TIMESTAMP) — показываем в локальном часовом поясе */
 function fmtDateTime(ts){
   if(!ts) return '—';
@@ -2095,7 +2102,7 @@ function renderAuditRows(){
   if(!auditState.entries.length){ emptyTable(table, 'Нет данных', 'Изменений пока не зафиксировано.'); return; }
   var html = '<thead><tr><th class="sortable" data-sort="createdAt">Дата/время</th><th class="sortable" data-sort="username">Автор</th><th class="sortable" data-sort="projectName">Проект</th><th class="sortable" data-sort="page">Страница</th><th class="sortable" data-sort="action">Действие</th><th>Сущность</th><th class="sortable" data-sort="fieldName">Поле</th><th class="sortable" data-sort="oldValue">Было</th><th class="sortable" data-sort="newValue">Стало</th></tr></thead><tbody>';
   applyTableSort('auditLogTable', auditState.entries).forEach(function(e){
-    var entityStr = e.entityType ? escapeHtml(e.entityType) + (e.entityName ? ' / ' + escapeHtml(e.entityName) : '') + (e.entityId ? ' #' + e.entityId : '') : '—';
+    var entityStr = e.entityType ? escapeHtml(auditEntityLabels[e.entityType] || e.entityType) + (e.entityName ? ' «' + escapeHtml(e.entityName) + '»' : '') + (e.entityId ? ' #' + e.entityId : '') : '—';
     html += '<tr>'+
       '<td class="mono nowrap">'+fmtDateTime(e.createdAt)+'</td>'+
       '<td>'+escapeHtml(e.username||'')+'</td>'+
@@ -2103,7 +2110,7 @@ function renderAuditRows(){
       '<td>'+escapeHtml(auditPageLabels[e.page]||e.page||'')+'</td>'+
       '<td>'+escapeHtml(auditActionLabels[e.action]||e.action||'')+'</td>'+
       '<td>'+entityStr+'</td>'+
-      '<td>'+escapeHtml(e.fieldName||'—')+'</td>'+
+      '<td>'+escapeHtml(auditFieldLabels[e.fieldName]||e.fieldName||'—')+'</td>'+
       '<td class="muted-cell">'+escapeHtml(e.oldValue||'—')+'</td>'+
       '<td class="strong-cell">'+escapeHtml(e.newValue||'—')+'</td>'+
     '</tr>';
