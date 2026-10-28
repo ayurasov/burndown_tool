@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,6 +25,22 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 from werkzeug.serving import make_server  # noqa: E402
 
 import app as app_module  # noqa: E402
+
+# Часы демо-стенда: «сейчас» — 14:00 по Москве сегодняшней (по UTC) даты, в выходные — пятницы. Тогда снимки не зависят
+# от времени запуска скрипта: утренний автозапуск уже прошёл, даты сервера и браузера совпадают.
+_demo_day = datetime.now(timezone.utc).date()
+while _demo_day.isoweekday() > 5:
+    _demo_day -= timedelta(days=1)
+DEMO_SHIFT = datetime.now(timezone.utc) - datetime(_demo_day.year, _demo_day.month, _demo_day.day, 11, tzinfo=timezone.utc)
+
+
+class _DemoDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return super().now(tz) - DEMO_SHIFT
+
+
+app_module.datetime = _DemoDatetime
 import fake_jira  # noqa: E402
 import notify  # noqa: E402
 from fake_notify import FakeSMTP, FakeTelegram  # noqa: E402
@@ -154,7 +171,9 @@ def main():
             opts = dict(viewport={'width': 1440, 'height': 900}, device_scale_factor=2, color_scheme='light',
                         locale='ru-RU', timezone_id='Europe/Moscow')
             opts.update(kw)
-            return browser.new_context(**opts)
+            ctx = browser.new_context(**opts)
+            ctx.clock.install(time=datetime.now(timezone.utc) - DEMO_SHIFT)
+            return ctx
 
         def login(pg, username, password):
             pg.goto(base + '/login')
@@ -409,6 +428,11 @@ def main():
         pg.click('#btnAddProject')
         modal('admin/04-project-add.png')
         pg.keyboard.press('Escape')
+        with app_module.app.app_context():  # реестр пишет время SQLite (CURRENT_TIMESTAMP) — переводим на часы стенда
+            db = app_module.get_db()
+            db.execute('UPDATE audit_log SET created_at = datetime(created_at, ?)',
+                       (f'{-int(DEMO_SHIFT.total_seconds()):+d} seconds',))
+            db.commit()
         pg.set_viewport_size({'width': 1800, 'height': 900})  # реестр — широкая таблица
         go('audit', '#auditLogTable tbody tr')
         shot(pg.locator('#view-audit .panel'), 'admin/05-audit.png')
