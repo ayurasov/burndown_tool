@@ -160,6 +160,11 @@ def handle_validation_error(err):
     return jsonify({'error': str(err)}), 400
 
 
+@app.errorhandler(jira.JiraError)
+def handle_jira_error(err):
+    return jsonify({'error': str(err)}), 502
+
+
 def text_value(value):
     """Строковое поле запроса: None и нестроковые значения приводятся к строке без пробелов по краям."""
     return '' if value is None else str(value).strip()

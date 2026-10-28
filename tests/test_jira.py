@@ -301,3 +301,15 @@ def test_old_database_gets_jira_tables(db_path):
     app_module.migrate_db()
     names = {r[0] for r in sqlite3.connect(db_path).execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {'jira_connections', 'jira_snapshot_buttons', 'jira_snapshot_mappings'} <= names
+
+
+def test_without_jira_libraries_app_works(admin, fake, monkeypatch):
+    """Обновили код, но не выполнили pip install: приложение работает, связь с Jira — с понятной ошибкой."""
+    monkeypatch.setattr(jira, 'requests', None)
+    monkeypatch.setattr(jira, 'Fernet', None)
+    assert admin.get('/api/projects/1/data').status_code == 200
+    assert admin.get('/api/projects/1/jira').status_code == 200
+    r = connect(admin, fake)
+    assert r.status_code == 502 and 'pip install -r requirements.txt' in r.get_json()['error']
+    r = admin.post('/api/projects/1/jira/connection/test', json={'baseUrl': fake.url, 'instanceType': 'server', 'token': 'x'})
+    assert r.status_code == 502 and 'pip install' in r.get_json()['error']

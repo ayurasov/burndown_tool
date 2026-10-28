@@ -19,8 +19,16 @@ import hashlib
 import re
 import time
 
-import requests
-from cryptography.fernet import Fernet, InvalidToken
+# Без этих библиотек (не выполнен pip install -r requirements.txt после обновления) приложение работает,
+# недоступна только связь с Jira — с понятным сообщением вместо падения при запуске.
+try:
+    import requests
+except ImportError:  # pragma: no cover
+    requests = None
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+except ImportError:  # pragma: no cover
+    Fernet = InvalidToken = None
 
 INSTANCE_TYPES = ('cloud', 'server', 'server_basic')
 ISSUE_KEY_RE = re.compile(r'^[A-Z][A-Z0-9_]*-\d+$')
@@ -41,9 +49,17 @@ class JiraError(Exception):
     """Ошибка обращения к Jira с понятным пользователю текстом."""
 
 
+def _require_libs():
+    missing = [name for name, mod in (('requests', requests), ('cryptography', Fernet)) if mod is None]
+    if missing:
+        raise JiraError('На сервере не установлены библиотеки для связи с Jira (' + ', '.join(missing) +
+                        '): выполните pip install -r requirements.txt и перезапустите приложение')
+
+
 # ─── Хранение токена ─────────────────────────────────────────────
 
 def _fernet(secret_key):
+    _require_libs()
     key = base64.urlsafe_b64encode(hashlib.sha256(('jira-token:' + str(secret_key)).encode()).digest())
     return Fernet(key)
 
@@ -158,6 +174,7 @@ class JiraClient:
         self.base_url = (base_url or '').strip().rstrip('/')
         if not re.match(r'^https?://', self.base_url):
             raise JiraError('Адрес Jira должен начинаться с http:// или https://')
+        _require_libs()
         self.instance_type = instance_type
         self.timeout = timeout
         self.session = requests.Session()  # прокси из окружения сервера подхватываются автоматически

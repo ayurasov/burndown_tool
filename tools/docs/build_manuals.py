@@ -161,8 +161,9 @@ def reference_docx(path):
             styles[name].paragraph_format.line_spacing = 1.15
     font(styles['Title'], 28, True, INK)
     font(styles['Subtitle'], 15, False, TEAL)
-    if 'Date' in styles:
-        font(styles['Date'], 11, False, MUTED)
+    for name in ('Author', 'Date'):
+        if name in styles:
+            font(styles[name], 11, False, MUTED)
     for level, size in {1: 18, 2: 14, 3: 12, 4: 11}.items():
         style = styles[f'Heading {level}']
         font(style, size, True, TEAL if level == 2 else INK)
