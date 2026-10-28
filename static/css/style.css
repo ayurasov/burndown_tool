@@ -509,6 +509,11 @@ table.jira-map-table{min-width:560px;}
 .history-message.error{color:var(--color-error);}
 @media (max-width:640px){.history-form{grid-template-columns:1fr;}}
 /* Сводки с шансом успеть: заголовки переносятся, чтобы таблица помещалась без прокрутки */
-#summaryTable th,#stageSummaryTable th{white-space:normal;vertical-align:bottom;}
+#summaryTable th,#stageSummaryTable th,#jiraCompTable th,#stageJiraTable th{white-space:normal;vertical-align:bottom;}
 #summaryTable td,#stageSummaryTable td{padding-left:var(--space-2);padding-right:var(--space-2);}
 #summaryTable td:nth-child(2){min-width:9rem;}
+.chart-note{margin:0 0 var(--space-2);font-size:var(--text-sm);color:var(--color-text-muted);}
+.chart-note b{color:var(--color-text);}
+#jiraCompTable tr.total-row td,#stageJiraTable tr.total-row td{font-weight:600;}
+#stageJiraTable tr.clickable:hover td{background:var(--color-surface-offset);}
+#stageJiraTable tr.clickable:focus-visible{outline:2px solid var(--color-primary);outline-offset:-2px;}

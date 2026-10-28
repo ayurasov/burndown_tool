@@ -128,6 +128,17 @@
           <div class="chart-wrap chart-wrap-sm"><canvas id="chartEstimateEpic"></canvas></div>
         </div>
       </div>
+      <div class="panel" id="driftPanel" hidden>
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Дрейф прогноза (эпик)</div>
+            <div class="section-note">Какой была прогнозная дата завершения на каждую дату замера. Линия вверх — срок сдвигается, горизонтальная — прогноз стабилен.</div>
+          </div>
+        </div>
+        <p class="chart-note" id="driftNote"></p>
+        <div class="legend-row" id="legendDrift"></div>
+        <div class="chart-wrap chart-wrap-sm"><canvas id="chartDrift"></canvas></div>
+      </div>
       <div class="panel" id="jiraBurnupPanel" hidden>
         <div class="panel-head">
           <div>
@@ -139,6 +150,7 @@
             <button type="button" class="btn btn-ghost btn-sm" id="jiraBurnupIssues">Задачи эпика</button>
           </div>
         </div>
+        <p class="chart-note" id="burnupNote"></p>
         <div class="legend-row" id="legendBurnup"></div>
         <div class="chart-wrap chart-wrap-sm"><canvas id="chartBurnup"></canvas></div>
       </div>
@@ -212,6 +224,30 @@
       <div class="panel">
         <div class="panel-head"><div class="panel-title">Сводка по этапам</div></div>
         <div class="table-scroll"><table class="data-table" id="stageSummaryTable"></table></div>
+      </div>
+      <div class="panel" id="stageJiraPanel" hidden>
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Задачи Jira по этапам</div>
+            <div class="section-note">Сумма последних срезов задач эпиков этапа и итог по проекту. Щелчок по строке — burn-up этапа ниже.</div>
+          </div>
+        </div>
+        <div class="table-scroll"><table class="data-table" id="stageJiraTable"></table></div>
+      </div>
+      <div class="panel" id="stageBurnupPanel" hidden>
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Объём и выполнение по задачам Jira</div>
+            <div class="section-note">Burn-up этапа или всего проекта с прогнозом: когда «Выполнено» догонит «Объём» при текущих темпах.</div>
+          </div>
+          <div class="panel-controls">
+            <label class="small" for="stageBurnupSelect">Этап</label>
+            <select id="stageBurnupSelect" class="filter-input"></select>
+          </div>
+        </div>
+        <p class="chart-note" id="stageBurnupNote"></p>
+        <div class="legend-row" id="legendStageBurnup"></div>
+        <div class="chart-wrap chart-wrap-sm"><canvas id="chartStageBurnup"></canvas></div>
       </div>
       <div class="panel">
         <div class="panel-head">

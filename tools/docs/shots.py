@@ -200,6 +200,7 @@ def main():
         pg.wait_for_selector('#jiraCompTable tbody tr')
         shot(pg.locator('#jiraCompPanel'), 'user/34-jira-composition.png')
         shot(pg.locator('#jiraBurnupPanel'), 'user/35-jira-burnup.png')
+        shot(pg.locator('#driftPanel'), 'user/42-forecast-drift.png')
         pg.click('#jiraCompTable tr[data-sid="4"]')
         pg.wait_for_selector('#jiTable tbody tr')
         pg.wait_for_timeout(300)
@@ -229,6 +230,11 @@ def main():
         shot(pg.locator('#stageChartsContainer .panel').first, 'user/12-stage-chart.png')
         shot(pg.locator('#stageSummaryTable').locator('xpath=ancestor::div[contains(@class,"panel")]'),
              'user/13-stage-summary.png')
+        pg.wait_for_selector('#stageJiraTable tbody tr')
+        shot(pg.locator('#stageJiraPanel'), 'user/43-stage-jira.png')
+        pg.select_option('#stageBurnupSelect', '__project')
+        pg.wait_for_timeout(400)
+        shot(pg.locator('#stageBurnupPanel'), 'user/44-project-burnup.png')
 
         # ── Данные по датам
         go('data', '#entriesTable tbody tr')

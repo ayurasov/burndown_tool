@@ -1015,3 +1015,67 @@ def test_jira_history_restore_ui(admin_ui, fake_jira, admin):
     assert entries['2026-10-19']['remaining'] == 14 and entries['2026-10-26']['remaining'] == 12.5
     page.wait_for_function("document.querySelector('#jiraButtonsTable tbody tr').textContent.includes('история: 19.10.2026 — 26.10.2026, готово')")
     assert not admin_ui.errors
+
+
+def test_forecast_drift_chart(admin_ui):
+    page = admin_ui.page
+    page.select_option('#chartServiceSelect', '1')
+    page.wait_for_selector('#driftPanel:not([hidden])')
+    # демо: 4 замера → прогноз на 3 даты (07-24, 07-28, 07-29); медиана Монте-Карло — с третьего замера
+    lens = page.evaluate("Chart.getChart('chartDrift').data.datasets.map(d => d.data.length)")
+    assert lens[:4] == [3, 3, 3, 3]
+    p50 = page.evaluate("Chart.getChart('chartDrift').data.datasets[1].data.map(p => p.y)")
+    assert p50[0] is None and p50[1] and p50[2]
+    note = admin_ui.text('#driftNote')
+    assert note.startswith('Прогноз завершения на последний замер:') and 'С прошлого замера (28.07.2026)' in note
+    assert 'Цель: 31.08.2026' in admin_ui.text('#legendDrift')
+    admin_ui.project(2)  # пустой проект — графика нет
+    assert page.is_hidden('#driftPanel')
+    assert not admin_ui.errors
+
+
+def test_burnup_forecast_and_stage_level(admin_ui, fake_jira, admin):
+    import datetime
+    import fake_jira as fj
+    page = admin_ui.page
+    admin.put('/api/projects/1/jira/connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
+    bid = admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'structureId': 7, 'mappings': [
+        {'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True},
+        {'serviceId': 2, 'issueKeys': 'ABC-4', 'includeSubtree': False}]}).get_json()['id']
+    admin.post(f'/api/jira/buttons/{bid}/snapshot', json={'date': '2026-11-02'})
+    old = dict(fj.ISSUES[103])
+    fj.ISSUES[103].update(category='done')
+    try:
+        admin.post(f'/api/jira/buttons/{bid}/snapshot', json={'date': '2026-11-09'})
+    finally:
+        fj.ISSUES[103] = old
+    page.reload()
+    page.wait_for_selector('#jiraCompTable tbody tr[data-sid="1"]')
+    # эпик 1: объём 16 ч, выполнено 3 → 4 ч за неделю, объём не растёт → 12 ч / (1/7 ч в день) = 84 дня
+    expected = (datetime.date(2026, 11, 9) + datetime.timedelta(days=84)).strftime('%d.%m.%Y')
+    row = admin_ui.cells('#jiraCompTable tbody tr[data-sid="1"] td')
+    assert row[6] == expected
+    assert page.get_attribute('#jiraCompTable tbody tr[data-sid="1"] td:nth-child(7) span', 'class') == 'prob-low'  # позже цели
+    # эпик 2: ничего не закрывается — линии не сходятся
+    assert admin_ui.cells('#jiraCompTable tbody tr[data-sid="2"] td')[6] == 'не сходится'
+    total = admin_ui.cells('#jiraCompTable tbody tr.total-row td')
+    assert total[0] == 'Итого по проекту' and total[3] == '2 / 3' and total[4] == '26 ч'
+    page.select_option('#chartServiceSelect', '1')
+    page.wait_for_selector('#jiraBurnupPanel:not([hidden])')
+    assert f'Прогноз по задачам Jira: {expected}' in admin_ui.text('#burnupNote')
+    labels = page.evaluate("Chart.getChart('chartBurnup').data.datasets.map(d => d.label)")
+    assert f'Прогноз: {expected}' in labels
+    page.select_option('#chartServiceSelect', '2')
+    assert 'не завершится' in admin_ui.text('#burnupNote')
+    # свод по этапам: этап 4 (эпики 1 и 2) и итог по проекту, burn-up этапа
+    admin_ui.go('stages')
+    page.wait_for_selector('#stageJiraTable tbody tr[data-stage]')
+    stages = admin_ui.cells('#stageJiraTable tbody tr td:first-child')
+    assert stages == ['Этап 4', 'Итого по проекту']
+    assert page.evaluate("[...document.querySelectorAll('#stageBurnupSelect option')].map(o => o.value)") == ['Этап 4', '__project']
+    page.select_option('#stageBurnupSelect', '__project')
+    page.wait_for_function("Chart.getChart('chartStageBurnup') && Chart.getChart('chartStageBurnup').data.datasets[0].data.length === 2")
+    assert 'Прогноз по задачам Jira' in admin_ui.text('#stageBurnupNote')
+    page.click('#stageJiraTable tbody tr[data-stage="Этап 4"]')
+    assert page.input_value('#stageBurnupSelect') == 'Этап 4'
+    assert not admin_ui.errors

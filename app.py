@@ -1109,6 +1109,91 @@ def api_jira_composition(pid):
                     'problemLabels': jira.PROBLEMS})
 
 
+def _days(a, b):
+    return (datetime.strptime(b, '%Y-%m-%d') - datetime.strptime(a, '%Y-%m-%d')).days
+
+
+def burnup_forecast(history, settings=None):
+    """Когда «Выполнено» догонит «Объём» (как в интерфейсе): темпы — наклоны регрессии по срезам,
+    при скользящем burn rate — по срезам окна. → {'date', 'converges', 'doneRate', 'scopeRate'} или None."""
+    if not history or len(history) < 2:
+        return None
+    pts = history
+    if settings and settings['burnrate_method'] == 'rolling':
+        cutoff = (datetime.strptime(history[-1]['date'], '%Y-%m-%d')
+                  - timedelta(days=settings['burnrate_window_days'] or 14)).date().isoformat()
+        windowed = [p for p in history if p['date'] >= cutoff]
+        pts = windowed if len(windowed) >= 2 else history[-2:]
+    base = pts[0]['date']
+    if _days(base, pts[-1]['date']) <= 0:
+        return None
+
+    def slope(field):
+        xs = [_days(base, p['date']) for p in pts]
+        ys = [p[field] for p in pts]
+        n = len(xs)
+        denom = n * sum(x * x for x in xs) - sum(xs) ** 2
+        return (n * sum(x * y for x, y in zip(xs, ys)) - sum(xs) * sum(ys)) / denom if denom else None
+
+    done_rate, scope_rate = slope('done'), slope('scope')
+    if done_rate is None or scope_rate is None:
+        return None
+    last = history[-1]
+    out = {'doneRate': done_rate, 'scopeRate': scope_rate, 'converges': False, 'date': None}
+    gap = last['scope'] - last['done']
+    if gap <= 0.005:
+        return dict(out, converges=True, date=last['date'])
+    speed = done_rate - scope_rate
+    if speed <= 0 or gap / speed > 3 * 365:
+        return out
+    return dict(out, converges=True, date=(datetime.strptime(last['date'], '%Y-%m-%d')
+                                           + timedelta(days=math.ceil(gap / speed))).date().isoformat())
+
+
+def aggregate_composition(history, latest, sids):
+    """Состав группы эпиков: на каждую дату — сумма последних известных срезов эпиков (как в интерфейсе)."""
+    hists = [history[sid] for sid in sids if history.get(sid)]
+    if not hists:
+        return None
+    out = []
+    for day in sorted({p['date'] for h in hists for p in h}):
+        agg = {'date': day, 'scope': 0.0, 'done': 0.0, 'total': 0, 'doneCount': 0,
+               'counts': {c: 0 for c in jira.STATUS_CATEGORIES}}
+        for h in hists:
+            known = [p for p in h if p['date'] <= day]
+            if not known:
+                continue
+            p = known[-1]
+            agg['scope'] += p['scope']
+            agg['done'] += p['done']
+            agg['total'] += p['total']
+            agg['doneCount'] += p['doneCount']
+            for c in jira.STATUS_CATEGORIES:
+                agg['counts'][c] += p['counts'][c]
+        agg['scope'], agg['done'] = round(agg['scope'], 2), round(agg['done'], 2)
+        out.append(agg)
+    problems = {}
+    for sid in sids:
+        for code, n in (latest.get(sid) or {}).get('problems', {}).items():
+            problems[code] = problems.get(code, 0) + n
+    return out, dict(out[-1], problems=problems)
+
+
+def _composition_pdf_row(label, history, latest, settings, target=None):
+    pct = f"{round(latest['done'] / latest['scope'] * 100)}%" if latest['scope'] else '—'
+    f = burnup_forecast(history, settings)
+    forecast = '—' if not f else (_fmt_date(f['date']) if f['converges'] else 'не сходится')
+    if f and f['converges'] and target and f['date'] > target:
+        forecast += ' (позже)'
+    return [label, str(latest['counts']['done']), str(latest['counts']['indeterminate']), str(latest['counts']['new']),
+            pct, _fmt_num(latest['scope']), forecast, str(sum(latest['problems'].values()) or '—'), _fmt_date(latest['date'])]
+
+
+COMPOSITION_PDF_HEAD = ['', 'Готово', 'В работе', 'Не начато', 'Выполнено', 'Объём, ч', 'Прогноз по задачам',
+                        'Неполные данные', 'Срез']
+COMPOSITION_PDF_WIDTHS = [3.2, 0.8, 0.9, 0.9, 1, 0.9, 1.7, 1.4, 1]
+
+
 def jira_composition(db, pid):
     """Состав эпиков проекта по срезам задач → (история по датам, последний срез с проблемами данных)."""
     rows = db.execute(
@@ -2082,20 +2167,18 @@ def api_export_pdf(pid):
             _pdf_table(pdf, ['Эпик'] + [_fmt_date(d)[:5] for d in dates], br_rows,
                        widths=[4] + [1] * len(dates), total_row=True)
 
-        _history, latest = jira_composition(db, pid)
-        comp_rows = []
-        for s in services:
-            c = latest.get(s['id'])
-            if not c:
-                continue
-            pct = f"{round(c['done'] / c['scope'] * 100)}%" if c['scope'] else '—'
-            comp_rows.append([s['name'], str(c['counts']['done']), str(c['counts']['indeterminate']),
-                              str(c['counts']['new']), pct, _fmt_num(c['scope']),
-                              str(sum(c['problems'].values()) or '—'), _fmt_date(c['date'])])
+        history, latest = jira_composition(db, pid)
+        settings = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
+        with_comp = [s for s in services if s['id'] in latest]
+        comp_rows = [_composition_pdf_row(s['name'], history[s['id']], latest[s['id']], settings, s['target_date'])
+                     for s in with_comp]
+        if len(with_comp) > 1:
+            agg_history, agg_latest = aggregate_composition(history, latest, [s['id'] for s in with_comp])
+            comp_rows.append(_composition_pdf_row('Итого по проекту', agg_history, agg_latest, settings))
         if comp_rows:
             _pdf_heading(pdf, 'Задачи Jira по эпикам (последний срез)')
-            _pdf_table(pdf, ['Эпик', 'Готово', 'В работе', 'Не начато', 'Выполнено объёма', 'Объём, ч',
-                             'С неполными данными', 'Срез'], comp_rows, widths=[3.5, 1, 1, 1, 1.3, 1.1, 1.5, 1.1])
+            _pdf_table(pdf, ['Эпик'] + COMPOSITION_PDF_HEAD[1:], comp_rows, widths=COMPOSITION_PDF_WIDTHS,
+                       total_row=len(with_comp) > 1)
 
     elif page_type == 'stages':
         stage_groups = {}
@@ -2114,6 +2197,21 @@ def api_export_pdf(pid):
                        _fmt_num(last_value(s['id'], 'estimate'))] for s in svcs]
             _pdf_table(pdf, ['Эпик', 'Целевая дата', 'Остаток, ч', 'Затрачено, ч', 'Оценка, ч'], d_rows,
                        widths=[4, 1.2, 1, 1, 1])
+
+        history, latest = jira_composition(db, pid)
+        settings = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
+        comp_rows, all_ids = [], []
+        for stage_name, svcs in stage_groups.items():
+            ids = [s['id'] for s in svcs if s['id'] in latest]
+            agg = aggregate_composition(history, latest, ids)
+            if agg:
+                all_ids += ids
+                comp_rows.append(_composition_pdf_row(stage_name, agg[0], agg[1], settings, stage_targets.get(stage_name)))
+        if comp_rows:
+            agg_history, agg_latest = aggregate_composition(history, latest, all_ids)
+            comp_rows.append(_composition_pdf_row('Итого по проекту', agg_history, agg_latest, settings))
+            _pdf_heading(pdf, 'Задачи Jira по этапам (последний срез)')
+            _pdf_table(pdf, ['Этап'] + COMPOSITION_PDF_HEAD[1:], comp_rows, widths=COMPOSITION_PDF_WIDTHS, total_row=True)
 
     elif page_type == 'data':
         for s in services:
