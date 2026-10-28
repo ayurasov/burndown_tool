@@ -8,17 +8,17 @@
   --color-border: #d3d7db;
   --color-text: #1c2126;
   --color-text-muted: #5c6470;
-  --color-text-faint: #99a1aa;
+  --color-text-faint: #6b737d;
   --color-primary: #01696f;
   --color-primary-hover: #0c4e54;
   --color-primary-active: #0f3638;
   --color-primary-highlight: #cedcd8;
   --color-warning: #964219;
-  --color-warning-highlight: #ddcfc6;
+  --color-warning-highlight: #e6dbd3;
   --color-error: #a12c7b;
-  --color-error-highlight: #e0ced7;
+  --color-error-highlight: #e9dbe2;
   --color-orange: #da7101;
-  --color-success: #437a22;
+  --color-success: #3a6a1d;
   --color-success-highlight: #d4dfcc;
   --color-blue: #006494;
   --radius-sm: 0.375rem; --radius-md: 0.5rem; --radius-lg: 0.75rem; --radius-full: 9999px;
@@ -28,6 +28,7 @@
   --shadow-lg: 0 12px 32px oklch(0.2 0.01 240 / 0.12);
   --font-body: 'General Sans', 'Helvetica Neue', sans-serif;
   --font-mono: 'JetBrains Mono', monospace;
+  color-scheme: light;
 }
 [data-theme="dark"] {
   --color-bg: #14171a;
@@ -39,22 +40,23 @@
   --color-border: #363b40;
   --color-text: #d3d6d9;
   --color-text-muted: #8b929a;
-  --color-text-faint: #5a6067;
+  --color-text-faint: #868d95;
   --color-primary: #4f98a3;
   --color-primary-hover: #227f8b;
   --color-primary-active: #1a626b;
   --color-primary-highlight: #263335;
-  --color-warning: #bb653b;
-  --color-warning-highlight: #4a3d33;
-  --color-error: #d163a7;
-  --color-error-highlight: #3d2e37;
+  --color-warning: #e3956a;
+  --color-warning-highlight: #3a3029;
+  --color-error: #e07bb8;
+  --color-error-highlight: #33272f;
   --color-orange: #fdab43;
-  --color-success: #6daa45;
+  --color-success: #7bb854;
   --color-success-highlight: #2c3629;
   --color-blue: #5591c7;
   --shadow-sm: 0 1px 2px oklch(0 0 0 / 0.3);
   --shadow-md: 0 4px 12px oklch(0 0 0 / 0.4);
   --shadow-lg: 0 12px 32px oklch(0 0 0 / 0.5);
+  color-scheme: dark;  /* флажки, календари и полосы прокрутки браузера — тоже тёмные */
 }
 :root{
   --text-xs: clamp(0.75rem, 0.7rem + 0.25vw, 0.8125rem);
@@ -93,6 +95,9 @@ input[type=text],input[type=search],input[type=email],input[type=url],input[type
   transition:border-color var(--transition-interactive),box-shadow var(--transition-interactive);
 }
 textarea{width:100%;resize:vertical;min-height:auto;}
+/* дата, время и список — той же высоты, что и текстовые поля (иначе в одной строке поля разной высоты) */
+input[type=date],input[type=time],select:not([multiple]){height:var(--control-h);padding-top:0;padding-bottom:0;}
+.compact-table input[type=date]{height:2rem;}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--color-primary);box-shadow:0 0 0 3px oklch(from var(--color-primary) l c h / 0.15);}
 input:disabled,select:disabled{opacity:0.55;cursor:not-allowed;}
 input[readonly]{background:var(--color-surface-offset);cursor:default;}
@@ -107,6 +112,9 @@ label.small,.field-label{font-size:var(--text-xs);color:var(--color-text-muted);
 .btn-sm{min-height:2rem;padding:var(--space-1) var(--space-3);font-size:var(--text-xs);}
 .btn-primary{background:var(--color-primary);color:#fff;}
 .btn-primary:hover{background:var(--color-primary-hover);}
+/* тёмная тема: белый текст на светлом бирюзовом — 3,3:1; на более тёмном — 4,7:1 */
+[data-theme="dark"] .btn-primary{background:var(--color-primary-hover);}
+[data-theme="dark"] .btn-primary:hover{background:var(--color-primary-active);}
 .btn-ghost{background:var(--color-surface-offset);color:var(--color-text);border-color:oklch(from var(--color-text) l c h / 0.1);}
 .btn-ghost:hover{background:var(--color-surface-offset-2);}
 .btn-danger{color:var(--color-error);background:var(--color-error-highlight);}
@@ -193,6 +201,7 @@ label.small,.field-label{font-size:var(--text-xs);color:var(--color-text-muted);
 .page-title{font-size:var(--text-xl);font-weight:700;letter-spacing:-0.01em;line-height:1.2;}
 .page-sub{font-size:var(--text-sm);color:var(--color-text-muted);margin-top:2px;}
 .topbar-actions{display:flex;gap:var(--space-2);align-items:center;flex-shrink:0;}
+@media (max-width:600px){ .topbar-actions .btn-label{display:none;} }
 .sidebar-toggle,.theme-toggle,.theme-toggle-login{width:36px;height:36px;border-radius:var(--radius-md);display:flex;align-items:center;justify-content:center;background:var(--color-surface);color:var(--color-text-muted);flex-shrink:0;border:1px solid var(--color-border);transition:background var(--transition-interactive),color var(--transition-interactive);}
 .sidebar-toggle:hover,.theme-toggle:hover,.theme-toggle-login:hover{background:var(--color-surface-offset);color:var(--color-text);}
 .sidebar-toggle svg,.theme-toggle svg,.theme-toggle-login svg{width:18px;height:18px;}
@@ -222,8 +231,8 @@ label.small,.field-label{font-size:var(--text-xs);color:var(--color-text-muted);
 /* ── KPI & badges ─────────────────────────────────────────────── */
 .kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:var(--space-3);}
 .kpi-card{background:var(--color-surface);border:1px solid var(--color-divider);border-radius:var(--radius-lg);padding:var(--space-4);box-shadow:var(--shadow-sm);min-width:0;}
-.kpi-label{font-size:var(--text-xs);color:var(--color-text-muted);text-transform:uppercase;letter-spacing:0.03em;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.kpi-value{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:var(--text-xl);font-weight:600;margin-top:var(--space-1);white-space:nowrap;}
+.kpi-label{font-size:var(--text-xs);color:var(--color-text-muted);text-transform:uppercase;letter-spacing:0.03em;font-weight:600;line-height:1.3;}
+.kpi-value{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:clamp(1.15rem, 0.9rem + 0.7vw, 1.75rem);font-weight:600;margin-top:var(--space-1);white-space:nowrap;}
 .kpi-note{font-size:var(--text-xs);color:var(--color-text-faint);margin-top:var(--space-1);display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-1) var(--space-2);}
 .badge{display:inline-flex;align-items:center;gap:var(--space-1);padding:2px var(--space-2);border-radius:var(--radius-full);font-size:var(--text-xs);font-weight:600;white-space:nowrap;}
 .badge-ok{background:var(--color-success-highlight);color:var(--color-success);}
@@ -277,7 +286,13 @@ table.services-table{table-layout:fixed;min-width:0;}
 .services-table col.col-group{width:15%;}
 .services-table col.col-count{width:96px;}
 .services-table col.col-actions{width:48px;}
-@media (max-width:1024px){ table.services-table{table-layout:auto;min-width:860px;} }
+@media (max-width:1024px){
+  table.services-table{table-layout:auto;min-width:860px;}
+  /* поля не уже текста: «Этап 3.2» не превращается в «Этап 3», название читается целиком */
+  .services-table td:nth-child(2) input{min-width:6.5rem;}
+  .services-table td:nth-child(3) input{min-width:14rem;}
+  .services-table td:nth-child(6) input{min-width:8rem;}
+}
 
 table.entries-table{table-layout:fixed;width:auto;min-width:0;}
 .entries-table col.col-date{width:160px;}
@@ -307,8 +322,9 @@ table#usersTable{min-width:720px;}
 .toast{position:fixed;bottom:var(--space-6);right:var(--space-6);max-width:calc(100vw - 2 * var(--space-4));background:var(--color-text);color:var(--color-bg);padding:var(--space-3) var(--space-5);border-radius:var(--radius-md);font-size:var(--text-sm);box-shadow:var(--shadow-lg);opacity:0;transform:translateY(12px);transition:opacity 240ms,transform 240ms;pointer-events:none;z-index:300;}
 .toast.show{opacity:1;transform:translateY(0);}
 @media (max-width:640px){ .toast{right:var(--space-4);left:var(--space-4);bottom:var(--space-4);} }
-.modal-overlay{position:fixed;inset:0;background:oklch(0 0 0/0.4);display:flex;align-items:center;justify-content:center;padding:var(--space-4);z-index:200;opacity:0;pointer-events:none;transition:opacity var(--transition-interactive);}
-.modal-overlay.show{opacity:1;pointer-events:auto;}
+.modal-overlay{position:fixed;inset:0;background:oklch(0 0 0/0.4);display:flex;align-items:center;justify-content:center;padding:var(--space-4);z-index:200;opacity:0;pointer-events:none;visibility:hidden;transition:opacity var(--transition-interactive),visibility 0s linear 180ms;}
+.modal-overlay.show{opacity:1;pointer-events:auto;visibility:visible;transition:opacity var(--transition-interactive);}
+[data-theme="dark"] .modal-overlay{background:oklch(0 0 0/0.6);}
 .modal{background:var(--color-surface);border:1px solid var(--color-divider);border-radius:var(--radius-lg);padding:var(--space-6);max-width:440px;width:100%;max-height:calc(100dvh - 2 * var(--space-4));overflow-y:auto;box-shadow:var(--shadow-lg);display:flex;flex-direction:column;gap:var(--space-4);}
 .modal-wide .modal{max-width:680px;}
 .modal h3{font-size:var(--text-lg);font-weight:600;}
@@ -323,10 +339,12 @@ table#usersTable{min-width:720px;}
 .user-form-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--space-3);}
 @media (max-width:520px){ .user-form-row{grid-template-columns:1fr;} }
 .form-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:var(--space-2);padding-top:var(--space-1);}
-.assign-row{display:flex;align-items:center;flex-wrap:wrap;gap:var(--space-2);padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider);}
+.assign-row{display:grid;grid-template-columns:minmax(3.5rem,1fr) minmax(0,19rem) 6.5rem;align-items:center;gap:var(--space-2);padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider);}
 .assign-row:last-child{border-bottom:none;}
 .assign-name{flex:1 1 120px;font-size:var(--text-sm);font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;}
-.assign-row select{flex:2 1 200px;}
+.assign-row select{width:100%;font-size:var(--text-sm);}
+.assign-row .btn{width:100%;}
+@media (max-width:560px){ .assign-row{grid-template-columns:1fr 6.5rem;} .assign-name{grid-column:1 / -1;} }
 
 /* ── Profile ──────────────────────────────────────────────────── */
 .profile-grid{display:grid;grid-template-columns:180px 1fr;gap:var(--space-6);}
@@ -349,11 +367,24 @@ table#usersTable{min-width:720px;}
 /* ── Read-only mode ───────────────────────────────────────────── */
 .readonly-overlay .btn-primary,.readonly-overlay .icon-btn-danger,.readonly-overlay .drag-handle{visibility:hidden;}
 .readonly-overlay #btnAddRow,.readonly-overlay #btnAddService,.readonly-overlay #btnBulkMeasure{display:none;}
+/* режим просмотра: без пустых колонок действий и подсказок про редактирование; заблокированные поля выглядят одинаково */
+.readonly-overlay .edit-only{display:none;}
+/* ячейки остаются (иначе колонки съезжают относительно colgroup), но не занимают места */
+.readonly-overlay .actions-col,.readonly-overlay td.row-actions,.readonly-overlay .drag-col,.readonly-overlay td.drag-handle{padding:0;font-size:0;width:0;}
+.readonly-overlay col.col-actions,.readonly-overlay col.col-drag{width:0;}
+.readonly-overlay input:disabled,.readonly-overlay select:disabled{opacity:1;background:var(--color-surface-offset);color:var(--color-text);}
+.readonly-overlay input[type=checkbox]:disabled{opacity:.7;}
 
 /* ── Quick filters / done epics ───────────────────────────────── */
 .quick-filter{padding:var(--space-3) var(--space-4);}
 .quick-filter-row{display:flex;align-items:center;gap:var(--space-2) var(--space-3);flex-wrap:wrap;}
 .quick-filter-item{display:inline-flex;align-items:center;gap:6px;font-size:var(--text-sm);cursor:pointer;white-space:nowrap;color:var(--color-text);}
+/* длинные подписи флажков переносятся (на телефоне иначе страница шире экрана) */
+.check-wrap{white-space:normal;align-items:flex-start;line-height:1.45;}
+.check-wrap>input[type=checkbox]{flex:none;margin-top:0.2em;}
+.check-wrap .inline-number{flex:none;}
+.check-wrap:has(.inline-number){align-items:center;}
+.check-wrap:has(.inline-number)>input[type=checkbox]{margin-top:0;}
 .quick-filter-sep{width:1px;height:20px;background:var(--color-divider);}
 .quick-filter-label{font-size:var(--text-xs);color:var(--color-text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.03em;}
 .quick-filter-actions{display:flex;gap:var(--space-2);margin-left:auto;}
@@ -392,6 +423,20 @@ table.bulk-table{min-width:520px;}
   .bulk-table tbody td:first-child{grid-column:1/-1;min-width:0;}
   .bulk-table tbody td[data-label]::before{content:attr(data-label);display:block;font-size:10px;color:var(--color-text-muted);margin-bottom:2px;}
   .bulk-table tbody tr:hover td{background:none;}
+}
+
+/* таблица замеров на телефоне — карточки: дата и удаление, ниже три показателя с подписями */
+@media (max-width:560px){
+  table.entries-table{width:100%;}
+  .entries-table colgroup,.entries-table thead{display:none;}
+  .entries-table tbody tr{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--space-1) var(--space-2);padding:var(--space-2) 0;border-bottom:1px solid var(--color-divider);}
+  .entries-table tbody tr:last-child{border-bottom:none;}
+  .entries-table tbody td{border:none;padding:0 var(--space-2);min-width:0;}
+  .entries-table tbody td:first-child{grid-column:1/3;}
+  .entries-table tbody td.row-actions{grid-column:3;grid-row:1;align-self:end;width:auto;}
+  .entries-table tbody td input{width:100%;}
+  .entries-table tbody td[data-label]::before{content:attr(data-label);display:block;font-size:10px;color:var(--color-text-muted);margin-bottom:2px;}
+  .entries-table tbody tr:hover td{background:none;}
 }
 
 /* ── Print ────────────────────────────────────────────────────── */
@@ -464,10 +509,11 @@ table.jira-map-table{min-width:560px;}
 .bulk-row-note{font-size:11px;color:var(--color-text-muted);margin-top:2px;}
 .bulk-row-note.warn{color:var(--color-warning);}
 .bulk-intro{color:var(--color-text);}
+.bulk-note+.bulk-note{margin-top:var(--space-2);}
 
 /* Задачи Jira: состав эпиков и список задач */
 .badge-info{background:oklch(from var(--color-blue) l c h / 0.14);color:var(--color-blue);}
-.comp-col{min-width:180px;width:28%;}
+.comp-col{min-width:110px;width:16%;}
 .comp-bar{display:flex;height:12px;border-radius:var(--radius-full);overflow:hidden;background:var(--color-surface-offset);gap:2px;}
 .comp-bar.empty{opacity:.6;}
 .comp-seg{display:block;min-width:4px;}
@@ -512,9 +558,11 @@ table.jira-map-table{min-width:560px;}
 .history-message.error{color:var(--color-error);}
 @media (max-width:640px){.history-form{grid-template-columns:1fr;}}
 /* Сводки с шансом успеть: заголовки переносятся, чтобы таблица помещалась без прокрутки */
-#summaryTable th,#stageSummaryTable th,#jiraCompTable th,#stageJiraTable th{white-space:normal;vertical-align:bottom;}
-#summaryTable td,#stageSummaryTable td{padding-left:var(--space-2);padding-right:var(--space-2);}
-#summaryTable td:nth-child(2){min-width:9rem;}
+#summaryTable th,#stageSummaryTable th,#jiraCompTable th,#stageJiraTable th,#auditLogTable th{white-space:normal;vertical-align:bottom;}
+/* широкие сводные таблицы помещаются в 1280 px без прокрутки */
+#summaryTable th,#summaryTable td,#stageSummaryTable th,#stageSummaryTable td,#jiraCompTable th,#jiraCompTable td,#stageJiraTable th,#stageJiraTable td,#auditLogTable th,#auditLogTable td{padding-left:6px;padding-right:6px;}
+#summaryTable td,#stageSummaryTable td,#jiraCompTable td,#stageJiraTable td{font-size:0.8125rem;}
+#summaryTable tbody tr:not(.total-row) td:nth-child(2){min-width:8rem;}
 .chart-note{margin:0 0 var(--space-2);font-size:var(--text-sm);color:var(--color-text-muted);}
 .chart-note b{color:var(--color-text);}
 #jiraCompTable tr.total-row td,#stageJiraTable tr.total-row td{font-weight:600;}
@@ -534,3 +582,17 @@ table.jira-map-table{min-width:560px;}
 .telegram-steps{margin:0 0 var(--space-3);padding-left:1.4em;display:flex;flex-direction:column;gap:var(--space-2);word-break:break-all;}
 #view-notify .panel-head .switch{flex-shrink:0;}
 @media (max-width:720px){.notify-grid{grid-template-columns:1fr;}}
+/* реестр: длинные значения (адреса, расписания) переносятся в любом месте, таблица не шире экрана */
+#auditLogTable td.muted-cell,#auditLogTable td.strong-cell{overflow-wrap:anywhere;min-width:6rem;max-width:18rem;}
+/* кнопки среза: отступ между кнопками; на узких экранах переносятся, а не уходят за край */
+#jiraButtonsTable td.row-actions .btn+.btn{margin-left:var(--space-1);}
+@media (max-width:1366px){
+  #jiraButtonsTable td.row-actions{white-space:normal;min-width:7.5rem;}
+  #jiraButtonsTable td.row-actions>*{margin:2px 0 2px var(--space-1);}
+}
+/* пустой график — пояснение вместо пустых осей */
+.chart-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:var(--space-4);color:var(--color-text-muted);font-size:var(--text-sm);border:1px dashed var(--color-border);border-radius:var(--radius-md);}
+/* поле выбора файла скрыто визуально, но доступно с клавиатуры: фокус виден на кнопке-подписи */
+.visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0;}
+.file-btn{position:relative;}
+.file-btn:focus-within{outline:2px solid var(--color-primary);outline-offset:2px;}

@@ -80,7 +80,7 @@
         </div>
       </div>
       <div class="topbar-actions">
-        <button type="button" class="btn btn-ghost btn-sm" id="btnPrint" style="display:none;" title="Печать раздела с графиками (в т.ч. сохранение в PDF через диалог печати)">🖶 Печать</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="btnPrint" style="display:none;" aria-label="Печать" title="Печать раздела с графиками (в т.ч. сохранение в PDF через диалог печати)">🖶<span class="btn-label"> Печать</span></button>
         <button type="button" class="btn btn-ghost btn-sm" id="btnPdf" style="display:none;" title="Выгрузить таблицы раздела в PDF с учётом фильтров">⬇ PDF</button>
         <button type="button" class="theme-toggle" id="themeToggle" aria-label="Переключить тему"></button>
       </div>
@@ -276,7 +276,7 @@
         <div class="panel-head">
           <div>
             <div class="panel-title">Внесение данных по датам</div>
-            <div class="section-note">Остаток, затраченное время и оценка на каждую дату замера. Изменения сохраняются автоматически.</div>
+            <div class="section-note">Остаток, затраченное время и оценка на каждую дату замера.<span class="edit-only"> Изменения сохраняются автоматически.</span></div>
           </div>
           <div class="panel-controls">
             <label class="small" for="dataServiceSelect">Эпик</label>
@@ -299,7 +299,7 @@
         <div class="panel-head">
           <div>
             <div class="panel-title">Эпики (блоки задач) проекта</div>
-            <div class="section-note">Этапы, целевые даты и признак сдачи. Порядок меняется перетаскиванием за ⠿.</div>
+            <div class="section-note">Этапы, целевые даты и признак сдачи.<span class="edit-only"> Порядок меняется перетаскиванием за ⠿.</span></div>
           </div>
           <button type="button" class="btn btn-primary btn-sm" id="btnAddService">+ Добавить эпик</button>
         </div>
@@ -353,7 +353,7 @@
             <div class="setting-item"><label class="small" for="jiraToken" id="jiraTokenLabel">Токен</label><input type="password" id="jiraToken" autocomplete="new-password"></div>
           </div>
           <p class="jira-hint" id="jiraHint"></p>
-          <label class="quick-filter-item"><input type="checkbox" id="jiraInsecure"> Не проверять TLS-сертификат сервера (для самоподписанных/корпоративных)</label>
+          <label class="quick-filter-item check-wrap"><input type="checkbox" id="jiraInsecure"> Не проверять TLS-сертификат сервера (для самоподписанных/корпоративных)</label>
           <div class="jira-status" id="jiraStatus" role="status"></div>
           <div class="form-actions">
             <button type="button" class="btn btn-danger btn-sm" id="jiraDisconnect" hidden>Отключить</button>
@@ -425,7 +425,7 @@
             <div class="setting-item"><label class="small" for="nfTime">Время</label><input type="time" id="nfTime"></div>
             <div class="setting-item"><label class="small" for="nfTz">Часовой пояс</label><select id="nfTz"></select></div>
           </div>
-          <label class="quick-filter-item"><input type="checkbox" id="nfPdf"> Прикладывать PDF дашборда</label>
+          <label class="quick-filter-item check-wrap"><input type="checkbox" id="nfPdf"> Прикладывать PDF дашборда</label>
           <dl class="autofill-status" id="nfDigestStatus"></dl>
           <div class="form-actions">
             <button type="button" class="btn btn-ghost btn-sm" id="nfPreview">Предпросмотр</button>
@@ -441,11 +441,11 @@
             <label class="switch"><input type="checkbox" id="nfAlertsOn"> <span>Оповещения включены</span></label>
           </div>
           <div class="notify-alerts" id="nfAlertTypes">
-            <label class="quick-filter-item"><input type="checkbox" data-type="status"> Статус эпика или этапа ухудшился (Успеваем → Риск → Не успеваем)</label>
-            <label class="quick-filter-item"><input type="checkbox" data-type="chance"> Шанс успеть опустился ниже <input type="number" id="nfChance" min="1" max="99" class="inline-number" aria-label="Порог шанса, %"> %</label>
-            <label class="quick-filter-item"><input type="checkbox" data-type="scope"> Объём задач Jira эпика вырос больше чем на <input type="number" id="nfScope" min="1" max="1000" class="inline-number" aria-label="Порог роста объёма, %"> % за срез</label>
-            <label class="quick-filter-item"><input type="checkbox" data-type="problems"> Стало больше задач Jira с неполными данными</label>
-            <label class="quick-filter-item"><input type="checkbox" data-type="autofill"> Автозаполнение не выполнено (ошибка Jira)</label>
+            <label class="quick-filter-item check-wrap"><input type="checkbox" data-type="status"> Статус эпика или этапа ухудшился (Успеваем → Риск → Не успеваем)</label>
+            <label class="quick-filter-item check-wrap"><input type="checkbox" data-type="chance"> Шанс успеть опустился ниже <input type="number" id="nfChance" min="1" max="99" class="inline-number" aria-label="Порог шанса, %"> %</label>
+            <label class="quick-filter-item check-wrap"><input type="checkbox" data-type="scope"> Объём задач Jira эпика вырос больше чем на <input type="number" id="nfScope" min="1" max="1000" class="inline-number" aria-label="Порог роста объёма, %"> % за срез</label>
+            <label class="quick-filter-item check-wrap"><input type="checkbox" data-type="problems"> Стало больше задач Jira с неполными данными</label>
+            <label class="quick-filter-item check-wrap"><input type="checkbox" data-type="autofill"> Автозаполнение не выполнено (ошибка Jira)</label>
           </div>
         </div>
         <div class="form-actions notify-save">
@@ -539,19 +539,19 @@
           <form class="user-form" id="addUserForm">
             <div class="profile-photo-upload">
               <div class="profile-photo-preview" id="newUserPhotoPreview">?</div>
-              <label class="btn btn-ghost btn-sm">Загрузить фото<input type="file" accept="image/*" id="newUserPhotoFile" hidden></label>
+              <label class="btn btn-ghost btn-sm file-btn">Загрузить фото<input type="file" accept="image/*" id="newUserPhotoFile" class="visually-hidden"></label>
             </div>
             <div class="user-form-row">
-              <div class="setting-item"><label class="small">Логин</label><input type="text" id="newUsername" required></div>
-              <div class="setting-item"><label class="small">Пароль</label><input type="password" id="newPassword" required autocomplete="new-password"></div>
+              <div class="setting-item"><label class="small" for="newUsername">Логин</label><input type="text" id="newUsername" required></div>
+              <div class="setting-item"><label class="small" for="newPassword">Пароль</label><input type="password" id="newPassword" required autocomplete="new-password"></div>
             </div>
             <div class="user-form-row">
-              <div class="setting-item"><label class="small">Отображаемое имя</label><input type="text" id="newDisplayName"></div>
-              <div class="setting-item"><label class="small">Email</label><input type="email" id="newEmail"></div>
+              <div class="setting-item"><label class="small" for="newDisplayName">Отображаемое имя</label><input type="text" id="newDisplayName"></div>
+              <div class="setting-item"><label class="small" for="newEmail">Email</label><input type="email" id="newEmail"></div>
             </div>
             <div class="user-form-row">
-              <div class="setting-item"><label class="small">Должность</label><input type="text" id="newPosition"></div>
-              <div class="setting-item"><label class="small">Роль</label>
+              <div class="setting-item"><label class="small" for="newPosition">Должность</label><input type="text" id="newPosition"></div>
+              <div class="setting-item"><label class="small" for="newRole">Роль</label>
                 <select id="newRole"><option value="user">Пользователь</option><option value="manager">Руководитель проекта</option><option value="admin">Администратор</option></select>
               </div>
             </div>

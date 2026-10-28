@@ -133,7 +133,7 @@ def test_all_views_render_without_errors(admin_ui, theme):
 def test_mobile_has_no_horizontal_scroll(browser, live_server):
     ctx = browser.new_context(viewport={'width': 390, 'height': 844})
     app = App(ctx.new_page(), live_server).login(*ADMIN)
-    for view in VIEWS:
+    for view in VIEWS + ['jira', 'autofill', 'notify', 'notifyAdmin']:  # длинные подписи флажков переносятся
         app.page.click('#sidebarToggle')
         app.go(view)
         overflow = app.page.evaluate('document.documentElement.scrollWidth - document.documentElement.clientWidth')
@@ -157,6 +157,74 @@ def test_modal_closes_by_escape_and_cancel(admin_ui):
     page.click('#confirmOk')
     admin_ui.expect_toast('Введите название проекта')
     assert page.is_visible('#confirmModal.show')
+
+
+def test_modal_keyboard_focus_and_enter(admin_ui):
+    """Окно: страница под ним недоступна, Tab не уходит из окна, Enter в поле — «Создать», фокус возвращается."""
+    page = admin_ui.page
+    admin_ui.go('projects')
+    assert not page.evaluate("getComputedStyle(document.getElementById('confirmModal')).visibility === 'visible'")
+    page.focus('#btnAddProject')
+    page.keyboard.press('Enter')
+    page.wait_for_selector('#confirmModal.show')
+    assert page.evaluate("document.getElementById('appRoot').inert")
+    for _ in range(6):
+        page.keyboard.press('Tab')
+        assert page.evaluate("document.getElementById('confirmModal').contains(document.activeElement)")
+    page.fill('#projectName', 'Проект по Enter')
+    page.press('#projectName', 'Enter')
+    page.wait_for_selector('#confirmModal:not(.show)', state='attached')
+    page.wait_for_selector('#projectsMgmtTable:has-text("Проект по Enter")')
+    assert not page.evaluate("document.getElementById('appRoot').inert")
+    assert page.evaluate('document.activeElement.id') == 'btnAddProject'
+
+
+def test_delete_confirmation_focuses_cancel(admin_ui):
+    page = admin_ui.page
+    admin_ui.go('data')
+    page.click('#entriesTable [data-action="delete"] >> nth=0')
+    page.wait_for_selector('#confirmModal.show')
+    assert page.evaluate('document.activeElement.id') == 'confirmCancel'
+    page.keyboard.press('Enter')  # Enter на «Отмена» не удаляет
+    page.wait_for_selector('#confirmModal:not(.show)', state='attached')
+    assert page.locator('#entriesTable tbody tr').count() == 4
+
+
+def test_mobile_menu_keyboard(browser, live_server):
+    ctx = browser.new_context(viewport={'width': 390, 'height': 844})
+    app = App(ctx.new_page(), live_server).login(*ADMIN)
+    page = app.page
+    assert page.evaluate("document.querySelector('.sidebar').inert")  # закрытое меню не в обходе Tab
+    page.click('#sidebarToggle')
+    assert not page.evaluate("document.querySelector('.sidebar').inert")
+    assert page.evaluate("document.activeElement.classList.contains('nav-item')")
+    page.keyboard.press('Escape')
+    assert page.evaluate("document.querySelector('.sidebar').inert")
+    assert page.evaluate('document.activeElement.id') == 'sidebarToggle'
+    assert app.errors == []
+    ctx.close()
+
+
+def test_default_password_warning(admin_ui):
+    page = admin_ui.page
+    assert page.is_visible('#defaultPwWarning')
+    page.click('#defaultPwWarning')
+    page.wait_for_selector('#confirmModal.show')
+    assert page.evaluate('document.activeElement.id') == 'profilePassword'
+    page.fill('#profilePassword', 'Strong-pass-2026')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Профиль обновлён')
+    assert not page.is_visible('#defaultPwWarning')
+
+
+def test_empty_charts_explain_why(admin_ui):
+    page = admin_ui.page
+    page.click('text=Снять все')
+    page.wait_for_selector('#chartRemaining[hidden]', state='attached')
+    assert 'Не выбран ни один эпик' in admin_ui.text('#chartRemaining + .chart-empty')
+    page.click('text=Все')
+    page.wait_for_selector('#chartRemaining:not([hidden])', state='attached')
+    assert page.locator('.chart-wrap .chart-empty').count() == 0
 
 
 # ─── Дашборд ─────────────────────────────────────────────────────
@@ -323,9 +391,11 @@ def test_viewer_readonly_mode(ui, make_user):
     assert not page.is_visible('#btnAddRow')
     assert page.is_enabled('#dataServiceSelect')
     assert page.get_attribute('#entriesTable input[data-field="remaining"] >> nth=0', 'readonly') is not None
+    assert not page.is_visible('#view-data .edit-only')  # «Изменения сохраняются автоматически» — не для просмотра
     ui.go('services')
     assert not page.is_visible('#btnAddService')
     assert page.is_disabled('#servicesTable input[type=checkbox] >> nth=0')
+    assert not page.is_visible('#view-services .edit-only')
 
 
 def test_readonly_is_lifted_after_switching_project(ui, make_user, admin):
