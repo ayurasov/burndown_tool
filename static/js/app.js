@@ -370,6 +370,86 @@ function aggregateStageSeries(stageName, stageGroups){
   return {dates:dates, remaining:series.remaining, spent:series.spent, estimate:series.estimate};
 }
 
+/* ── Прогноз диапазоном (Монте-Карло) ─────────────────────────────
+   Берём интервалы между замерами (скорость сгорания и длина интервала) и много раз «проигрываем» будущее,
+   выбирая интервалы случайно с весом по длине. Получаем распределение даты обнуления остатка:
+   P15/P50/P85 и вероятность успеть к цели. Генератор детерминирован — цифры не «прыгают» между перерисовками. */
+var MC_RUNS = 2000, MC_HORIZON_DAYS = 3 * 365;
+var mcCache = {};
+function seededRandom(seed){
+  return function(){
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function hashString(str){
+  var h = 2166136261;
+  for(var i = 0; i < str.length; i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+function burnIntervals(pts){
+  var list = [];
+  for(var i = 1; i < pts.length; i++){
+    var len = daysBetween(pts[i-1].d, pts[i].d);
+    if(len > 0) list.push({end: pts[i].d, len: len, rate: (pts[i-1].y - pts[i].y) / len});
+  }
+  if(STATE.settings && STATE.settings.burnrateMethod === 'rolling' && list.length){
+    var cutoff = addDays(pts[pts.length-1].d, -(STATE.settings.burnrateWindowDays || 14));
+    var windowed = list.filter(function(it){ return it.end > cutoff; });
+    list = windowed.length >= 2 ? windowed : list.slice(-2);
+  }
+  return list;
+}
+function monteCarloForecast(dates, remainingVals, targetDate){
+  var pts = dates.map(function(d, i){ return {d: d, y: remainingVals[i]}; }).filter(function(p){ return isNum(p.y); });
+  if(pts.length < 3) return null;
+  var intervals = burnIntervals(pts);
+  if(intervals.length < 2) return null;
+  var last = pts[pts.length-1];
+  var key = JSON.stringify([intervals, last, targetDate || '']);
+  if(mcCache[key]) return mcCache[key];
+  var res;
+  if(last.y <= 0){
+    res = {p15: last.d, p50: last.d, p85: last.d, probability: targetDate ? (last.d <= targetDate ? 1 : 0) : null, intervals: intervals.length};
+  } else {
+    var total = intervals.reduce(function(sum, it){ return sum + it.len; }, 0);
+    var rnd = seededRandom(hashString(key));
+    var days = [];
+    for(var r = 0; r < MC_RUNS; r++){
+      var rem = last.y, day = 0;
+      while(day < MC_HORIZON_DAYS){
+        var pick = rnd() * total, it = intervals[0];
+        for(var k = 0; k < intervals.length; k++){ pick -= intervals[k].len; if(pick <= 0){ it = intervals[k]; break; } }
+        if(it.rate > 0 && rem <= it.rate * it.len){ day += rem / it.rate; rem = 0; break; }
+        rem -= it.rate * it.len;
+        day += it.len;
+      }
+      days.push(rem <= 0 ? day : Infinity);
+    }
+    days.sort(function(a, b){ return a - b; });
+    var at = function(q){ var d = days[Math.floor(q * (days.length - 1))]; return isFinite(d) ? addDays(last.d, Math.ceil(d)) : null; };
+    var probability = null;
+    if(targetDate){
+      var limit = daysBetween(last.d, targetDate);
+      probability = days.filter(function(d){ return Math.ceil(d) <= limit; }).length / days.length;
+    }
+    res = {p15: at(0.15), p50: at(0.5), p85: at(0.85), probability: probability, intervals: intervals.length};
+  }
+  mcCache[key] = res;
+  return res;
+}
+function probabilityCell(mc){
+  if(!mc) return '<td class="num muted-cell" title="Нужно не меньше трёх замеров остатка">—</td>';
+  var range = 'Диапазон 70%: '+(mc.p15 ? fmtDate(mc.p15) : 'не сгорает')+' — '+(mc.p85 ? fmtDate(mc.p85) : 'не сгорает')+
+    '\nМедиана (P50): '+(mc.p50 ? fmtDate(mc.p50) : 'не сгорает')+'\nПо '+mc.intervals+' интервалам между замерами';
+  if(mc.probability === null) return '<td class="num muted-cell" title="'+escapeAttr('Нет цели. '+range)+'">—</td>';
+  var pct = Math.round(mc.probability * 100);
+  var cls = pct >= 80 ? 'prob-high' : (pct >= 50 ? 'prob-mid' : 'prob-low');
+  return '<td class="num nowrap"><span class="prob '+cls+'" title="'+escapeAttr(range)+'">'+pct+'%</span></td>';
+}
+
 /* Изменение оценки (объёма работ) от первого до последнего заполненного значения */
 function scopeChange(values){
   var filled = values.filter(isNum);
@@ -377,7 +457,7 @@ function scopeChange(values){
 }
 
 function computeStatus(dates, remainingVals, targetDate){
-  if(!dates.length) return {status:'unknown', forecastZeroDate:null, noBurn:false, burnRate:null, lastRemaining:null, reg:null, baseDate:null, lastDate:null};
+  if(!dates.length) return {status:'unknown', forecastZeroDate:null, noBurn:false, burnRate:null, lastRemaining:null, reg:null, baseDate:null, lastDate:null, mc:null};
   var baseDate = dates[0];
   var lastDate = dates[dates.length-1];
   var pts = dates.map(function(d,i){ return {x:daysBetween(baseDate, d), y:remainingVals[i]}; }).filter(function(p){ return p.y !== null && p.y !== undefined; });
@@ -413,7 +493,8 @@ function computeStatus(dates, remainingVals, targetDate){
   } else if(noBurn && targetX !== null){
     status = 'danger';
   }
-  return {status:status, forecastZeroDate:forecastZeroDate, noBurn:noBurn, burnRate:burnRate, lastRemaining:lastRemaining, reg:reg, baseDate:baseDate, lastDate:lastDate};
+  return {status:status, forecastZeroDate:forecastZeroDate, noBurn:noBurn, burnRate:burnRate, lastRemaining:lastRemaining, reg:reg, baseDate:baseDate, lastDate:lastDate,
+          mc: monteCarloForecast(dates, remainingVals, targetDate)};
 }
 
 function computeServiceStatus(serviceId){
@@ -488,6 +569,7 @@ function baseChartOptions(yTitle, extraTooltipCtx){
       legend:{display:false},
       tooltip:{
         filter: function(item){
+          if(item.dataset && item.dataset.isRange) return false;
           /* для линий целей эпиков — только одна точка, без верхних/нижних значений */
           if(item.dataset && item.dataset.isEpicTarget) return item.dataIndex === 0;
           return true;
@@ -542,9 +624,28 @@ function baseChartOptions(yTitle, extraTooltipCtx){
 function renderLegend(containerId, datasets){
   var el = document.getElementById(containerId);
   if(!el) return;
-  el.innerHTML = datasets.map(function(d){
-    return '<span><span class="legend-dot" style="background:'+d.borderColor+'"></span>'+escapeHtml(d.label)+'</span>';
+  el.innerHTML = datasets.filter(function(d){ return !d.hideInLegend; }).map(function(d){
+    return '<span><span class="legend-dot'+(d.isRange ? ' legend-range' : '')+'" style="background:'+(d.isRange ? d.backgroundColor : d.borderColor)+'"></span>'+escapeHtml(d.label)+'</span>';
   }).join('');
+}
+
+/* Диапазон прогноза 70% (P15–P85 Монте-Карло): две линии от последнего остатка к нулю с заливкой между ними */
+function rangeDatasets(stat){
+  var mc = stat.mc;
+  if(!mc || !mc.p15 || !mc.p85 || !isNum(stat.lastRemaining) || stat.lastRemaining <= 0) return [];
+  var color = getCss('--color-orange');
+  var rem = stat.lastRemaining, start = stat.lastDate;
+  /* обе границы — в одних и тех же точках по оси X, иначе заливка между ними рисуется с разрывом */
+  var span = Math.max(1, daysBetween(start, mc.p85));
+  var upperAtP15 = rem * (1 - daysBetween(start, mc.p15) / span);
+  return [
+    {label: 'Диапазон прогноза 70%: ' + fmtDate(mc.p15) + ' — ' + fmtDate(mc.p85),
+     data: [{x: start, y: rem}, {x: mc.p15, y: 0}, {x: mc.p85, y: 0}],
+     borderColor: color + '66', backgroundColor: color + '1f', borderWidth: 1, pointRadius: 0, tension: 0, isRange: true},
+    {label: '', data: [{x: start, y: rem}, {x: mc.p15, y: Math.max(0, upperAtP15)}, {x: mc.p85, y: 0}],
+     borderColor: color + '66', backgroundColor: color + '1f', borderWidth: 1, pointRadius: 0, tension: 0, fill: '-1',
+     isRange: true, hideInLegend: true}
+  ];
 }
 
 function avgLineDataset(dates, burnRate, lastRemaining, lastDate){
@@ -636,6 +737,7 @@ function renderEpicRemainingChart(){
     var tl = targetLineDataset(stat.lastDate, stat.lastRemaining, svc.targetDate, 'Целевая линия (эпик)');
     if(tl) datasets.push(tl);
     if(avgLine) avgPts = avgLine.data;
+    rangeDatasets(stat).forEach(function(d){ datasets.push(d); });
   }
 
   renderLegend('legendRemaining', datasets);
@@ -740,6 +842,7 @@ function renderSummaryTable(){
     '<th class="sortable num" data-sort="scope" title="Изменение первоначальной оценки с первого замера">Δ оценки</th>'+
     '<th class="sortable" data-sort="targetDate">Цель</th>'+
     '<th class="sortable" data-sort="forecastZero">Прогноз «0»</th>'+
+    '<th class="sortable num" data-sort="probability" title="Вероятность обнулить остаток к цели по моделированию Монте-Карло">Шанс успеть</th>'+
     '<th class="sortable" data-sort="status">Статус</th>'+
     '</tr></thead><tbody>';
   var totalRemaining = 0, totalBurnRate = 0, totalScope = 0, hasRemaining=false, hasBurn=false, hasScope=false;
@@ -748,16 +851,17 @@ function renderSummaryTable(){
     if(isNum(stat.lastRemaining)){ totalRemaining += stat.lastRemaining; hasRemaining = true; }
     if(isNum(stat.burnRate)){ totalBurnRate += stat.burnRate; hasBurn = true; }
     if(isNum(stat.scope)){ totalScope += stat.scope; hasScope = true; }
-    return {etap:s.etap, name:s.name, isDone:s.isDone, remaining:stat.lastRemaining, burnRate:stat.burnRate, scope:stat.scope, targetDate:s.targetDate||'', forecastZero:stat.forecastZeroDate||'', noBurn:stat.noBurn, status:stat.status};
+    return {etap:s.etap, name:s.name, isDone:s.isDone, remaining:stat.lastRemaining, burnRate:stat.burnRate, scope:stat.scope, targetDate:s.targetDate||'', forecastZero:stat.forecastZeroDate||'', noBurn:stat.noBurn, status:stat.status,
+            mc:stat.mc, probability:stat.mc ? stat.mc.probability : null};
   });
   if(!rows.length){
-    html += '<tr><td colspan="8" class="empty-cell">Нет эпиков для отображения — проверьте фильтр выше.</td></tr>';
+    html += '<tr><td colspan="9" class="empty-cell">Нет эпиков для отображения — проверьте фильтр выше.</td></tr>';
   }
   applyTableSort('summaryTable', rows).forEach(function(r){
-    html += '<tr'+(r.isDone?' class="done-row"':'')+'><td class="nowrap">'+escapeHtml(r.etap)+'</td><td>'+escapeHtml(r.name)+'</td><td class="num">'+hoursToStr(r.remaining)+'</td>'+rateCell(r.burnRate,' ч')+scopeCell(r.scope)+'<td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+forecastText(r)+'</td><td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
+    html += '<tr'+(r.isDone?' class="done-row"':'')+'><td class="nowrap">'+escapeHtml(r.etap)+'</td><td>'+escapeHtml(r.name)+'</td><td class="num">'+hoursToStr(r.remaining)+'</td>'+rateCell(r.burnRate,' ч')+scopeCell(r.scope)+'<td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+forecastText(r)+'</td>'+probabilityCell(r.mc)+'<td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
   });
   if(rows.length){
-    html += '<tr class="total-row"><td colspan="2">Итого</td><td class="num">'+(hasRemaining?hoursToStr(totalRemaining):'—')+'</td>'+rateCell(hasBurn?totalBurnRate:null,' ч')+scopeCell(hasScope?totalScope:null)+'<td colspan="3"></td></tr>';
+    html += '<tr class="total-row"><td colspan="2">Итого</td><td class="num">'+(hasRemaining?hoursToStr(totalRemaining):'—')+'</td>'+rateCell(hasBurn?totalBurnRate:null,' ч')+scopeCell(hasScope?totalScope:null)+'<td colspan="4"></td></tr>';
   }
   html += '</tbody>';
   table.innerHTML = html;
@@ -857,14 +961,15 @@ function renderStageSummaryTable(){
     '<th class="sortable num" data-sort="scope" title="Изменение суммарной оценки с первого замера">Δ оценки</th>'+
     '<th class="sortable" data-sort="targetDate">Цель</th>'+
     '<th class="sortable" data-sort="forecastZero">Прогноз «0»</th>'+
+    '<th class="sortable num" data-sort="probability" title="Вероятность обнулить остаток к цели по моделированию Монте-Карло">Шанс успеть</th>'+
     '<th class="sortable" data-sort="status">Статус</th>'+
     '</tr></thead><tbody>';
   var rows = stageNames.map(function(name){
     var stat = computeStageStatus(name, stageGroups);
-    return {name:name, count:stageGroups[name].length, remaining:stat.lastRemaining, burnRate:stat.burnRate, scope:stat.scope, targetDate:STATE.stageTargets[name]||'', forecastZero:stat.forecastZeroDate||'', noBurn:stat.noBurn, status:stat.status};
+    return {name:name, count:stageGroups[name].length, remaining:stat.lastRemaining, burnRate:stat.burnRate, scope:stat.scope, targetDate:STATE.stageTargets[name]||'', forecastZero:stat.forecastZeroDate||'', noBurn:stat.noBurn, status:stat.status, mc:stat.mc, probability:stat.mc ? stat.mc.probability : null};
   });
   applyTableSort('stageSummaryTable', rows).forEach(function(r){
-    html += '<tr><td>'+escapeHtml(r.name)+'</td><td class="num">'+r.count+'</td><td class="num">'+hoursToStr(r.remaining)+'</td>'+rateCell(r.burnRate,' ч')+scopeCell(r.scope)+'<td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+forecastText(r)+'</td><td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
+    html += '<tr><td>'+escapeHtml(r.name)+'</td><td class="num">'+r.count+'</td><td class="num">'+hoursToStr(r.remaining)+'</td>'+rateCell(r.burnRate,' ч')+scopeCell(r.scope)+'<td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+forecastText(r)+'</td>'+probabilityCell(r.mc)+'<td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
   });
   html += '</tbody>';
   table.innerHTML = html;
@@ -1979,11 +2084,14 @@ function renderJiraButtonsTable(){
   table.innerHTML = '<thead><tr><th>Кнопка</th><th>Структура</th><th>Эпики и задачи</th><th>Поля Jira</th><th></th></tr></thead><tbody>' +
     buttons.map(function(b){
       var auto = b.schedule && b.schedule.enabled ? '<div class="muted-cell">автозаполнение: ' + escapeHtml(scheduleSummary(b.schedule)) + '</div>' : '';
+      if(b.history) auto += '<div class="muted-cell">история: ' + escapeHtml(historyJobSummary(b.history)) + '</div>';
       return '<tr data-bid="'+b.id+'"><td><b>'+escapeHtml(b.name)+'</b>'+auto+'</td>'+
         '<td>'+(b.structureId ? escapeHtml(b.structureName || ('Структура ' + b.structureId)) + ' <span class="muted-cell">#'+b.structureId+'</span>' : '<span class="muted-cell">без структуры</span>')+'</td>'+
         '<td>'+b.mappings.map(function(m){ return '<div class="jira-map-line"><span>'+escapeHtml(serviceName(m.serviceId))+'</span> ← <span class="mono">'+escapeHtml(m.issueKeys)+'</span>'+(m.includeSubtree ? ' <span class="muted-cell">с вложенными</span>' : '')+'</div>'; }).join('')+'</td>'+
         '<td>'+fieldMapSummary(b.fieldMap)+'</td>'+
         '<td class="row-actions"><button type="button" class="btn btn-ghost btn-sm" data-action="snapshot"'+(connected ? '' : ' disabled title="Нет подключения к Jira"')+'>⇣ Срез</button>'+
+          '<button type="button" class="btn btn-ghost btn-sm" data-action="history"'+(!connected ? ' disabled title="Нет подключения к Jira"' :
+            (b.lastSuccessAt ? ' title="Восстановить замеры на прошлые даты по журналу изменений Jira"' : ' disabled title="Доступно после первого успешного среза"'))+'>↺ История</button>'+
           actionBtn('edit','Редактировать',ICON_EDIT)+actionBtn('delete','Удалить',ICON_DELETE)+'</td></tr>';
     }).join('') + '</tbody>';
   var buttonOf = function(el){ var bid = parseInt(el.closest('tr').dataset.bid, 10); return buttons.find(function(b){ return b.id === bid; }); };
@@ -1992,6 +2100,9 @@ function renderJiraButtonsTable(){
   });
   table.querySelectorAll('[data-action="edit"]').forEach(function(el){
     el.addEventListener('click', function(){ openJiraButtonEditor(buttonOf(el)); });
+  });
+  table.querySelectorAll('[data-action="history"]').forEach(function(el){
+    el.addEventListener('click', function(){ openHistoryRestore(buttonOf(el)); });
   });
   table.querySelectorAll('[data-action="delete"]').forEach(function(el){
     el.addEventListener('click', function(){
@@ -2158,6 +2269,7 @@ function openJiraButtonEditor(button){
 ════════════════════════════════════════════════════════════════ */
 var CATEGORY_LABELS = {done: 'Готово', indeterminate: 'В работе', 'new': 'Не начато'};
 var CATEGORY_ORDER = ['done', 'indeterminate', 'new'];
+var CATEGORY_BADGE = {done: 'badge-ok', indeterminate: 'badge-info', 'new': 'badge-muted'};
 
 function loadJiraComposition(){
   STATE.jiraComp = null;
@@ -2198,7 +2310,7 @@ function renderJiraComposition(){
   var labels = STATE.jiraComp.problemLabels || {};
   var table = document.getElementById('jiraCompTable');
   table.innerHTML = '<thead><tr><th>Эпик</th><th class="comp-col">Состав задач</th><th class="num">Выполнено объёма</th>'+
-    '<th class="num">Задач готово</th><th class="num">Объём, ч</th><th>Данные</th><th>Срез</th></tr></thead><tbody>' +
+    '<th class="num">Задач готово</th><th class="num">Объём, ч</th><th class="num" title="Изменение объёма с прошлого среза">Δ объёма</th><th>Данные</th><th>Срез</th></tr></thead><tbody>' +
     rows.map(function(s){
       var l = compositionOf(s.id);
       var pct = l.scope > 0 ? Math.round(l.done / l.scope * 100) : null;
@@ -2209,14 +2321,32 @@ function renderJiraComposition(){
         '<td class="num">'+(pct === null ? '—' : pct + '%')+'</td>'+
         '<td class="num">'+l.doneCount+' / '+l.total+'</td>'+
         '<td class="num">'+hoursToStr(l.scope)+'</td>'+
+        '<td class="num nowrap">'+scopeDeltaCell(s.id)+'</td>'+
         '<td class="nowrap">'+(probs ? '<span class="badge badge-risk" title="'+escapeAttr(probTitle)+'">⚠ '+probs+'</span>' : '<span class="badge badge-ok">✓ в порядке</span>')+'</td>'+
         '<td class="mono nowrap">'+fmtDate(l.date)+'</td></tr>';
     }).join('') + '</tbody>';
+  table.querySelectorAll('[data-changes]').forEach(function(btn){
+    btn.addEventListener('click', function(e){
+      e.stopPropagation();
+      openJiraChanges(parseInt(btn.dataset.changes, 10));
+    });
+  });
   table.querySelectorAll('tr[data-sid]').forEach(function(tr){
     var open = function(){ openJiraIssues(parseInt(tr.dataset.sid, 10)); };
     tr.addEventListener('click', open);
     tr.addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); open(); } });
   });
+}
+
+/* Изменение объёма эпика с предыдущего среза — ссылка на разбор «что изменилось» */
+function scopeDeltaCell(sid){
+  var hist = STATE.jiraComp && STATE.jiraComp.history ? STATE.jiraComp.history[sid] : null;
+  if(!hist || hist.length < 2) return '<span class="muted-cell">—</span>';
+  var prev = hist[hist.length - 2], last = hist[hist.length - 1];
+  var d = Math.round((last.scope - prev.scope) * 100) / 100;
+  var cls = d > 0 ? 'delta-up' : (d < 0 ? 'delta-down' : 'muted-cell');
+  return '<button type="button" class="link-btn '+cls+'" data-changes="'+sid+'" title="Что изменилось с '+fmtDate(prev.date)+'">'+
+    (d > 0 ? '+' : '')+fmtNum(d)+' ч</button>';
 }
 
 function renderBurnupChart(){
@@ -2246,6 +2376,104 @@ function renderBurnupChart(){
 document.getElementById('jiraBurnupIssues').addEventListener('click', function(){
   openJiraIssues(parseInt(document.getElementById('chartServiceSelect').value, 10));
 });
+document.getElementById('jiraBurnupChanges').addEventListener('click', function(){
+  openJiraChanges(parseInt(document.getElementById('chartServiceSelect').value, 10));
+});
+
+function jiraIssueLink(baseUrl, key){
+  if(!baseUrl) return '<span class="mono">'+escapeHtml(key)+'</span>';
+  return '<a class="mono" href="'+escapeAttr(baseUrl + '/browse/' + encodeURIComponent(key))+'" target="_blank" rel="noopener">'+escapeHtml(key)+'</a>';
+}
+function signedHours(v){ return (v > 0 ? '+' : '') + fmtNum(v) + ' ч'; }
+
+/* Что изменилось в задачах эпика между двумя срезами: каскад объёма и списки задач */
+var CHANGE_GROUPS = [
+  ['added', 'Новые задачи', 'Добавлены в эпик за период'],
+  ['removed', 'Убраны из эпика', 'Были в эпике, в последнем срезе их нет'],
+  ['reestimated', 'Переоценка', 'Изменился объём задач, которые были и остались'],
+  ['closed', 'Закрыты за период', 'Перешли в «Готово»'],
+  ['reopened', 'Переоткрыты', 'Были в «Готово», вернулись в работу']
+];
+
+function openJiraChanges(sid, from, to){
+  var svc = serviceById(sid);
+  if(!svc) return;
+  var q = [];
+  if(from) q.push('from=' + from);
+  if(to) q.push('to=' + to);
+  api('/api/services/'+sid+'/jira/changes' + (q.length ? '?' + q.join('&') : '')).then(function(c){
+    destroyChart('scopeChanges');
+    var title = 'Что изменилось: ' + svc.name;
+    if(!c.from){
+      openModal({title: title, okLabel: 'Закрыть', noCancel: true,
+        html: '<p class="bulk-intro">Для сравнения нужны хотя бы два среза задач в разные дни. Срезов сейчас: '+c.dates.length+'.</p>'});
+      return;
+    }
+    var options = function(selected, limit){
+      return c.dates.filter(limit).map(function(d){
+        return '<option value="'+d+'"'+(d === selected ? ' selected' : '')+'>'+fmtDate(d)+'</option>';
+      }).join('');
+    };
+    var groupList = function(g){
+      var grp = c[g[0]];
+      if(!grp.count) return '';
+      return '<details class="change-group"'+(g[0] === 'added' || g[0] === 'reestimated' ? ' open' : '')+'><summary><b>'+g[1]+'</b> · '+grp.count+
+        (g[0] === 'closed' || g[0] === 'reopened' ? ' · ' + fmtNum(grp.volume) + ' ч' : ' · ' + signedHours(grp.volume))+
+        ' <span class="muted-cell">'+g[2]+'</span></summary><table class="data-table compact-table"><tbody>'+
+        grp.issues.map(function(i){
+          var value = i.delta !== undefined ? fmtNum(i.before) + ' → ' + fmtNum(i.volume) + ' ч (' + signedHours(i.delta) + ')' :
+            fmtNum(i.volume) + ' ч';
+          return '<tr><td class="nowrap">'+jiraIssueLink(c.baseUrl, i.key)+'</td><td>'+escapeHtml(i.summary)+'</td>'+
+            '<td class="nowrap"><span class="badge '+CATEGORY_BADGE[i.category]+'">'+escapeHtml(i.status || CATEGORY_LABELS[i.category])+'</span></td>'+
+            '<td class="num nowrap">'+value+'</td></tr>';
+        }).join('')+'</tbody></table></details>';
+    };
+    openModal({
+      title: title, size: 'xl', okLabel: 'Закрыть', noCancel: true,
+      html: '<div class="changes-period"><label class="small" for="chFrom">С</label><select id="chFrom">'+options(c.from, function(d){ return d < c.to; })+'</select>'+
+          '<label class="small" for="chTo">по</label><select id="chTo">'+options(c.to, function(d){ return d > c.from; })+'</select>'+
+          '<span class="muted-cell">даты срезов задач</span></div>'+
+        '<p class="bulk-intro">Объём эпика: <b>'+fmtNum(c.scopeFrom)+' ч</b> → <b>'+fmtNum(c.scopeTo)+' ч</b> ('+signedHours(Math.round((c.scopeTo - c.scopeFrom) * 100) / 100)+'). '+
+          'Выполнено: '+fmtNum(c.doneFrom)+' → '+fmtNum(c.doneTo)+' ч.</p>'+
+        '<div class="chart-wrap chart-wrap-sm"><canvas id="chartScopeChanges" aria-label="Каскад изменения объёма"></canvas></div>'+
+        '<div class="changes-lists">'+CHANGE_GROUPS.map(groupList).join('')+
+        (CHANGE_GROUPS.every(function(g){ return !c[g[0]].count; }) ? '<p class="muted-cell">Изменений в задачах нет.</p>' : '')+'</div>'
+    });
+    renderScopeWaterfall(c);
+    ['chFrom', 'chTo'].forEach(function(id){
+      document.getElementById(id).addEventListener('change', function(){
+        openJiraChanges(sid, document.getElementById('chFrom').value, document.getElementById('chTo').value);
+      });
+    });
+  }).catch(function(){});
+}
+
+/* Каскад: объём «до» → новые → убранные → переоценка → объём «после» */
+function renderScopeWaterfall(c){
+  var steps = [['Объём ' + fmtShortDate(c.from), 0, c.scopeFrom, 'base']];
+  var level = c.scopeFrom;
+  [['added', 'Новые'], ['removed', 'Убраны'], ['reestimated', 'Переоценка']].forEach(function(g){
+    var v = c[g[0]].volume;
+    steps.push([g[1], level, level + v, v > 0 ? 'up' : (v < 0 ? 'down' : 'base')]);
+    level += v;
+  });
+  steps.push(['Объём ' + fmtShortDate(c.to), 0, c.scopeTo, 'base']);
+  var colors = {base: getCss('--color-blue'), up: getCss('--color-orange'), down: getCss('--color-success')};
+  charts.scopeChanges = new Chart(document.getElementById('chartScopeChanges'), {
+    type: 'bar',
+    data: {labels: steps.map(function(st){ return st[0]; }),
+           datasets: [{data: steps.map(function(st){ return [Math.min(st[1], st[2]), Math.max(st[1], st[2])]; }),
+                       backgroundColor: steps.map(function(st){ return colors[st[3]]; }), borderRadius: 4, maxBarThickness: 64}]},
+    options: {responsive: true, maintainAspectRatio: false, plugins: {legend: {display: false},
+      tooltip: {callbacks: {label: function(ctx){
+        var st = steps[ctx.dataIndex];
+        return st[3] === 'base' && st[1] === 0 ? fmtNum(st[2]) + ' ч' : signedHours(Math.round((st[2] - st[1]) * 100) / 100);
+      }}}},
+      scales: {x: {grid: {display: false}, ticks: {color: getCss('--color-text-muted')}},
+               y: {beginAtZero: true, title: {display: true, text: 'Часы', color: getCss('--color-text-muted')},
+                   grid: {color: getCss('--color-divider')}, ticks: {color: getCss('--color-text-muted')}}}}
+  });
+}
 
 function openJiraIssues(sid){
   var svc = serviceById(sid);
@@ -2258,15 +2486,18 @@ function openJiraIssues(sid){
     issues.forEach(function(i){ if(!i.container) counts[i.category] = (counts[i.category] || 0) + 1; });
     var filters = [['all', 'Все', issues.length], ['problems', '⚠ С проблемами', problemTotal]].concat(
       CATEGORY_ORDER.map(function(c){ return [c, CATEGORY_LABELS[c], counts[c] || 0]; }));
-    var link = function(key){
-      if(!data.baseUrl) return '<span class="mono">'+escapeHtml(key)+'</span>';
-      return '<a class="mono" href="'+escapeAttr(data.baseUrl + '/browse/' + encodeURIComponent(key))+'" target="_blank" rel="noopener">'+escapeHtml(key)+'</a>';
+    var link = function(key){ return jiraIssueLink(data.baseUrl, key); };
+    var badgeClass = CATEGORY_BADGE;
+    var deltaHtml = function(i, m){
+      if(!data.prevDate || !i.prev || !isNum(i[m])) return '';
+      var d = Math.round(((i[m] || 0) - (i.prev[m] || 0)) * 100) / 100;
+      return d ? '<div class="cell-delta '+(d > 0 ? 'delta-up' : 'delta-down')+'">'+(d > 0 ? '+' : '')+fmtNum(d)+'</div>' : '';
     };
-    var badgeClass = {done: 'badge-ok', indeterminate: 'badge-info', 'new': 'badge-muted'};
     openModal({
       title: 'Задачи Jira: ' + svc.name, size: 'xl', okLabel: 'Закрыть', noCancel: true,
       html: '<p class="bulk-intro">Срез от '+fmtDate(data.date)+'. Задач: '+issues.filter(function(i){ return !i.container; }).length+
-          (problemTotal ? ', с неполными данными: <b>'+problemTotal+'</b>' : '')+'. Ключ задачи открывает её в Jira.</p>'+
+          (problemTotal ? ', с неполными данными: <b>'+problemTotal+'</b>' : '')+'. Ключ задачи открывает её в Jira.'+
+          (data.prevDate ? ' Под значениями — изменение с прошлого среза ('+fmtDate(data.prevDate)+'), «новая» — задачи, которых тогда не было.' : '')+'</p>'+
         '<div class="seg-filter" id="jiFilter" role="group" aria-label="Фильтр задач">'+filters.map(function(f, i){
           return '<button type="button" class="btn btn-ghost btn-sm'+(i === 0 ? ' active' : '')+'" data-filter="'+f[0]+'"'+(f[2] ? '' : ' disabled')+'>'+escapeHtml(f[1])+' <span class="muted-cell">'+f[2]+'</span></button>';
         }).join('')+'</div>'+
@@ -2275,11 +2506,12 @@ function openJiraIssues(sid){
         issues.map(function(i){
           return '<tr data-cat="'+i.category+'"'+(i.problems.length ? ' data-problem="1"' : '')+(i.container ? ' class="container-row"' : '')+'>'+
             '<td class="nowrap">'+link(i.key)+'</td>'+
-            '<td>'+escapeHtml(i.summary)+(i.container ? ' <span class="muted-cell">· содержит задачи</span>' : '')+'</td>'+
+            '<td>'+escapeHtml(i.summary)+(i.container ? ' <span class="muted-cell">· содержит задачи</span>' : '')+
+              (data.prevDate && !i.prev ? ' <span class="badge badge-new">новая</span>' : '')+'</td>'+
             '<td class="nowrap"><span class="badge '+badgeClass[i.category]+'">'+escapeHtml(i.status || CATEGORY_LABELS[i.category])+'</span></td>'+
-            '<td class="num">'+(isNum(i.remaining) ? fmtNum(i.remaining) : '—')+'</td>'+
-            '<td class="num">'+(isNum(i.spent) ? fmtNum(i.spent) : '—')+'</td>'+
-            '<td class="num">'+(isNum(i.estimate) ? fmtNum(i.estimate) : '—')+'</td>'+
+            '<td class="num">'+(isNum(i.remaining) ? fmtNum(i.remaining) : '—')+deltaHtml(i, 'remaining')+'</td>'+
+            '<td class="num">'+(isNum(i.spent) ? fmtNum(i.spent) : '—')+deltaHtml(i, 'spent')+'</td>'+
+            '<td class="num">'+(isNum(i.estimate) ? fmtNum(i.estimate) : '—')+deltaHtml(i, 'estimate')+'</td>'+
             '<td class="issue-problems">'+i.problems.map(function(p){ return '<div>⚠ '+escapeHtml(labels[p] || p)+'</div>'; }).join('')+'</td></tr>';
         }).join('')+'</tbody></table></div>',
       onOk: function(){ closeModal(); return false; }
@@ -2294,6 +2526,86 @@ function openJiraIssues(sid){
       });
     });
   }).catch(function(){});
+}
+
+
+/* ════════════════════════════════════════════════════════════════
+   Восстановление истории по журналу изменений Jira (фоновая задача на сервере)
+════════════════════════════════════════════════════════════════ */
+var HISTORY_STATUS = {running: 'выполняется', done: 'готово', error: 'ошибка', stale: 'прервано'};
+
+function historyJobSummary(job){
+  var p = job.params || {};
+  return fmtDate(p.from) + ' — ' + fmtDate(p.to) + ', ' + (HISTORY_STATUS[job.status] || job.status) +
+    (job.finishedAt ? ' ' + fmtDateTime(job.finishedAt) : '');
+}
+
+function openHistoryRestore(button){
+  var mapped = {};
+  button.mappings.forEach(function(m){ mapped[m.serviceId] = true; });
+  var firstEntry = STATE.entries.filter(function(e){ return mapped[e.service_id]; })
+    .map(function(e){ return e.date; }).sort()[0];
+  var yesterday = addDays(todayIso(), -1);
+  var from = firstEntry && firstEntry < yesterday ? firstEntry : addDays(todayIso(), -56);
+  var browserTz = '';
+  try { browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch(e){}
+  var zones = TIMEZONES.slice();
+  if(browserTz && zones.indexOf(browserTz) === -1) zones.push(browserTz);
+  var tz = browserTz || 'Europe/Moscow';
+  openModal({
+    title: 'Восстановить историю: ' + button.name, okLabel: 'Восстановить', wide: true,
+    html: '<p class="bulk-intro">Burndown прочитает журнал изменений задач кнопки в Jira и посчитает остаток, затраченное время, оценку и состав задач на прошлые даты — так, как они выглядели в конце каждого дня.</p>'+
+      '<div class="form-grid history-form">'+
+        field('С', '<input type="date" id="hrFrom" value="'+from+'" max="'+yesterday+'">')+
+        field('По', '<input type="date" id="hrTo" value="'+yesterday+'" max="'+todayIso()+'">')+
+        field('Шаг', '<select id="hrStep"><option value="week">раз в неделю</option><option value="day">каждый день</option></select>')+
+        field('Часовой пояс', '<select id="hrTz">'+zones.map(function(z){ return '<option value="'+escapeAttr(z)+'"'+(z === tz ? ' selected' : '')+'>'+escapeHtml(z)+'</option>'; }).join('')+'</select>')+
+      '</div>'+
+      '<label class="quick-filter-item"><input type="checkbox" id="hrKeep" checked> Не изменять даты, где замер уже внесён</label>'+
+      '<ul class="bulk-note history-notes">'+
+        '<li>Берётся текущий состав задач кнопки: задачи учитываются с даты их создания; задачи, которые раньше были в структуре и потом убраны, не учитываются.</li>'+
+        '<li>Стандартные поля учёта времени и статусы восстанавливаются точно. Для пользовательских полей — если Jira пишет их изменения в журнал.</li>'+
+        '<li>Срезы состава, сделанные раньше на эти даты, не перезаписываются. Все изменения попадут в реестр.</li>'+
+      '</ul>',
+    onOk: function(){
+      var body = {from: document.getElementById('hrFrom').value, to: document.getElementById('hrTo').value,
+                  step: document.getElementById('hrStep').value, timezone: document.getElementById('hrTz').value,
+                  keepExisting: document.getElementById('hrKeep').checked};
+      if(!body.from || !body.to){ toast('Укажите период'); return false; }
+      confirmOk.disabled = true;
+      apiPost('/api/jira/buttons/'+button.id+'/history', body).then(function(job){
+        showHistoryProgress(button, job);
+      }).catch(function(){ confirmOk.disabled = false; });
+      return false;
+    }
+  });
+}
+
+function showHistoryProgress(button, job){
+  var render = function(j){
+    var pct = j.total ? Math.round(j.progress / j.total * 100) : 0;
+    var finished = j.status !== 'running';
+    confirmBody.innerHTML = '<div class="history-progress" id="hrProgress" data-status="'+j.status+'">'+
+      '<div class="progress-bar'+(finished ? '' : ' active')+'"><span style="width:'+(finished && j.status === 'done' ? 100 : pct)+'%"></span></div>'+
+      '<p class="history-message '+(j.status === 'done' ? 'ok' : (finished ? 'error' : ''))+'">'+escapeHtml(j.message || 'Подготовка…')+'</p>'+
+      (finished ? '' : '<p class="bulk-note">Можно закрыть окно — восстановление продолжится на сервере, результат появится в таблице кнопок.</p>')+'</div>';
+    confirmOk.textContent = 'Закрыть';
+    confirmOk.disabled = false;
+    confirmCancel.hidden = true;
+    modalOkHandler = null;
+    if(finished){
+      replaceJiraButton(Object.assign({}, jiraButtonById(button.id) || button, {history: j}));
+      if(j.status === 'done'){ loadProjectData(currentProjectId); toast('История восстановлена'); }
+    }
+    return finished;
+  };
+  if(render(job)) return;
+  var timer = setInterval(function(){
+    if(!document.getElementById('hrProgress')){ clearInterval(timer); loadJiraConfig(); return; }
+    api('/api/jira/history-jobs/'+job.id).then(function(j){
+      if(render(j)) clearInterval(timer);
+    }).catch(function(){ clearInterval(timer); });
+  }, 1000);
 }
 
 
@@ -2653,7 +2965,7 @@ var auditPageLabels = {
   services: 'Эпики', settings: 'Настройки', users: 'Пользователи',
   projects: 'Проекты', profile: 'Профиль', jira: 'Связь с Jira'
 };
-var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление', autofill: 'Автозаполнение' };
+var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление', autofill: 'Автозаполнение', restore: 'Восстановление истории' };
 var auditEntityLabels = { project: 'Проект', service: 'Эпик', entry: 'Замер', user: 'Пользователь', stage_target: 'Цель этапа', settings: 'Настройки',
   jira_connection: 'Подключение к Jira', jira_button: 'Кнопка среза', jira_schedule: 'Расписание автозаполнения' };
 var auditFieldLabels = {

@@ -469,10 +469,10 @@ def test_status_without_target_and_non_burning_epic(admin_ui, admin):
     admin_ui.page.reload()
     admin_ui.page.wait_for_selector('#summaryTable tbody tr')
     ksbo = admin_ui.cells('#summaryTable tbody tr:has-text("КСБО") td')
-    assert ksbo[-1] == 'Нет цели'
-    # остаток «Планирования закупок» растёт (55 → 86) — прогноз не достигает нуля
+    assert ksbo[-1] == 'Нет цели' and ksbo[-2] == '—'  # без цели нет и шанса успеть
+    # остаток «Планирования закупок» растёт (55 → 86) — прогноз не достигает нуля, шанса успеть нет
     plan = admin_ui.cells('#summaryTable tbody tr:has-text("Планирование закупок") td')
-    assert plan[-2] == 'не сгорает' and plan[-1] == '✗ Не успеваем'
+    assert plan[-3] == 'не сгорает' and plan[-2] == '0%' and plan[-1] == '✗ Не успеваем'
 
 
 def test_scope_change_and_negative_burn_highlight(admin_ui):
@@ -934,3 +934,84 @@ def test_jira_composition_visible_for_viewer(ui, make_user, admin, fake_jira):
     ui.page.click('#jiraCompTable tbody tr[data-sid="1"]')
     ui.page.wait_for_selector('#jiTable tbody tr')
     assert ui.page.locator('#jiTable tbody tr').count() == 2  # ABC-1 и подзадача ABC-6
+
+
+def test_forecast_probability_and_range(admin_ui):
+    page = admin_ui.page
+    # демо: у эпиков по 4 замера (3 интервала) и цели — у каждого есть шанс успеть и диапазон
+    cells = admin_ui.cells('#summaryTable tbody tr:not(.total-row) td:nth-child(8)')
+    assert cells and all(re.fullmatch(r'\d{1,3}%', c) for c in cells), cells
+    title = page.get_attribute('#summaryTable tbody tr:first-child .prob', 'title')
+    assert 'Диапазон 70%' in title and 'Медиана (P50)' in title and 'По 3 интервалам' in title
+    # детерминированно: после перерисовки те же значения
+    page.click('#summaryTable th[data-sort="name"]')
+    assert sorted(admin_ui.cells('#summaryTable tbody tr:not(.total-row) td:nth-child(8)')) == sorted(cells)
+    ranges = page.evaluate("Chart.getChart('chartRemaining').data.datasets.filter(d => d.isRange).length")
+    legend = admin_ui.text('#legendRemaining')
+    assert ranges in (0, 2) and (ranges == 0 or 'Диапазон прогноза 70%' in legend)
+    admin_ui.go('stages')
+    page.wait_for_selector('#stageSummaryTable tbody tr')
+    assert 'Шанс успеть' in admin_ui.text('#stageSummaryTable thead')
+    assert not admin_ui.errors
+
+
+def test_jira_changes_between_snapshots(admin_ui, fake_jira, admin):
+    import fake_jira as fj
+    page = admin_ui.page
+    admin.put('/api/projects/1/jira/connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
+    bid = admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'structureId': 7, 'mappings': [
+        {'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]}).get_json()['id']
+    admin.post(f'/api/jira/buttons/{bid}/snapshot', json={'date': '2026-11-02'})
+    old = dict(fj.ISSUES[103])
+    fj.ISSUES[103].update(category='done', timeoriginalestimate=3 * 3600)
+    try:
+        admin.post(f'/api/jira/buttons/{bid}/snapshot', json={'date': '2026-11-09'})
+    finally:
+        fj.ISSUES[103] = old
+    page.reload()
+    page.wait_for_selector('#jiraCompTable [data-changes="1"]')
+    assert admin_ui.text('#jiraCompTable [data-changes="1"]') == '+2 ч'
+    page.click('#jiraCompTable [data-changes="1"]')
+    page.wait_for_selector('#chartScopeChanges')
+    assert admin_ui.text('#confirmTitle').startswith('Что изменилось: ')
+    intro = admin_ui.text('#confirmBody .bulk-intro')
+    assert '16 ч' in intro and '18 ч' in intro
+    assert page.evaluate("Chart.getChart('chartScopeChanges').data.labels") == ['Объём 02.11', 'Новые', 'Убраны', 'Переоценка', 'Объём 09.11']
+    groups = admin_ui.text('#confirmBody .changes-lists')
+    assert 'Переоценка · 1 · +2 ч' in groups and 'Закрыты за период · 1' in groups and 'ABC-3' in groups
+    page.click('#confirmOk')
+    page.wait_for_selector('#confirmModal:not(.show)', state='attached')
+    # в списке задач — изменения с прошлого среза
+    page.click('#jiraCompTable tbody tr[data-sid="1"]')
+    page.wait_for_selector('#jiTable tbody tr')
+    assert 'изменение с прошлого среза (02.11.2026)' in admin_ui.text('#confirmBody .bulk-intro')
+    assert admin_ui.text('#jiTable tr:has-text("ABC-3") td:nth-child(6) .cell-delta') == '+2'
+    assert not admin_ui.errors
+
+
+def test_jira_history_restore_ui(admin_ui, fake_jira, admin):
+    page = admin_ui.page
+    admin.put('/api/projects/1/jira/connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
+    bid = admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'structureId': 7, 'mappings': [
+        {'serviceId': 3, 'issueKeys': 'ABC-1', 'includeSubtree': True}]}).get_json()['id']
+    page.reload()
+    admin_ui.go('jira')
+    page.wait_for_selector('#jiraButtonsTable [data-action="history"]')
+    assert page.is_disabled('#jiraButtonsTable [data-action="history"]')  # до первого среза
+    admin.post(f'/api/jira/buttons/{bid}/snapshot', json={'date': '2026-10-28'})
+    page.reload()
+    admin_ui.go('jira')
+    page.wait_for_selector('#jiraButtonsTable [data-action="history"]:not([disabled])')
+    page.click('#jiraButtonsTable [data-action="history"]')
+    page.fill('#hrFrom', '2026-10-19')
+    page.fill('#hrTo', '2026-10-26')
+    page.select_option('#hrTz', 'Europe/Moscow')
+    page.click('#confirmOk')
+    page.wait_for_selector('#hrProgress[data-status="done"]', timeout=20000)
+    assert 'Восстановлено замеров: 2 на 2 дат(ы)' in admin_ui.text('#hrProgress')
+    assert admin_ui.text('#confirmOk') == 'Закрыть'
+    page.click('#confirmOk')
+    entries = {e['date']: e for e in admin.get('/api/projects/1/data').get_json()['entries'] if e['service_id'] == 3}
+    assert entries['2026-10-19']['remaining'] == 14 and entries['2026-10-26']['remaining'] == 12.5
+    page.wait_for_function("document.querySelector('#jiraButtonsTable tbody tr').textContent.includes('история: 19.10.2026 — 26.10.2026, готово')")
+    assert not admin_ui.errors

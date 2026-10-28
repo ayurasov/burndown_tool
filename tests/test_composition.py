@@ -100,7 +100,7 @@ def test_issue_list_for_epic(admin, button):
     abc2 = data['issues'][1]
     assert abc2 == {'key': 'ABC-2', 'summary': 'Интеграция с ЕИС', 'status': 'Готово', 'category': 'done',
                     'remaining': 2.0, 'spent': 1.0, 'estimate': 3.0, 'container': False,
-                    'problems': ['done_with_remaining']}
+                    'problems': ['done_with_remaining'], 'prev': None}
     assert data['issues'][0]['container'] is True
     assert admin.get('/api/services/3/jira/issues').get_json()['issues'] == []
     assert admin.get('/api/services/999/jira/issues').status_code == 404
@@ -183,3 +183,51 @@ def test_dashboard_pdf_includes_jira_composition(admin, button):
     # без срезов раздела нет
     r = admin.get('/api/projects/2/pdf?page=dashboard')
     assert 'Задачи Jira' not in ''.join(p.extract_text() for p in PdfReader(io.BytesIO(r.data)).pages)
+
+
+
+# ─── Что изменилось между срезами ────────────────────────────────
+
+def test_scope_changes_decomposition():
+    from app import scope_changes
+    def i(key, est, cat='new', **kw):
+        return dict({'key': key, 'summary': key, 'status': '', 'category': cat, 'estimate': est,
+                     'remaining': None, 'spent': None}, **kw)
+    before = {'A-1': i('A-1', 10), 'A-2': i('A-2', 5, 'done'), 'A-3': i('A-3', 8), 'A-4': i('A-4', 3, 'done')}
+    after = {'A-1': i('A-1', 14, 'done'), 'A-2': i('A-2', 5, 'indeterminate'), 'A-3': i('A-3', 6),
+             'A-5': i('A-5', 20), 'A-6': i('A-6', None, spent=2, remaining=1)}
+    c = scope_changes(before, after)
+    assert (c['scopeFrom'], c['scopeTo']) == (26, 48)
+    assert (c['added']['count'], c['added']['volume']) == (2, 23)
+    assert (c['removed']['count'], c['removed']['volume']) == (1, -3)
+    assert (c['reestimated']['count'], c['reestimated']['volume']) == (2, 2)
+    assert c['reestimated']['issues'][0] == {'key': 'A-1', 'summary': 'A-1', 'status': '', 'category': 'done',
+                                             'volume': 14, 'before': 10, 'delta': 4}
+    assert c['scopeFrom'] + c['added']['volume'] + c['removed']['volume'] + c['reestimated']['volume'] == c['scopeTo']
+    assert [x['key'] for x in c['closed']['issues']] == ['A-1'] and [x['key'] for x in c['reopened']['issues']] == ['A-2']
+    assert (c['doneFrom'], c['doneTo']) == (8, 14)
+
+
+def test_changes_api(admin, button):
+    import fake_jira
+    snap(admin, button, '2026-11-02')
+    assert admin.get('/api/services/1/jira/changes').get_json() == {
+        'dates': ['2026-11-02'], 'from': None, 'to': '2026-11-02', 'baseUrl': admin.get(
+            '/api/projects/1/jira/composition').get_json()['baseUrl']}
+    old = dict(fake_jira.ISSUES[103])
+    fake_jira.ISSUES[103].update(category='done', timeoriginalestimate=3 * 3600)
+    try:
+        snap(admin, button, '2026-11-09')
+    finally:
+        fake_jira.ISSUES[103] = old
+    c = admin.get('/api/services/1/jira/changes').get_json()
+    assert (c['from'], c['to'], c['scopeFrom'], c['scopeTo']) == ('2026-11-02', '2026-11-09', 16, 18)
+    assert c['reestimated']['issues'][0]['key'] == 'ABC-3' and c['reestimated']['volume'] == 2
+    assert c['closed']['count'] == 1 and c['added']['count'] == 0
+    assert admin.get('/api/services/1/jira/changes?from=2026-11-09&to=2026-11-02').status_code == 400
+    assert admin.get('/api/services/1/jira/changes?from=2026-11-03&to=2026-11-09').status_code == 400
+    # в списке задач — значения прошлого среза для сравнения
+    issues = {i['key']: i for i in admin.get('/api/services/1/jira/issues').get_json()['issues']}
+    assert issues['ABC-3']['prev'] == {'remaining': 0.5, 'spent': None, 'estimate': 1.0, 'category': 'indeterminate'}
+    data = admin.get('/api/services/1/jira/issues?date=2026-11-02').get_json()
+    assert data['prevDate'] is None and all(i['prev'] is None for i in data['issues'])
