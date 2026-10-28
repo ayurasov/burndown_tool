@@ -25,6 +25,8 @@ from werkzeug.serving import make_server  # noqa: E402
 
 import app as app_module  # noqa: E402
 import fake_jira  # noqa: E402
+import notify  # noqa: E402
+from fake_notify import FakeSMTP, FakeTelegram  # noqa: E402
 import init_db  # noqa: E402
 
 H = 3600
@@ -129,6 +131,10 @@ def prepare(base, jira_url):
 def main():
     demo_jira()
     jira = fake_jira.FakeJira(token='demo-pat')
+    # почта и Telegram — учебные: письма складываются в память, бот отвечает локально
+    notify.smtplib.SMTP = notify.smtplib.SMTP_SSL = FakeSMTP
+    telegram = FakeTelegram(username='burndown_vector_bot')
+    app_module.app.config['TELEGRAM_API'] = telegram.url
     base = start_app()
     api = prepare(base, jira.url)
     jira_history(api, base, jira.url)
@@ -236,6 +242,44 @@ def main():
         pg.wait_for_timeout(400)
         shot(pg.locator('#stageBurnupPanel'), 'user/44-project-burnup.png')
 
+        # ── Рассылки (администратор) и уведомления по проекту
+        go('notifyAdmin', '#notifyLogTable thead')
+        pg.fill('#naHost', 'smtp.example.ru')
+        pg.fill('#naPort', '587')
+        pg.fill('#naSender', 'burndown@example.ru')
+        pg.fill('#naLogin', 'burndown')
+        pg.fill('#naPassword', 'demo')
+        pg.fill('#naToken', '123:ABC')
+        pg.fill('#naUrl', 'https://burndown.example.ru')
+        pg.click('#naSave')
+        pg.wait_for_function("document.getElementById('naBotStatus').textContent.includes('@')")
+        hide_toast()
+        go('notify', '#nfDays [data-day]')
+        pg.click('#nfTelegramLink')
+        pg.wait_for_selector('.telegram-steps a')
+        modal('user/47-telegram-link.png')
+        code = pg.get_attribute('.telegram-steps a', 'href').split('start=')[1]
+        telegram.user_starts(code, chat_id=1001)
+        pg.click('#confirmOk')
+        pg.wait_for_function("document.getElementById('nfTelegramState').textContent.includes('Привязан')")
+        pg.check('#nfViaTelegram')
+        pg.check('#nfDigestOn')
+        pg.check('#nfPdf')
+        pg.check('#nfAlertsOn')
+        pg.click('#nfSave')
+        pg.wait_for_timeout(500)
+        pg.click('#nfSendNow')
+        pg.wait_for_function("document.getElementById('nfDigestStatus').textContent.includes('отправлено')")
+        hide_toast()
+        shot(pg.locator('#view-notify'), 'user/45-notify.png')
+        pg.click('#nfPreview')
+        pg.wait_for_selector('#confirmModal.show iframe.digest-preview')
+        pg.wait_for_timeout(500)
+        shot(pg.locator('#confirmModal .modal'), 'user/46-digest-preview.png')
+        pg.keyboard.press('Escape')
+        go('notifyAdmin', '#notifyLogTable tbody tr')
+        pg.fill('#naTestTo', 'ivanov@example.ru')
+        shot(pg.locator('#view-notifyAdmin'), 'admin/10-notify-admin.png')
         # ── Данные по датам
         go('data', '#entriesTable tbody tr')
         shot(pg.locator('#view-data .panel'), 'user/14-data.png')
@@ -373,6 +417,7 @@ def main():
         pg.set_viewport_size({'width': 1440, 'height': 900})
         go('autofill', '.autofill-card')
         shot(pg.locator('#view-autofill .panel'), 'admin/09-autofill.png')
+
         ctx.close()
 
         # ── Режим просмотра (роль «Пользователь»)
@@ -396,6 +441,7 @@ def main():
         ctx.close()
         browser.close()
     jira.stop()
+    telegram.stop()
     optimize_png()
     print('Снимки:', sum(1 for _ in OUT.rglob('*.png')))
 

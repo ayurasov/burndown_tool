@@ -105,6 +105,92 @@ def create_jira_tables(conn):
         conn.execute('ALTER TABLE jira_snapshot_buttons ADD COLUMN last_success_at TEXT')
 
 
+def create_notify_tables(conn):
+    """Уведомления: настройки отправки, подписки пользователей на проекты, состояние для оповещений, очередь, журнал."""
+    conn.executescript('''
+        -- Настройки сервиса (SMTP, Telegram, адрес Burndown); секреты — в зашифрованном виде
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        -- Подписка пользователя на проект: каналы, дайджест по расписанию, оповещения
+        CREATE TABLE IF NOT EXISTS notification_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            project_id INTEGER NOT NULL,
+            via_email INTEGER DEFAULT 1,
+            via_telegram INTEGER DEFAULT 0,
+            digest_enabled INTEGER DEFAULT 0,
+            digest_days TEXT DEFAULT '1',
+            digest_time TEXT DEFAULT '09:00',
+            timezone TEXT DEFAULT 'Europe/Moscow',
+            digest_pdf INTEGER DEFAULT 0,
+            last_digest_date TEXT,
+            last_digest_at TEXT,
+            last_digest_status TEXT,
+            last_digest_message TEXT,
+            digest_snapshot TEXT,
+            alerts_enabled INTEGER DEFAULT 0,
+            alert_types TEXT DEFAULT 'autofill,status,chance,scope,problems',
+            chance_threshold INTEGER DEFAULT 50,
+            scope_threshold INTEGER DEFAULT 10,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            UNIQUE(user_id, project_id)
+        );
+        -- Последнее известное состояние эпиков и этапов — для оповещений об ухудшениях
+        CREATE TABLE IF NOT EXISTS notification_state (
+            project_id INTEGER NOT NULL,
+            entity TEXT NOT NULL,
+            name TEXT,
+            status TEXT,
+            probability REAL,
+            scope REAL,
+            problems INTEGER,
+            PRIMARY KEY (project_id, entity),
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS notification_marks (
+            project_id INTEGER PRIMARY KEY,
+            fingerprint TEXT,
+            checked_at TEXT,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        -- Очередь оповещений: доставляет фоновый планировщик
+        CREATE TABLE IF NOT EXISTS notification_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            project_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            subject TEXT,
+            body_text TEXT,
+            body_html TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        -- Журнал отправок (для администратора)
+        CREATE TABLE IF NOT EXISTS notification_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            project_id INTEGER,
+            project_name TEXT,
+            kind TEXT,
+            channel TEXT,
+            status TEXT,
+            message TEXT,
+            created_at TEXT
+        );
+    ''')
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(users)')}
+    if 'telegram_chat_id' not in cols:
+        conn.execute('ALTER TABLE users ADD COLUMN telegram_chat_id TEXT')
+    if 'telegram_link_code' not in cols:
+        conn.execute('ALTER TABLE users ADD COLUMN telegram_link_code TEXT')
+
+
 def create_indexes(conn):
     """Индексы для частых выборок; создаются идемпотентно и не меняют данные."""
     conn.execute('CREATE INDEX IF NOT EXISTS idx_entries_service_date ON entries(service_id, date)')
@@ -319,6 +405,7 @@ def init_db():
     ''')
 
     create_jira_tables(conn)
+    create_notify_tables(conn)
     create_indexes(conn)
 
     conn.commit()

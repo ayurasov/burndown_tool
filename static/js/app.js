@@ -408,7 +408,9 @@ function monteCarloForecast(dates, remainingVals, targetDate){
   var intervals = burnIntervals(pts);
   if(intervals.length < 2) return null;
   var last = pts[pts.length-1];
-  var key = JSON.stringify([intervals, last, targetDate || '']);
+  /* ключ — тот же, что у сервера (forecast.py mc_key): цифры в письмах совпадают с дашбордом */
+  var key = intervals.map(function(it){ return it.end + ':' + it.len + ':' + it.rate.toFixed(6); }).join(';') +
+    '|' + last.d + ':' + last.y.toFixed(6) + '|' + (targetDate || '');
   if(mcCache[key]) return mcCache[key];
   var res;
   if(last.y <= 0){
@@ -1644,7 +1646,7 @@ function updateRoleUI(){
   var admin = isGlobalAdmin();
   document.getElementById('readonlyBanner').style.display = (!canEdit() && currentProjectId) ? '' : 'none';
   document.getElementById('adminNav').style.display = admin ? '' : 'none';
-  ['navUsers','navProjects','navAudit','btnExport'].forEach(function(id){ document.getElementById(id).style.display = admin ? '' : 'none'; });
+  ['navUsers','navProjects','navAudit','navNotifyAdmin','btnExport'].forEach(function(id){ document.getElementById(id).style.display = admin ? '' : 'none'; });
   document.getElementById('navSettings').style.display = canEdit() ? '' : 'none';
   document.getElementById('navJira').style.display = canEdit() ? '' : 'none';
   document.getElementById('navAutofill').style.display = canEdit() ? '' : 'none';
@@ -1661,7 +1663,7 @@ function updateRoleUI(){
 var navItems = document.querySelectorAll('.nav-item');
 var pageTitle = document.getElementById('pageTitle');
 var pageSub = document.getElementById('pageSub');
-var ADMIN_VIEWS = ['users', 'projects', 'audit'];
+var ADMIN_VIEWS = ['users', 'projects', 'audit', 'notifyAdmin'];
 var PDF_VIEWS = ['dashboard', 'stages', 'data'];
 var titles = {
   dashboard: ['Дашборд сгорания', 'Свод по эпикам и этапам'],
@@ -1671,6 +1673,8 @@ var titles = {
   settings: ['Настройки проекта', 'Параметры прогноза и расчёта burn rate'],
   jira: ['Связь с Jira', 'Подключение и кнопки среза данных из Structure'],
   autofill: ['Автозаполнение', 'Срез из Jira по расписанию'],
+  notify: ['Уведомления', 'Дайджест и оповещения по проекту'],
+  notifyAdmin: ['Рассылки', 'Почта, Telegram-бот и журнал отправок'],
   users: ['Управление пользователями', 'Пользователи, роли и доступ к проектам'],
   projects: ['Управление проектами', 'Создание, редактирование и удаление проектов'],
   audit: ['Реестр изменений', 'Журнал всех изменений с фильтрами']
@@ -1695,7 +1699,8 @@ function navigate(view){
     pageSub.textContent = titles[view][1] + (ADMIN_VIEWS.indexOf(view) === -1 ? projectTitleSuffix() : '');
   }
   var renderers = {dashboard:renderDashboard, stages:renderStagesView, data:renderDataView, services:renderServicesView,
-    settings:renderSettingsView, jira:renderJiraView, autofill:renderAutofillView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); }};
+    settings:renderSettingsView, jira:renderJiraView, autofill:renderAutofillView, notify:renderNotifyView,
+    notifyAdmin:renderNotifyAdminView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); }};
   if(renderers[view] && (currentProjectId || ADMIN_VIEWS.indexOf(view) !== -1)) renderers[view]();
   var reportView = PDF_VIEWS.indexOf(view) !== -1 && currentProjectId;
   document.getElementById('btnPdf').style.display = reportView ? '' : 'none';
@@ -2846,6 +2851,215 @@ function showHistoryProgress(button, job){
 
 
 /* ════════════════════════════════════════════════════════════════
+   Уведомления: подписка пользователя на проект (дайджест и оповещения)
+════════════════════════════════════════════════════════════════ */
+var notifyState = null;
+var nfForm = document.getElementById('notifyForm');
+
+function renderNotifyView(){
+  var pid = currentProjectId;
+  api('/api/projects/'+pid+'/notifications').then(function(data){
+    if(pid !== currentProjectId) return;
+    notifyState = data;
+    fillNotifyForm(data);
+  }).catch(function(){});
+}
+
+function fillNotifyForm(d){
+  var ch = d.channels;
+  document.getElementById('nfViaEmail').checked = d.viaEmail;
+  document.getElementById('nfViaTelegram').checked = d.viaTelegram;
+  document.getElementById('nfEmailState').innerHTML = !ch.emailReady ?
+    '<span class="muted-cell">Администратор ещё не настроил отправку почты</span>' :
+    (ch.email ? escapeHtml(ch.email) : '<span class="prob-low">В профиле не указан email — обратитесь к администратору</span>');
+  document.getElementById('nfTelegramState').innerHTML = !ch.telegramReady ?
+    '<span class="muted-cell">Администратор ещё не подключил Telegram-бота</span>' :
+    (ch.telegramLinked ? '<span class="prob-high">✓ Привязан</span>' + (ch.botName ? ' <span class="muted-cell">бот @' + escapeHtml(ch.botName) + '</span>' : '') :
+      '<span class="muted-cell">Не привязан</span>');
+  document.getElementById('nfTelegramLink').hidden = !ch.telegramReady || ch.telegramLinked;
+  document.getElementById('nfTelegramUnlink').hidden = !ch.telegramLinked;
+  var dg = d.digest;
+  document.getElementById('nfDigestOn').checked = dg.enabled;
+  document.getElementById('nfDays').innerHTML = WEEKDAYS.map(function(w){
+    return '<label><input type="checkbox" data-day="'+w[0]+'"'+(dg.days.indexOf(w[0]) !== -1 ? ' checked' : '')+'><span>'+w[1]+'</span></label>';
+  }).join('');
+  document.getElementById('nfTime').value = dg.time;
+  var browserTz = '';
+  try { browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch(e){}
+  var zones = TIMEZONES.slice();
+  [dg.timezone, browserTz].forEach(function(z){ if(z && zones.indexOf(z) === -1) zones.push(z); });
+  document.getElementById('nfTz').innerHTML = zones.map(function(z){
+    return '<option value="'+escapeAttr(z)+'"'+(z === dg.timezone ? ' selected' : '')+'>'+escapeHtml(z)+(z === browserTz ? ' — ваш' : '')+'</option>';
+  }).join('');
+  document.getElementById('nfPdf').checked = dg.pdf;
+  document.getElementById('nfDigestStatus').innerHTML =
+    '<dt>Последний дайджест</dt><dd>'+(dg.lastAt ? fmtDateTime(dg.lastAt) + ' — <span class="autofill-result '+(dg.lastStatus === 'ok' ? 'ok' : 'error')+'">'+escapeHtml(dg.lastMessage || '')+'</span>' : '—')+'</dd>'+
+    '<dt>Следующий</dt><dd>'+(dg.enabled && dg.nextAt ? fmtLocalIso(dg.nextAt) + ' <span class="muted-cell">('+escapeHtml(dg.timezone)+')</span>' : '<span class="muted-cell">дайджест выключен</span>')+'</dd>';
+  var al = d.alerts;
+  document.getElementById('nfAlertsOn').checked = al.enabled;
+  document.querySelectorAll('#nfAlertTypes [data-type]').forEach(function(cb){ cb.checked = al.types.indexOf(cb.dataset.type) !== -1; });
+  document.getElementById('nfChance').value = al.chanceThreshold;
+  document.getElementById('nfScope').value = al.scopeThreshold;
+}
+
+function notifyFormData(){
+  return {
+    viaEmail: document.getElementById('nfViaEmail').checked,
+    viaTelegram: document.getElementById('nfViaTelegram').checked,
+    digest: {enabled: document.getElementById('nfDigestOn').checked,
+             days: Array.prototype.map.call(document.querySelectorAll('#nfDays [data-day]:checked'), function(c){ return parseInt(c.dataset.day, 10); }),
+             time: document.getElementById('nfTime').value, timezone: document.getElementById('nfTz').value,
+             pdf: document.getElementById('nfPdf').checked},
+    alerts: {enabled: document.getElementById('nfAlertsOn').checked,
+             types: Array.prototype.map.call(document.querySelectorAll('#nfAlertTypes [data-type]:checked'), function(c){ return c.dataset.type; }),
+             chanceThreshold: parseInt(document.getElementById('nfChance').value, 10) || 50,
+             scopeThreshold: parseInt(document.getElementById('nfScope').value, 10) || 10}
+  };
+}
+
+nfForm.addEventListener('submit', function(e){
+  e.preventDefault();
+  apiPut('/api/projects/'+currentProjectId+'/notifications', notifyFormData()).then(function(data){
+    notifyState = data;
+    fillNotifyForm(data);
+    toast('Настройки уведомлений сохранены');
+  }).catch(function(){});
+});
+
+document.getElementById('nfPreview').addEventListener('click', function(){
+  api('/api/projects/'+currentProjectId+'/notifications/preview').then(function(data){
+    openModal({title: data.subject, size: 'xl', okLabel: 'Закрыть', noCancel: true,
+      html: '<iframe class="digest-preview" title="Предпросмотр дайджеста" sandbox></iframe>'});
+    confirmBody.querySelector('iframe').srcdoc = '<!doctype html><meta charset="utf-8"><body style="margin:16px;background:#fff">' + data.html;
+  }).catch(function(){});
+});
+
+document.getElementById('nfSendNow').addEventListener('click', function(){
+  var btn = this;
+  btn.disabled = true;
+  apiPost('/api/projects/'+currentProjectId+'/notifications/test').then(function(data){
+    toast('Дайджест отправлен: ' + data.results.map(function(r){ return r.channel === 'email' ? 'почта' : 'Telegram'; }).join(', '));
+  }).catch(function(){}).then(function(){ btn.disabled = false; renderNotifyView(); });
+});
+
+document.getElementById('nfTelegramLink').addEventListener('click', function(){
+  apiPost('/api/profile/telegram/link').then(function(link){
+    openModal({
+      title: 'Привязать Telegram', okLabel: 'Проверить',
+      html: '<ol class="telegram-steps">'+
+        '<li>Откройте бота <b>@'+escapeHtml(link.botName)+'</b> по ссылке: <a href="'+escapeAttr(link.url)+'" target="_blank" rel="noopener">'+escapeHtml(link.url)+'</a></li>'+
+        '<li>Нажмите в Telegram <b>Запустить</b> (Start).</li>'+
+        '<li>Вернитесь сюда и нажмите <b>Проверить</b>.</li></ol>'+
+        '<p class="bulk-note">Ссылка действует, пока вы не запросите новую. Бот пришлёт подтверждение.</p>',
+      onOk: function(){
+        apiPost('/api/profile/telegram/check').then(function(r){
+          if(!r.linked){ toast('Бот ещё не получил команду Start — откройте ссылку и нажмите «Запустить»'); return; }
+          closeModal();
+          toast('Telegram привязан');
+          renderNotifyView();
+        }).catch(function(){});
+        return false;
+      }
+    });
+  }).catch(function(){});
+});
+
+document.getElementById('nfTelegramUnlink').addEventListener('click', function(){
+  askConfirm('Отвязать Telegram?', 'Сообщения в Telegram перестанут приходить по всем проектам.', function(){
+    apiDelete('/api/profile/telegram').then(function(){ toast('Telegram отвязан'); renderNotifyView(); });
+  }, 'Отвязать');
+});
+
+/* ════════════════════════════════════════════════════════════════
+   Администрирование: рассылки (SMTP, Telegram-бот, журнал отправок)
+════════════════════════════════════════════════════════════════ */
+var NOTIFY_KINDS = {digest: 'Дайджест', alert: 'Оповещение', test: 'Проверка'};
+
+function renderNotifyAdminView(){
+  api('/api/admin/notify-settings').then(fillNotifyAdmin).catch(function(){});
+  loadNotifyLog();
+}
+
+function fillNotifyAdmin(d){
+  document.getElementById('naHost').value = d.smtp.host;
+  document.getElementById('naPort').value = d.smtp.port;
+  document.getElementById('naSecurity').value = d.smtp.security;
+  document.getElementById('naSender').value = d.smtp.sender;
+  document.getElementById('naLogin').value = d.smtp.login;
+  var pw = document.getElementById('naPassword');
+  pw.value = '';
+  pw.placeholder = d.smtp.hasPassword ? 'Сохранён — оставьте пустым, чтобы не менять' : 'если сервер требует входа';
+  var token = document.getElementById('naToken');
+  token.value = '';
+  token.placeholder = d.telegram.hasToken ? 'Сохранён — оставьте пустым, чтобы не менять' : '123456:ABC-DEF…';
+  var st = document.getElementById('naBotStatus');
+  st.textContent = !d.telegram.hasToken ? 'Бот не подключён' : (d.telegram.botName ? '✓ Бот @' + d.telegram.botName : 'Токен сохранён, бот не проверен');
+  st.className = 'jira-status' + (d.telegram.botName ? ' ok' : '');
+  document.getElementById('naBotRemove').hidden = !d.telegram.hasToken;
+  document.getElementById('naUrl').value = d.publicUrl;
+}
+
+function notifyAdminData(extra){
+  return Object.assign({
+    smtp: {host: document.getElementById('naHost').value.trim(), port: parseInt(document.getElementById('naPort').value, 10) || null,
+           security: document.getElementById('naSecurity').value, sender: document.getElementById('naSender').value.trim(),
+           login: document.getElementById('naLogin').value.trim(), password: document.getElementById('naPassword').value},
+    telegram: {token: document.getElementById('naToken').value.trim()},
+    publicUrl: document.getElementById('naUrl').value.trim()
+  }, extra || {});
+}
+
+function saveNotifyAdmin(extra, message){
+  return apiPut('/api/admin/notify-settings', notifyAdminData(extra)).then(function(d){
+    fillNotifyAdmin(d);
+    if(message) toast(message);
+    return d;
+  });
+}
+
+document.getElementById('notifyAdminForm').addEventListener('submit', function(e){
+  e.preventDefault();
+  saveNotifyAdmin(null, 'Настройки рассылок сохранены').catch(function(){});
+});
+document.getElementById('naTestEmail').addEventListener('click', function(){
+  var to = document.getElementById('naTestTo').value.trim();
+  if(!to){ toast('Укажите, куда отправить тестовое письмо'); return; }
+  var btn = this;
+  btn.disabled = true;
+  saveNotifyAdmin().then(function(){
+    return apiPost('/api/admin/notify-settings/test-email', {to: to});
+  }).then(function(){ toast('Тестовое письмо отправлено на ' + to); }).catch(function(){}).then(function(){
+    btn.disabled = false;
+    loadNotifyLog();
+  });
+});
+document.getElementById('naBotTest').addEventListener('click', function(){
+  saveNotifyAdmin().then(function(){
+    return apiPost('/api/admin/notify-settings/test-telegram');
+  }).then(function(r){ toast('Бот @' + r.botName + ' отвечает'); renderNotifyAdminView(); }).catch(function(){});
+});
+document.getElementById('naBotRemove').addEventListener('click', function(){
+  askConfirm('Отключить Telegram-бота?', 'Сообщения в Telegram перестанут приходить всем пользователям; привязки сохранятся.', function(){
+    saveNotifyAdmin({telegram: {clearToken: true}}, 'Telegram-бот отключён').catch(function(){});
+  }, 'Отключить');
+});
+document.getElementById('naLogReload').addEventListener('click', loadNotifyLog);
+
+function loadNotifyLog(){
+  var table = document.getElementById('notifyLogTable');
+  api('/api/admin/notify-log').then(function(rows){
+    if(!rows.length){ emptyTable(table, 'Отправок пока не было', 'Здесь появятся дайджесты, оповещения и тестовые отправки.'); return; }
+    table.innerHTML = '<thead><tr><th>Время</th><th>Кому</th><th>Проект</th><th>Что</th><th>Канал</th><th>Результат</th></tr></thead><tbody>'+
+      rows.map(function(r){
+        return '<tr><td class="mono nowrap">'+fmtDateTime(r.createdAt)+'</td><td>'+escapeHtml(r.username || '—')+'</td><td>'+escapeHtml(r.projectName || '—')+'</td>'+
+          '<td>'+escapeHtml(NOTIFY_KINDS[r.kind] || r.kind)+'</td><td>'+(r.channel === 'email' ? 'Почта' : 'Telegram')+'</td>'+
+          '<td><span class="autofill-result '+(r.status === 'ok' ? 'ok' : 'error')+'">'+(r.status === 'ok' ? '✓ ' : '✗ ')+escapeHtml(r.message || (r.status === 'ok' ? 'отправлено' : ''))+'</span></td></tr>';
+      }).join('')+'</tbody>';
+  }).catch(function(){});
+}
+
+
+/* ════════════════════════════════════════════════════════════════
    Автозаполнение: срез по кнопке по расписанию (выполняет сервер)
 ════════════════════════════════════════════════════════════════ */
 var WEEKDAYS = [[1, 'Пн'], [2, 'Вт'], [3, 'Ср'], [4, 'Чт'], [5, 'Пт'], [6, 'Сб'], [7, 'Вс']];
@@ -3199,17 +3413,20 @@ function init(){
 var auditPageLabels = {
   dashboard: 'Дашборд', stages: 'Свод по этапам', data: 'Данные по датам',
   services: 'Эпики', settings: 'Настройки', users: 'Пользователи',
-  projects: 'Проекты', profile: 'Профиль', jira: 'Связь с Jira'
+  projects: 'Проекты', profile: 'Профиль', jira: 'Связь с Jira', notify: 'Рассылки'
 };
 var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление', autofill: 'Автозаполнение', restore: 'Восстановление истории' };
 var auditEntityLabels = { project: 'Проект', service: 'Эпик', entry: 'Замер', user: 'Пользователь', stage_target: 'Цель этапа', settings: 'Настройки',
-  jira_connection: 'Подключение к Jira', jira_button: 'Кнопка среза', jira_schedule: 'Расписание автозаполнения' };
+  jira_connection: 'Подключение к Jira', jira_button: 'Кнопка среза', jira_schedule: 'Расписание автозаполнения',
+  notify_settings: 'Настройки рассылок' };
 var auditFieldLabels = {
   name: 'Название', description: 'Описание', etap: 'Этап', targetDate: 'Целевая дата', isDone: 'Сдано', stageGroup: 'Группа в своде',
   date: 'Дата', remaining: 'Остаток', spent: 'Затрачено', estimate: 'Оценка',
   username: 'Логин', displayName: 'Имя', email: 'Email', position: 'Должность', role: 'Роль',
   jiraUrl: 'Адрес Jira', jiraAuth: 'Тип подключения', jiraLogin: 'Логин Jira', jiraToken: 'Токен Jira',
   autofill: 'Расписание', result: 'Результат',
+  smtpHost: 'SMTP-сервер', smtpPort: 'Порт SMTP', smtpSecurity: 'Защита SMTP', smtpLogin: 'Логин SMTP', smtpFrom: 'Отправитель',
+  smtpPassword: 'Пароль SMTP', telegramToken: 'Токен Telegram-бота', publicUrl: 'Адрес Burndown',
   forecastMethod: 'Метод прогноза', riskBufferDays: 'Буфер риска', burnrateMethod: 'Метод burn rate', burnrateWindowDays: 'Окно burn rate'
 };
 /* В БД время хранится в UTC (CURRENT_TIMESTAMP) — показываем в локальном часовом поясе */

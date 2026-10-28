@@ -28,8 +28,10 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from init_db import create_indexes, create_jira_tables
+from init_db import create_indexes, create_jira_tables, create_notify_tables
+import forecast as fc
 import jira_integration as jira
+import notify
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'burndown.db'))
@@ -81,6 +83,7 @@ def migrate_db():
         if 'stage_group' not in cols:
             conn.execute('ALTER TABLE services ADD COLUMN stage_group TEXT')
         create_jira_tables(conn)
+        create_notify_tables(conn)
         create_indexes(conn)
         conn.commit()
     finally:
@@ -1499,6 +1502,8 @@ def _finish_autofill(db, button_row, status, message, actor):
     audit_log('jira', 'autofill', 'jira_button', button_row['id'], button_row['project_id'],
               [{'field': 'result', 'old': None, 'new': message}], entity_name=button_row['name'], commit=False,
               actor=actor)
+    if status == 'error':
+        queue_autofill_error(db, button_row, message)
     db.commit()
 
 
@@ -1731,12 +1736,736 @@ def run_due_schedules(now_utc=None):
     return done
 
 
+# ─── Уведомления: настройки отправки, подписки, дайджест, оповещения ───
+
+ALERT_TYPES = ('autofill', 'status', 'chance', 'scope', 'problems')
+NOTIFY_SECRETS = ('smtp_password', 'telegram_token')
+STATUS_TITLES = {'ok': 'Успеваем', 'risk': 'Риск', 'danger': 'Не успеваем', 'notarget': 'Нет цели', 'unknown': 'Нет данных'}
+STATUS_COLORS = {'ok': '#437a22', 'risk': '#964219', 'danger': '#a12c7b', 'notarget': '#5c6470', 'unknown': '#5c6470'}
+TIME_RE = re.compile(r'^([01]\d|2[0-3]):[0-5]\d$')
+
+
+def notify_settings(db):
+    """Настройки отправки из app_settings; секреты расшифрованы (None, если ключ сервера сменился)."""
+    cfg = {r['key']: r['value'] for r in db.execute('SELECT key, value FROM app_settings')}
+    for key in NOTIFY_SECRETS:
+        enc = cfg.get(key)
+        try:
+            cfg[key] = jira.decrypt_token(app.secret_key, enc) if enc else None
+        except jira.JiraError:
+            cfg[key] = None
+    return cfg
+
+
+def _set_setting(db, key, value):
+    if value is None:
+        db.execute('DELETE FROM app_settings WHERE key = ?', (key,))
+    else:
+        db.execute('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)', (key, str(value)))
+
+
+def smtp_config(cfg):
+    return {'host': cfg.get('smtp_host'), 'port': cfg.get('smtp_port'), 'security': cfg.get('smtp_security') or 'starttls',
+            'login': cfg.get('smtp_login'), 'password': cfg.get('smtp_password'), 'sender': cfg.get('smtp_from')}
+
+
+def telegram_client(cfg):
+    return notify.Telegram(cfg.get('telegram_token'),
+                           app.config.get('TELEGRAM_API') or os.environ.get('TELEGRAM_API') or 'https://api.telegram.org')
+
+
+def _notify_settings_json(cfg):
+    return {'smtp': {'host': cfg.get('smtp_host') or '', 'port': int(cfg.get('smtp_port') or 587),
+                     'security': cfg.get('smtp_security') or 'starttls', 'login': cfg.get('smtp_login') or '',
+                     'sender': cfg.get('smtp_from') or '', 'hasPassword': bool(cfg.get('smtp_password'))},
+            'telegram': {'hasToken': bool(cfg.get('telegram_token')), 'botName': cfg.get('telegram_bot_name') or ''},
+            'publicUrl': cfg.get('public_url') or ''}
+
+
+def notify_log(db, user, project, kind, channel, status, message):
+    db.execute('INSERT INTO notification_log (user_id, username, project_id, project_name, kind, channel, status, '
+               'message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+               (user['id'] if user else None, user['username'] if user else None, project['id'] if project else None,
+                project['name'] if project else None, kind, channel, status, (message or '')[:500], _utc_now_iso()))
+
+
+@app.route('/api/admin/notify-settings')
+@admin_required
+def api_get_notify_settings():
+    return jsonify(_notify_settings_json(notify_settings(get_db())))
+
+
+@app.route('/api/admin/notify-settings', methods=['PUT'])
+@admin_required
+def api_save_notify_settings():
+    db = get_db()
+    data = request.get_json() or {}
+    smtp = data.get('smtp') if isinstance(data.get('smtp'), dict) else {}
+    host = text_value(smtp.get('host'))
+    security = smtp.get('security') or 'starttls'
+    if security not in notify.SMTP_SECURITY:
+        raise ValidationError('Защита соединения — без шифрования, STARTTLS или SSL')
+    try:
+        port = int(smtp.get('port') or (465 if security == 'ssl' else 587))
+    except (TypeError, ValueError):
+        raise ValidationError('Порт SMTP — число')
+    if not 1 <= port <= 65535:
+        raise ValidationError('Порт SMTP — от 1 до 65535')
+    sender = text_value(smtp.get('sender'))
+    if host and not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', sender):
+        raise ValidationError('Укажите адрес отправителя, например burndown@company.ru')
+    public_url = text_value(data.get('publicUrl')).rstrip('/')
+    if public_url and not re.match(r'^https?://\S+$', public_url):
+        raise ValidationError('Адрес Burndown должен начинаться с http:// или https://')
+    old = notify_settings(db)
+    changes = []
+    for key, value, label in (('smtp_host', host, 'smtpHost'), ('smtp_port', port if host else None, 'smtpPort'),
+                              ('smtp_security', security if host else None, 'smtpSecurity'),
+                              ('smtp_login', text_value(smtp.get('login')) or None, 'smtpLogin'),
+                              ('smtp_from', sender or None, 'smtpFrom'), ('public_url', public_url or None, 'publicUrl')):
+        value = value if value not in ('', None) else None
+        if str(old.get(key) or '') != str(value or ''):
+            changes.append({'field': label, 'old': old.get(key), 'new': None if value is None else str(value)})
+        _set_setting(db, key, value)
+    password = smtp.get('password') or ''
+    if smtp.get('clearPassword') or (password and not host):
+        _set_setting(db, 'smtp_password', None)
+        changes.append({'field': 'smtpPassword', 'old': None, 'new': 'удалён'})
+    elif password:
+        _set_setting(db, 'smtp_password', jira.encrypt_token(app.secret_key, password))
+        changes.append({'field': 'smtpPassword', 'old': None, 'new': 'изменён'})
+    tg = data.get('telegram') if isinstance(data.get('telegram'), dict) else {}
+    token = text_value(tg.get('token'))
+    if tg.get('clearToken'):
+        _set_setting(db, 'telegram_token', None)
+        _set_setting(db, 'telegram_bot_name', None)
+        changes.append({'field': 'telegramToken', 'old': None, 'new': 'удалён'})
+    elif token:
+        _set_setting(db, 'telegram_token', jira.encrypt_token(app.secret_key, token))
+        try:
+            _set_setting(db, 'telegram_bot_name', telegram_client({'telegram_token': token}).bot_name() or None)
+        except notify.NotifyError:
+            _set_setting(db, 'telegram_bot_name', None)
+        changes.append({'field': 'telegramToken', 'old': None, 'new': 'изменён'})
+    db.commit()
+    if changes:
+        audit_log('notify', 'update', 'notify_settings', None, None, changes, entity_name='Рассылки')
+    return jsonify(_notify_settings_json(notify_settings(db)))
+
+
+@app.route('/api/admin/notify-settings/test-email', methods=['POST'])
+@admin_required
+def api_test_email():
+    db = get_db()
+    to = text_value((request.get_json() or {}).get('to'))
+    if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', to):
+        raise ValidationError('Укажите email получателя')
+    try:
+        notify.send_email(smtp_config(notify_settings(db)), to, 'Burndown: тестовое письмо',
+                          'Почта для уведомлений Burndown настроена правильно.')
+    except notify.NotifyError as e:
+        notify_log(db, get_current_user(), None, 'test', 'email', 'error', str(e))
+        db.commit()
+        return jsonify({'error': str(e)}), 502
+    notify_log(db, get_current_user(), None, 'test', 'email', 'ok', to)
+    db.commit()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/admin/notify-settings/test-telegram', methods=['POST'])
+@admin_required
+def api_test_telegram():
+    db = get_db()
+    try:
+        name = telegram_client(notify_settings(db)).bot_name()
+    except notify.NotifyError as e:
+        return jsonify({'error': str(e)}), 502
+    _set_setting(db, 'telegram_bot_name', name or None)
+    db.commit()
+    return jsonify({'botName': name})
+
+
+@app.route('/api/admin/notify-log')
+@admin_required
+def api_notify_log():
+    rows = get_db().execute('SELECT * FROM notification_log ORDER BY id DESC LIMIT 100').fetchall()
+    return jsonify([{'id': r['id'], 'username': r['username'], 'projectName': r['project_name'], 'kind': r['kind'],
+                     'channel': r['channel'], 'status': r['status'], 'message': r['message'],
+                     'createdAt': r['created_at']} for r in rows])
+
+
+# ── Привязка Telegram в профиле
+
+@app.route('/api/profile/telegram/link', methods=['POST'])
+@login_required
+def api_telegram_link():
+    db = get_db()
+    cfg = notify_settings(db)
+    if not cfg.get('telegram_token'):
+        return jsonify({'error': 'Администратор ещё не подключил Telegram-бота'}), 400
+    bot = cfg.get('telegram_bot_name')
+    if not bot:
+        try:
+            bot = telegram_client(cfg).bot_name()
+        except notify.NotifyError as e:
+            return jsonify({'error': str(e)}), 502
+        _set_setting(db, 'telegram_bot_name', bot)
+    code = secrets.token_hex(4)
+    db.execute('UPDATE users SET telegram_link_code = ? WHERE id = ?', (code, session['user_id']))
+    db.commit()
+    return jsonify({'code': code, 'botName': bot, 'url': f'https://t.me/{bot}?start={code}'})
+
+
+@app.route('/api/profile/telegram/check', methods=['POST'])
+@login_required
+def api_telegram_check():
+    db = get_db()
+    user = get_current_user()
+    if not user['telegram_link_code']:
+        raise ValidationError('Сначала получите ссылку для привязки')
+    cfg = notify_settings(db)
+    try:
+        client = telegram_client(cfg)
+        chat_id = client.find_start(user['telegram_link_code'])
+        if chat_id:
+            client.send_message(chat_id, '<b>Burndown</b>\nУведомления подключены. Настройте дайджест и оповещения '
+                                         'в разделе «Уведомления» проекта.')
+    except notify.NotifyError as e:
+        return jsonify({'error': str(e)}), 502
+    if not chat_id:
+        return jsonify({'linked': False})
+    db.execute('UPDATE users SET telegram_chat_id = ?, telegram_link_code = NULL WHERE id = ?', (chat_id, user['id']))
+    db.commit()
+    return jsonify({'linked': True})
+
+
+@app.route('/api/profile/telegram', methods=['DELETE'])
+@login_required
+def api_telegram_unlink():
+    db = get_db()
+    db.execute('UPDATE users SET telegram_chat_id = NULL, telegram_link_code = NULL WHERE id = ?', (session['user_id'],))
+    db.execute('UPDATE notification_subscriptions SET via_telegram = 0 WHERE user_id = ?', (session['user_id'],))
+    db.commit()
+    return jsonify({'linked': False})
+
+
+# ── Подписка пользователя на проект
+
+def _subscription(db, uid, pid):
+    return db.execute('SELECT * FROM notification_subscriptions WHERE user_id = ? AND project_id = ?',
+                      (uid, pid)).fetchone()
+
+
+def _next_digest(sub):
+    if not sub or not sub['digest_enabled']:
+        return None
+    return _next_run({'enabled': 1, 'days': sub['digest_days'], 'timezone': sub['timezone'],
+                      'run_time': sub['digest_time'], 'last_run_date': sub['last_digest_date']})
+
+
+def _subscription_json(db, user, sub):
+    cfg = notify_settings(db)
+    types = (sub['alert_types'] if sub else 'autofill,status,chance,scope,problems').split(',')
+    return {
+        'viaEmail': bool(sub['via_email']) if sub else True,
+        'viaTelegram': bool(sub['via_telegram']) if sub else False,
+        'digest': {'enabled': bool(sub and sub['digest_enabled']),
+                   'days': _schedule_days(sub['digest_days']) if sub else [1],
+                   'time': sub['digest_time'] if sub else '09:00', 'timezone': sub['timezone'] if sub else 'Europe/Moscow',
+                   'pdf': bool(sub and sub['digest_pdf']), 'lastAt': sub['last_digest_at'] if sub else None,
+                   'lastStatus': sub['last_digest_status'] if sub else None,
+                   'lastMessage': sub['last_digest_message'] if sub else None, 'nextAt': _next_digest(sub)},
+        'alerts': {'enabled': bool(sub and sub['alerts_enabled']), 'types': [t for t in types if t in ALERT_TYPES],
+                   'chanceThreshold': sub['chance_threshold'] if sub else 50,
+                   'scopeThreshold': sub['scope_threshold'] if sub else 10},
+        'channels': {'email': user['email'] or '', 'emailReady': bool(cfg.get('smtp_host') and cfg.get('smtp_from')),
+                     'telegramReady': bool(cfg.get('telegram_token')), 'botName': cfg.get('telegram_bot_name') or '',
+                     'telegramLinked': bool(user['telegram_chat_id'])},
+    }
+
+
+@app.route('/api/projects/<int:pid>/notifications')
+@login_required
+def api_get_notifications(pid):
+    if not can_view_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет доступа'}), 403
+    db = get_db()
+    return jsonify(_subscription_json(db, get_current_user(), _subscription(db, session['user_id'], pid)))
+
+
+@app.route('/api/projects/<int:pid>/notifications', methods=['PUT'])
+@login_required
+def api_save_notifications(pid):
+    if not can_view_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет доступа'}), 403
+    db = get_db()
+    user = get_current_user()
+    data = request.get_json() or {}
+    digest = data.get('digest') if isinstance(data.get('digest'), dict) else {}
+    alerts = data.get('alerts') if isinstance(data.get('alerts'), dict) else {}
+    via_email, via_tg = bool(data.get('viaEmail')), bool(data.get('viaTelegram'))
+    days = digest.get('days') or []
+    if not isinstance(days, list) or not all(isinstance(d, int) and 1 <= d <= 7 for d in days):
+        raise ValidationError('Дни недели — числа от 1 (пн) до 7 (вс)')
+    days = sorted(set(days))
+    run_time = text_value(digest.get('time')) or '09:00'
+    if not TIME_RE.match(run_time):
+        raise ValidationError('Время дайджеста — в формате ЧЧ:ММ')
+    tz_name = text_value(digest.get('timezone')) or 'Europe/Moscow'
+    tz = _zone(tz_name)
+    types = alerts.get('types') or []
+    if not isinstance(types, list) or any(t not in ALERT_TYPES for t in types):
+        raise ValidationError('Неизвестный вид оповещения')
+    try:
+        chance = int(alerts.get('chanceThreshold', 50))
+        scope = int(alerts.get('scopeThreshold', 10))
+    except (TypeError, ValueError):
+        raise ValidationError('Пороги — целые числа')
+    if not 1 <= chance <= 99 or not 1 <= scope <= 1000:
+        raise ValidationError('Порог шанса — от 1 до 99%, порог роста объёма — от 1 до 1000%')
+    digest_on, alerts_on = bool(digest.get('enabled')), bool(alerts.get('enabled'))
+    if digest_on and not days:
+        raise ValidationError('Выберите хотя бы один день для дайджеста')
+    if alerts_on and not types:
+        raise ValidationError('Выберите хотя бы один вид оповещений')
+    if digest_on or alerts_on:
+        _check_channels(db, user, via_email, via_tg)
+    sub = _subscription(db, user['id'], pid)
+    local = datetime.now(timezone.utc).astimezone(tz)
+    last_date = sub['last_digest_date'] if sub else None
+    # дайджест включили после сегодняшнего времени отправки — первый уйдёт в следующий день по расписанию
+    if digest_on and local.strftime('%H:%M') >= run_time and not (sub and sub['digest_enabled']):
+        last_date = local.date().isoformat()
+    values = (1 if via_email else 0, 1 if via_tg else 0, 1 if digest_on else 0, ','.join(map(str, days)), run_time,
+              tz_name, 1 if digest.get('pdf') else 0, last_date, 1 if alerts_on else 0, ','.join(types), chance, scope)
+    if sub:
+        db.execute('UPDATE notification_subscriptions SET via_email = ?, via_telegram = ?, digest_enabled = ?, '
+                   'digest_days = ?, digest_time = ?, timezone = ?, digest_pdf = ?, last_digest_date = ?, '
+                   'alerts_enabled = ?, alert_types = ?, chance_threshold = ?, scope_threshold = ? WHERE id = ?',
+                   values + (sub['id'],))
+    else:
+        db.execute('INSERT INTO notification_subscriptions (via_email, via_telegram, digest_enabled, digest_days, '
+                   'digest_time, timezone, digest_pdf, last_digest_date, alerts_enabled, alert_types, chance_threshold, '
+                   'scope_threshold, user_id, project_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                   values + (user['id'], pid))
+    db.commit()
+    return jsonify(_subscription_json(db, user, _subscription(db, user['id'], pid)))
+
+
+def _check_channels(db, user, via_email, via_tg):
+    cfg = notify_settings(db)
+    if not via_email and not via_tg:
+        raise ValidationError('Выберите канал: почта или Telegram')
+    if via_email and not (cfg.get('smtp_host') and cfg.get('smtp_from')):
+        raise ValidationError('Администратор ещё не настроил отправку почты')
+    if via_email and not user['email']:
+        raise ValidationError('В вашем профиле не указан email — обратитесь к администратору')
+    if via_tg and not cfg.get('telegram_token'):
+        raise ValidationError('Администратор ещё не подключил Telegram-бота')
+    if via_tg and not user['telegram_chat_id']:
+        raise ValidationError('Сначала привяжите Telegram')
+
+
+@app.route('/api/projects/<int:pid>/notifications/preview')
+@login_required
+def api_digest_preview(pid):
+    if not can_view_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет доступа'}), 403
+    db = get_db()
+    overview = project_overview(db, pid)
+    sub = _subscription(db, session['user_id'], pid)
+    prev = json.loads(sub['digest_snapshot']) if sub and sub['digest_snapshot'] else None
+    msg = render_digest(overview, prev, notify_settings(db).get('public_url'))
+    return jsonify({'subject': msg['subject'], 'html': msg['html'], 'overview': overview})
+
+
+@app.route('/api/projects/<int:pid>/notifications/test', methods=['POST'])
+@login_required
+def api_digest_test(pid):
+    """Отправить дайджест сейчас по выбранным каналам подписки (для проверки)."""
+    if not can_view_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет доступа'}), 403
+    db = get_db()
+    user = get_current_user()
+    sub = _subscription(db, user['id'], pid)
+    if not sub:
+        raise ValidationError('Сначала сохраните настройки уведомлений')
+    _check_channels(db, user, bool(sub['via_email']), bool(sub['via_telegram']))
+    results = send_digest(db, user, sub, save_state=False)
+    db.commit()
+    code = 200 if all(r['status'] == 'ok' for r in results) else 502
+    return jsonify({'results': results}), code
+
+
+# ── Состояние проекта для писем: та же логика, что в интерфейсе (forecast.py)
+
+def project_overview(db, pid):
+    project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
+    settings_row = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
+    settings = fc.settings_dict(settings_row)
+    services = db.execute('SELECT * FROM services WHERE project_id = ? AND NOT COALESCE(is_done, 0) '
+                          'ORDER BY sort_order, id', (pid,)).fetchall()
+    rows = {s['id']: [dict(r) for r in db.execute('SELECT date, remaining, spent, estimate FROM entries WHERE '
+                                                  'service_id = ? ORDER BY date', (s['id'],))] for s in services}
+    history, latest = jira_composition(db, pid)
+    epics = []
+    for s in services:
+        r = rows[s['id']]
+        st = fc.compute_status([e['date'] for e in r], [e['remaining'] for e in r], s['target_date'] or None, settings)
+        comp = latest.get(s['id'])
+        hist = history.get(s['id']) or []
+        epics.append({
+            'id': s['id'], 'name': s['name'], 'etap': s['etap'], 'target': s['target_date'] or None,
+            'remaining': st['lastRemaining'], 'status': st['status'], 'forecast': st['forecastZero'],
+            'noBurn': st['noBurn'], 'probability': st['mc']['probability'] if st['mc'] else None,
+            'p50': st['mc']['p50'] if st['mc'] else None, 'lastDate': st['lastDate'] if r else None,
+            'scope': comp['scope'] if comp else None, 'problems': sum(comp['problems'].values()) if comp else None,
+            'scopePrev': hist[-2]['scope'] if len(hist) >= 2 else None})
+    stage_targets = {r['stage_name']: r['target_date'] for r in
+                     db.execute('SELECT * FROM stage_targets WHERE project_id = ?', (pid,))}
+    groups = {}
+    for s in services:
+        groups.setdefault(stage_key(s), []).append(s['id'])
+    stages = []
+    for name, ids in groups.items():
+        dates, series = fc.aggregate_series([rows[i] for i in ids])
+        st = fc.compute_status(dates, series['remaining'], stage_targets.get(name) or None, settings)
+        stages.append({'name': name, 'target': stage_targets.get(name) or None, 'remaining': st['lastRemaining'],
+                       'status': st['status'], 'forecast': st['forecastZero'], 'noBurn': st['noBurn'],
+                       'probability': st['mc']['probability'] if st['mc'] else None})
+    autofill = [{'button': b['name'], 'lastStatus': b['last_status'], 'lastMessage': b['last_message'],
+                 'lastRunAt': b['last_run_at']} for b in db.execute(
+        'SELECT b.name, s.last_status, s.last_message, s.last_run_at FROM jira_snapshot_buttons b '
+        'JOIN jira_schedules s ON s.button_id = b.id WHERE b.project_id = ? AND s.enabled = 1 ORDER BY b.sort_order, b.id',
+        (pid,))]
+    counts = {k: sum(1 for e in epics if e['status'] == k) for k in ('ok', 'risk', 'danger')}
+    return {'project': {'id': project['id'], 'name': project['name']}, 'date': datetime.now().date().isoformat(),
+            'kpi': dict(counts, epics=len(epics), remaining=round(sum(e['remaining'] or 0 for e in epics), 2)),
+            'epics': epics, 'stages': stages, 'autofill': autofill}
+
+
+def _pct(p):
+    return '—' if p is None else f'{fc.js_round(p * 100)}%'  # как в интерфейсе: 90,5 → 91
+
+
+def _ru_num(v):
+    """Число по-русски, как в интерфейсе: 1 188,3."""
+    text = f'{v:,.2f}'.rstrip('0').rstrip('.')
+    return text.replace(',', '\u00a0').replace('.', ',')
+
+
+def _hours(v):
+    return '—' if v is None else _ru_num(v) + ' ч'
+
+
+def render_digest(ov, prev, public_url):
+    """Дайджест проекта → subject, text, html (письмо), telegram (HTML Telegram). prev — состояние прошлого дайджеста."""
+    prev_epics = {str(e['id']): e for e in (prev or {}).get('epics', [])}
+    k = ov['kpi']
+    worse = [e for e in ov['epics'] if e['status'] in ('risk', 'danger')]
+    subject = f"Burndown · {ov['project']['name']}: " + (
+        f"под угрозой {len(worse)} из {k['epics']} эпиков" if worse else f"сроки в порядке ({k['epics']} эпиков)")
+    head = (f"Успевают: {k['ok']} · риск: {k['risk']} · не успевают: {k['danger']} · "
+            f"остаток: {_ru_num(k['remaining'])} ч")
+
+    def change(e):
+        p = prev_epics.get(str(e['id']))
+        if not p:
+            return ''
+        parts = []
+        if p.get('status') != e['status'] and p.get('status') in STATUS_TITLES:
+            parts.append(f"{STATUS_TITLES[p['status']]} → {STATUS_TITLES[e['status']]}")
+        if p.get('probability') is not None and e['probability'] is not None:
+            d = fc.js_round((e['probability'] - p['probability']) * 100)
+            if d:
+                parts.append(f"шанс {'+' if d > 0 else ''}{d} п.п.")
+        if p.get('remaining') is not None and e['remaining'] is not None and p['remaining'] != e['remaining']:
+            d = round(e['remaining'] - p['remaining'], 2)
+            parts.append(f"остаток {'+' if d > 0 else ''}{_ru_num(d)} ч")
+        return ', '.join(parts)
+
+    lines = [subject, head, '']
+    for e in ov['epics']:
+        ch = change(e)
+        lines.append(f"• {e['name']} — {STATUS_TITLES[e['status']]}; остаток {_hours(e['remaining'])}; "
+                     f"прогноз {_fmt_date(e['forecast']) if e['forecast'] else ('не сгорает' if e['noBurn'] else '—')}; "
+                     f"цель {_fmt_date(e['target'])}; шанс {_pct(e['probability'])}"
+                     + (f"; с прошлого дайджеста: {ch}" if ch else ''))
+    errors = [a for a in ov['autofill'] if a['lastStatus'] == 'error']
+    if errors:
+        lines += ['', 'Автозаполнение с ошибкой:'] + [f"• {a['button']}: {a['lastMessage']}" for a in errors]
+    if public_url:
+        lines += ['', f'Открыть Burndown: {public_url}']
+    text = '\n'.join(lines)
+
+    esc = notify.esc
+    row_html = []
+    for e in ov['epics']:
+        ch = change(e)
+        color = STATUS_COLORS[e['status']]
+        forecast_text = _fmt_date(e['forecast']) if e['forecast'] else ('не сгорает' if e['noBurn'] else '—')
+        row_html.append(
+            f"<tr><td style='padding:6px 8px;border-bottom:1px solid #e3e7f0'>{esc(e['name'])}"
+            + (f"<div style='font-size:12px;color:#964219'>{esc(ch)}</div>" if ch else '') + "</td>"
+            f"<td style='padding:6px 8px;border-bottom:1px solid #e3e7f0;color:{color};font-weight:600;white-space:nowrap'>"
+            f"{esc(STATUS_TITLES[e['status']])}</td>"
+            f"<td style='padding:6px 8px;border-bottom:1px solid #e3e7f0;text-align:right;white-space:nowrap'>{esc(_hours(e['remaining']))}</td>"
+            f"<td style='padding:6px 8px;border-bottom:1px solid #e3e7f0;white-space:nowrap'>{esc(forecast_text)}</td>"
+            f"<td style='padding:6px 8px;border-bottom:1px solid #e3e7f0;white-space:nowrap'>{esc(_fmt_date(e['target']))}</td>"
+            f"<td style='padding:6px 8px;border-bottom:1px solid #e3e7f0;text-align:right'>{esc(_pct(e['probability']))}</td></tr>")
+    th = "style='padding:6px 8px;text-align:left;font-size:12px;color:#5c6470;border-bottom:2px solid #01696f'"
+    html_body = (
+        "<div style='font-family:Arial,sans-serif;color:#1c2126;max-width:760px'>"
+        f"<h2 style='color:#01696f;margin:0 0 4px'>{esc(ov['project']['name'])}</h2>"
+        f"<div style='color:#5c6470;margin-bottom:12px'>Дайджест Burndown на {esc(_fmt_date(ov['date']))}</div>"
+        f"<p style='margin:0 0 12px'><b>{esc(head)}</b></p>"
+        "<table style='border-collapse:collapse;width:100%;font-size:14px'><thead><tr>"
+        f"<th {th}>Эпик</th><th {th}>Статус</th><th {th}>Остаток</th><th {th}>Прогноз «0»</th><th {th}>Цель</th>"
+        f"<th {th}>Шанс успеть</th></tr></thead><tbody>{''.join(row_html)}</tbody></table>"
+        + (("<p style='margin:16px 0 4px'><b>Автозаполнение с ошибкой</b></p><ul>"
+            + ''.join(f"<li>{esc(a['button'])}: {esc(a['lastMessage'])}</li>" for a in errors) + '</ul>') if errors else '')
+        + (f"<p style='margin-top:16px'><a href='{esc(public_url)}' style='color:#01696f'>Открыть Burndown</a></p>"
+           if public_url else '')
+        + "<p style='color:#99a1aa;font-size:12px;margin-top:16px'>Настроить или отключить дайджест — в разделе "
+          "«Уведомления» проекта.</p></div>")
+
+    tg = [f"<b>{esc(ov['project']['name'])}</b> — дайджест на {esc(_fmt_date(ov['date']))}", esc(head), '']
+    icons = {'ok': '✅', 'risk': '⚠️', 'danger': '⛔', 'notarget': '◽', 'unknown': '◽'}
+    for e in ov['epics']:
+        ch = change(e)
+        tg.append(f"{icons[e['status']]} <b>{esc(e['name'])}</b>: {esc(_hours(e['remaining']))}, "
+                  f"шанс {esc(_pct(e['probability']))}" + (f"\n    <i>{esc(ch)}</i>" if ch else ''))
+    if errors:
+        tg += ['', '<b>Автозаполнение с ошибкой:</b>'] + [f"• {esc(a['button'])}: {esc(a['lastMessage'])}" for a in errors]
+    if public_url:
+        tg += ['', f"<a href=\"{esc(public_url)}\">Открыть Burndown</a>"]
+    return {'subject': subject, 'text': text, 'html': html_body, 'telegram': '\n'.join(tg)}
+
+
+def _snapshot_for_digest(ov):
+    return json.dumps({'epics': [{k: e[k] for k in ('id', 'status', 'probability', 'remaining')} for e in ov['epics']]},
+                      ensure_ascii=False)
+
+
+def deliver(db, user, sub, project, kind, subject, text, html_body, telegram_html, attachments=()):
+    """Отправить по каналам подписки → [{channel, status, message}]; каждая попытка — в журнал."""
+    cfg = notify_settings(db)
+    results = []
+    if sub['via_email']:
+        try:
+            notify.send_email(smtp_config(cfg), user['email'], subject, text, html_body, attachments)
+            results.append({'channel': 'email', 'status': 'ok', 'message': user['email']})
+        except notify.NotifyError as e:
+            results.append({'channel': 'email', 'status': 'error', 'message': str(e)})
+    if sub['via_telegram']:
+        try:
+            if not user['telegram_chat_id']:
+                raise notify.NotifyError('Telegram не привязан')
+            client = telegram_client(cfg)
+            client.send_message(user['telegram_chat_id'], telegram_html)
+            for name, data, _mime in attachments:
+                client.send_document(user['telegram_chat_id'], name, data, subject)
+            results.append({'channel': 'telegram', 'status': 'ok', 'message': ''})
+        except notify.NotifyError as e:
+            results.append({'channel': 'telegram', 'status': 'error', 'message': str(e)})
+    for r in results:
+        notify_log(db, user, project, kind, r['channel'], r['status'], r['message'])
+    return results
+
+
+def send_digest(db, user, sub, save_state=True):
+    project = db.execute('SELECT * FROM projects WHERE id = ?', (sub['project_id'],)).fetchone()
+    ov = project_overview(db, project['id'])
+    prev = json.loads(sub['digest_snapshot']) if sub['digest_snapshot'] else None
+    msg = render_digest(ov, prev, notify_settings(db).get('public_url'))
+    attachments = []
+    if sub['digest_pdf']:
+        data, filename = build_project_pdf(db, project, 'dashboard')
+        attachments.append((filename, data, 'application/pdf'))
+    results = deliver(db, user, sub, project, 'digest', msg['subject'], msg['text'], msg['html'], msg['telegram'],
+                      attachments)
+    ok = all(r['status'] == 'ok' for r in results)
+    message = '; '.join(('почта' if r['channel'] == 'email' else 'Telegram') + ': ' +
+                        ('отправлено' if r['status'] == 'ok' else r['message']) for r in results)
+    db.execute('UPDATE notification_subscriptions SET last_digest_at = ?, last_digest_status = ?, last_digest_message = ?'
+               + (', digest_snapshot = ?' if save_state and ok else '') + ' WHERE id = ?',
+               (_utc_now_iso(), 'ok' if ok else 'error', message)
+               + ((_snapshot_for_digest(ov),) if save_state and ok else ()) + (sub['id'],))
+    return results
+
+
+def run_due_digests(now_utc=None):
+    """Дайджесты по расписанию подписок: один раз в день на подписку (день захватывается атомарно, как автозаполнение)."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    db = get_db()
+    sent = 0
+    for sub in db.execute('SELECT * FROM notification_subscriptions WHERE digest_enabled = 1').fetchall():
+        try:
+            local = now_utc.astimezone(ZoneInfo(sub['timezone']))
+        except (ZoneInfoNotFoundError, ValueError):
+            continue
+        today = local.date().isoformat()
+        if (local.isoweekday() not in _schedule_days(sub['digest_days']) or local.strftime('%H:%M') < sub['digest_time']
+                or sub['last_digest_date'] == today):
+            continue
+        claimed = db.execute('UPDATE notification_subscriptions SET last_digest_date = ? WHERE id = ? AND digest_enabled = 1 '
+                             'AND (last_digest_date IS NULL OR last_digest_date != ?)', (today, sub['id'], today)).rowcount
+        db.commit()
+        if not claimed:
+            continue
+        user = db.execute('SELECT * FROM users WHERE id = ?', (sub['user_id'],)).fetchone()
+        if not user or user_project_role(user['id'], sub['project_id']) is None:
+            continue  # доступ к проекту отозван
+        try:
+            send_digest(db, user, db.execute('SELECT * FROM notification_subscriptions WHERE id = ?', (sub['id'],)).fetchone())
+        except Exception:  # noqa: BLE001 — сбой одного дайджеста не останавливает остальные
+            db.rollback()
+            logger.exception('digest %s failed', sub['id'])
+        db.commit()
+        sent += 1
+    return sent
+
+
+# ── Оповещения: сравнение состояния проекта с прошлым
+
+def project_state(ov):
+    state = {}
+    for e in ov['epics']:
+        state[f"epic:{e['id']}"] = {'name': e['name'], 'status': e['status'], 'probability': e['probability'],
+                                    'scope': e['scope'], 'problems': e['problems'], 'kind': 'epic'}
+    for st in ov['stages']:
+        state[f"stage:{st['name']}"] = {'name': st['name'], 'status': st['status'], 'probability': st['probability'],
+                                        'scope': None, 'problems': None, 'kind': 'stage'}
+    return state
+
+
+def alert_events(old, new, sub):
+    """События для подписчика по его видам оповещений и порогам: [(вид, текст)]."""
+    types = set((sub['alert_types'] or '').split(','))
+    events = []
+    for key, n in new.items():
+        o = old.get(key)
+        if not o:
+            continue
+        label = ('Эпик' if n['kind'] == 'epic' else 'Этап') + f" «{n['name']}»"
+        if 'status' in types and n['status'] in fc.STATUS_RANK and o['status'] in fc.STATUS_RANK \
+                and fc.STATUS_RANK[n['status']] > fc.STATUS_RANK[o['status']]:
+            events.append(('status', f"{label}: {STATUS_TITLES[o['status']]} → {STATUS_TITLES[n['status']]}"))
+        thr = sub['chance_threshold'] / 100
+        if 'chance' in types and o['probability'] is not None and n['probability'] is not None \
+                and o['probability'] >= thr > n['probability']:
+            events.append(('chance', f"{label}: шанс успеть {_pct(o['probability'])} → {_pct(n['probability'])} "
+                                     f"(порог {sub['chance_threshold']}%)"))
+        if 'scope' in types and o['scope'] and n['scope'] is not None \
+                and (n['scope'] - o['scope']) / o['scope'] * 100 >= sub['scope_threshold']:
+            events.append(('scope', f"{label}: объём задач Jira вырос на "
+                                    f"{fc.js_round((n['scope'] - o['scope']) / o['scope'] * 100)}% "
+                                    f"({_ru_num(o['scope'])} → {_ru_num(n['scope'])} ч)"))
+        if 'problems' in types and n['problems'] is not None and n['problems'] > (o['problems'] or 0):
+            events.append(('problems', f"{label}: задач с неполными данными {o['problems'] or 0} → {n['problems']}"))
+    return events
+
+
+def _project_fingerprint(db, pid):
+    audit = db.execute('SELECT MAX(id) FROM audit_log WHERE project_id = ?', (pid,)).fetchone()[0]
+    snap = db.execute('SELECT MAX(s.id) FROM jira_issue_snapshots s JOIN services v ON v.id = s.service_id '
+                      'WHERE v.project_id = ?', (pid,)).fetchone()[0]
+    return f'{audit or 0}:{snap or 0}'
+
+
+def run_alert_checks():
+    """Проекты с подписками на оповещения, где что-то изменилось (реестр, срезы Jira): сравнить состояние с прошлым
+    и поставить письма в очередь. Проект обрабатывает один процесс — отпечаток изменений захватывается атомарно."""
+    db = get_db()
+    queued = 0
+    pids = [r[0] for r in db.execute('SELECT DISTINCT project_id FROM notification_subscriptions WHERE alerts_enabled = 1')]
+    for pid in pids:
+        fp = _project_fingerprint(db, pid)
+        db.execute('INSERT OR IGNORE INTO notification_marks (project_id) VALUES (?)', (pid,))
+        claimed = db.execute('UPDATE notification_marks SET fingerprint = ?, checked_at = ? WHERE project_id = ? '
+                             'AND (fingerprint IS NULL OR fingerprint != ?)', (fp, _utc_now_iso(), pid, fp)).rowcount
+        db.commit()
+        if not claimed:
+            continue
+        ov = project_overview(db, pid)
+        new = project_state(ov)
+        old = {r['entity']: dict(r) for r in db.execute('SELECT * FROM notification_state WHERE project_id = ?', (pid,))}
+        for sub in db.execute('SELECT * FROM notification_subscriptions WHERE project_id = ? AND alerts_enabled = 1',
+                              (pid,)).fetchall():
+            events = alert_events(old, new, sub)
+            if events:
+                queue_alert(db, sub['user_id'], pid, ov['project']['name'], [text for _kind, text in events])
+                queued += 1
+        db.execute('DELETE FROM notification_state WHERE project_id = ?', (pid,))
+        db.executemany('INSERT INTO notification_state (project_id, entity, name, status, probability, scope, problems) '
+                       'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                       [(pid, key, v['name'], v['status'], v['probability'], v['scope'], v['problems'])
+                        for key, v in new.items()])
+        db.commit()
+    return queued
+
+
+def queue_alert(db, user_id, pid, project_name, lines):
+    subject = f'Burndown · {project_name}: ' + (lines[0] if len(lines) == 1 else f'{len(lines)} изменения в сроках и данных')
+    text = '\n'.join('• ' + line for line in lines)
+    html_body = ("<div style='font-family:Arial,sans-serif;color:#1c2126'>"
+                 f"<h3 style='color:#01696f;margin:0 0 8px'>{notify.esc(project_name)}</h3><ul>"
+                 + ''.join(f'<li>{notify.esc(line)}</li>' for line in lines) + '</ul></div>')
+    db.execute('INSERT INTO notification_outbox (user_id, project_id, kind, subject, body_text, body_html, created_at) '
+               "VALUES (?, ?, 'alert', ?, ?, ?, ?)", (user_id, pid, subject, text, html_body, _utc_now_iso()))
+
+
+def queue_autofill_error(db, button_row, message):
+    """Сбой автозаполнения — подписчикам проекта с оповещением «autofill»."""
+    project = db.execute('SELECT name FROM projects WHERE id = ?', (button_row['project_id'],)).fetchone()
+    for sub in db.execute('SELECT * FROM notification_subscriptions WHERE project_id = ? AND alerts_enabled = 1',
+                          (button_row['project_id'],)).fetchall():
+        if 'autofill' in (sub['alert_types'] or '').split(','):
+            queue_alert(db, sub['user_id'], button_row['project_id'], project['name'],
+                        [f"Автозаполнение «{button_row['name']}» не выполнено: {message}"])
+
+
+def deliver_outbox():
+    db = get_db()
+    done = 0
+    for item in db.execute("SELECT * FROM notification_outbox WHERE status = 'pending' ORDER BY id").fetchall():
+        claimed = db.execute("UPDATE notification_outbox SET status = 'sending' WHERE id = ? AND status = 'pending'",
+                             (item['id'],)).rowcount
+        db.commit()
+        if not claimed:
+            continue
+        user = db.execute('SELECT * FROM users WHERE id = ?', (item['user_id'],)).fetchone()
+        sub = _subscription(db, item['user_id'], item['project_id'])
+        project = db.execute('SELECT * FROM projects WHERE id = ?', (item['project_id'],)).fetchone()
+        status = 'skipped'
+        if user and sub and project and user_project_role(user['id'], project['id']) is not None:
+            tg = f"<b>{notify.esc(item['subject'])}</b>\n{notify.esc(item['body_text'])}"
+            results = deliver(db, user, sub, project, item['kind'], item['subject'], item['body_text'],
+                              item['body_html'], tg)
+            status = 'sent' if results and all(r['status'] == 'ok' for r in results) else 'error'
+        db.execute('UPDATE notification_outbox SET status = ? WHERE id = ?', (status, item['id']))
+        db.commit()
+        done += 1
+    return done
+
+
+def run_notifications(now_utc=None):
+    """Шаг планировщика: оповещения, дайджесты, доставка очереди. Сбой одной части не мешает остальным."""
+    for step in (run_alert_checks, lambda: run_due_digests(now_utc), deliver_outbox):
+        try:
+            step()
+        except Exception:  # noqa: BLE001
+            get_db().rollback()
+            logger.exception('notifications step failed')
+
+
 def _scheduler_loop():
     while True:
         time.sleep(SCHEDULER_INTERVAL)
         try:
             with app.app_context():
                 run_due_schedules()
+                run_notifications()
         except Exception:  # noqa: BLE001
             logger.exception('scheduler tick failed')
 
@@ -2060,6 +2789,16 @@ def api_export_pdf(pid):
     project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
     if not project:
         return jsonify({'error': 'Проект не найден'}), 404
+    pdf_bytes, filename = build_project_pdf(db, project, page_type, request.args.get('epics'),
+                                            request.args.get('showDone') == '1')
+    filename_ascii = filename.encode('ascii', 'replace').decode('ascii')
+    return Response(pdf_bytes, mimetype='application/pdf',
+                    headers={'Content-Disposition': f"attachment; filename=\"{filename_ascii}\"; filename*=UTF-8''{quote(filename)}"})
+
+
+def build_project_pdf(db, project, page_type, epics_arg=None, show_done=False):
+    """PDF-отчёт раздела → (байты, имя файла). epics_arg — выбранные эпики дашборда («1,2»), show_done — сданные в своде."""
+    pid = project['id']
     services = db.execute('SELECT * FROM services WHERE project_id = ? ORDER BY sort_order, id', (pid,)).fetchall()
     service_ids = [s['id'] for s in services]
     entries = []
@@ -2070,11 +2809,10 @@ def api_export_pdf(pid):
                      db.execute('SELECT * FROM stage_targets WHERE project_id = ?', (pid,)).fetchall()}
 
     # Фильтры интерфейса: выбранные эпики дашборда, учёт сданных эпиков в своде по этапам
-    epics_arg = request.args.get('epics')
     if page_type == 'dashboard' and epics_arg is not None:
         selected = {int(x) for x in epics_arg.split(',') if x.strip().isdigit()}
         services = [s for s in services if s['id'] in selected]
-    elif page_type == 'stages' and request.args.get('showDone') != '1':
+    elif page_type == 'stages' and not show_done:
         services = [s for s in services if not s['is_done']]
 
     by_service = {}
@@ -2223,11 +2961,8 @@ def api_export_pdf(pid):
                       for e in svc_e]
             _pdf_table(pdf, ['Дата', 'Остаток, ч', 'Затрачено, ч', 'Оценка, ч'], d_rows)
 
-    pdf_bytes = pdf.output()
     filename = f"Burndown_{PDF_PAGES[page_type][1]}_{datetime.now().strftime('%Y-%m-%d_%H%M')}.pdf"
-    filename_ascii = filename.encode('ascii', 'replace').decode('ascii')
-    return Response(bytes(pdf_bytes), mimetype='application/pdf',
-                    headers={'Content-Disposition': f"attachment; filename=\"{filename_ascii}\"; filename*=UTF-8''{quote(filename)}"})
+    return bytes(pdf.output()), filename
 
 
 PDF_PAGES = {

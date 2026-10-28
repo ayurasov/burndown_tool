@@ -46,6 +46,7 @@
       <a href="#" class="nav-item" data-view="settings" id="navSettings">Настройки проекта</a>
       <a href="#" class="nav-item" data-view="jira" id="navJira">Связь с Jira</a>
       <a href="#" class="nav-item" data-view="autofill" id="navAutofill">Автозаполнение</a>
+      <a href="#" class="nav-item" data-view="notify" id="navNotify">Уведомления</a>
     </nav>
 
     <nav class="nav-group" id="adminNav" style="display:none;">
@@ -53,6 +54,7 @@
       <a href="#" class="nav-item" data-view="users" id="navUsers">Пользователи</a>
       <a href="#" class="nav-item" data-view="projects" id="navProjects">Проекты</a>
       <a href="#" class="nav-item" data-view="audit" id="navAudit">Реестр изменений</a>
+      <a href="#" class="nav-item" data-view="notifyAdmin" id="navNotifyAdmin">Рассылки</a>
     </nav>
 
     <div class="sidebar-actions">
@@ -381,6 +383,130 @@
           </div>
         </div>
         <div id="autofillList" class="autofill-list"></div>
+      </div>
+    </section>
+
+    <!-- УВЕДОМЛЕНИЯ ПОЛЬЗОВАТЕЛЯ ПО ПРОЕКТУ -->
+    <section class="view" id="view-notify">
+      <form id="notifyForm" novalidate>
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Куда присылать</div>
+              <div class="section-note">Каналы общие для всех ваших подписок; выберите, какие использовать для этого проекта.</div>
+            </div>
+          </div>
+          <div class="notify-channels">
+            <div class="notify-channel">
+              <label class="quick-filter-item"><input type="checkbox" id="nfViaEmail"> Почта</label>
+              <div class="notify-channel-state" id="nfEmailState"></div>
+            </div>
+            <div class="notify-channel">
+              <label class="quick-filter-item"><input type="checkbox" id="nfViaTelegram"> Telegram</label>
+              <div class="notify-channel-state" id="nfTelegramState"></div>
+              <div class="notify-channel-actions">
+                <button type="button" class="btn btn-ghost btn-sm" id="nfTelegramLink">Привязать Telegram</button>
+                <button type="button" class="btn btn-ghost btn-sm" id="nfTelegramUnlink" hidden>Отвязать</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Дайджест</div>
+              <div class="section-note">Сводка по проекту по расписанию: статусы эпиков, остаток, прогноз, шанс успеть и что изменилось с прошлого дайджеста.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="nfDigestOn"> <span>Дайджест включён</span></label>
+          </div>
+          <div class="notify-grid">
+            <div class="setting-item"><span class="field-label">Дни недели</span><div class="weekday-picker" id="nfDays"></div></div>
+            <div class="setting-item"><label class="small" for="nfTime">Время</label><input type="time" id="nfTime"></div>
+            <div class="setting-item"><label class="small" for="nfTz">Часовой пояс</label><select id="nfTz"></select></div>
+          </div>
+          <label class="quick-filter-item"><input type="checkbox" id="nfPdf"> Прикладывать PDF дашборда</label>
+          <dl class="autofill-status" id="nfDigestStatus"></dl>
+          <div class="form-actions">
+            <button type="button" class="btn btn-ghost btn-sm" id="nfPreview">Предпросмотр</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="nfSendNow">Отправить сейчас</button>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Оповещения</div>
+              <div class="section-note">Сообщение сразу, когда в проекте что-то ухудшилось. Проверка — после каждого изменения данных или среза из Jira.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="nfAlertsOn"> <span>Оповещения включены</span></label>
+          </div>
+          <div class="notify-alerts" id="nfAlertTypes">
+            <label class="quick-filter-item"><input type="checkbox" data-type="status"> Статус эпика или этапа ухудшился (Успеваем → Риск → Не успеваем)</label>
+            <label class="quick-filter-item"><input type="checkbox" data-type="chance"> Шанс успеть опустился ниже <input type="number" id="nfChance" min="1" max="99" class="inline-number" aria-label="Порог шанса, %"> %</label>
+            <label class="quick-filter-item"><input type="checkbox" data-type="scope"> Объём задач Jira эпика вырос больше чем на <input type="number" id="nfScope" min="1" max="1000" class="inline-number" aria-label="Порог роста объёма, %"> % за срез</label>
+            <label class="quick-filter-item"><input type="checkbox" data-type="problems"> Стало больше задач Jira с неполными данными</label>
+            <label class="quick-filter-item"><input type="checkbox" data-type="autofill"> Автозаполнение не выполнено (ошибка Jira)</label>
+          </div>
+        </div>
+        <div class="form-actions notify-save">
+          <button type="submit" class="btn btn-primary" id="nfSave">Сохранить</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- ADMIN: РАССЫЛКИ -->
+    <section class="view" id="view-notifyAdmin">
+      <form id="notifyAdminForm" novalidate autocomplete="off">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Почта (SMTP)</div>
+              <div class="section-note">Сервер, через который Burndown отправляет дайджесты и оповещения. Пароль хранится зашифрованным и в интерфейс не возвращается.</div>
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="setting-item"><label class="small" for="naHost">Сервер</label><input type="text" id="naHost" placeholder="smtp.company.ru"></div>
+            <div class="setting-item"><label class="small" for="naPort">Порт</label><input type="number" id="naPort" min="1" max="65535" placeholder="587"></div>
+            <div class="setting-item"><label class="small" for="naSecurity">Защита соединения</label>
+              <select id="naSecurity"><option value="starttls">STARTTLS (обычно порт 587)</option><option value="ssl">SSL/TLS (обычно порт 465)</option><option value="none">Без шифрования (порт 25, только внутри сети)</option></select></div>
+            <div class="setting-item"><label class="small" for="naSender">Адрес отправителя</label><input type="email" id="naSender" placeholder="burndown@company.ru"></div>
+            <div class="setting-item"><label class="small" for="naLogin">Логин</label><input type="text" id="naLogin" autocomplete="off" placeholder="если сервер требует входа"></div>
+            <div class="setting-item"><label class="small" for="naPassword">Пароль</label><input type="password" id="naPassword" autocomplete="new-password"></div>
+          </div>
+          <div class="form-actions">
+            <input type="email" id="naTestTo" class="filter-input" placeholder="куда отправить тест" aria-label="Email для тестового письма">
+            <button type="button" class="btn btn-ghost btn-sm" id="naTestEmail">Отправить тестовое письмо</button>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Telegram-бот</div>
+              <div class="section-note">Создайте бота у @BotFather и вставьте его токен. Пользователи привязывают Telegram в разделе «Уведомления» проекта.</div>
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="setting-item"><label class="small" for="naToken">Токен бота</label><input type="password" id="naToken" autocomplete="new-password"></div>
+            <div class="setting-item"><span class="field-label">Состояние</span><div class="jira-status" id="naBotStatus"></div></div>
+          </div>
+          <div class="form-actions">
+            <button type="button" class="btn btn-danger btn-sm" id="naBotRemove" hidden>Отключить бота</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="naBotTest">Проверить бота</button>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Адрес Burndown</div>
+              <div class="section-note">Ссылка «Открыть Burndown» в письмах и сообщениях.</div>
+            </div>
+          </div>
+          <div class="form-grid"><div class="setting-item"><label class="small" for="naUrl">Адрес</label><input type="url" id="naUrl" placeholder="https://burndown.company.ru"></div></div>
+          <div class="form-actions"><button type="submit" class="btn btn-primary btn-sm" id="naSave">Сохранить настройки</button></div>
+        </div>
+      </form>
+      <div class="panel">
+        <div class="panel-head"><div class="panel-title">Журнал отправок</div><button type="button" class="btn btn-ghost btn-sm" id="naLogReload">Обновить</button></div>
+        <div class="table-scroll"><table class="data-table" id="notifyLogTable"></table></div>
       </div>
     </section>
 

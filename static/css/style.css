@@ -517,3 +517,17 @@ table.jira-map-table{min-width:560px;}
 #jiraCompTable tr.total-row td,#stageJiraTable tr.total-row td{font-weight:600;}
 #stageJiraTable tr.clickable:hover td{background:var(--color-surface-offset);}
 #stageJiraTable tr.clickable:focus-visible{outline:2px solid var(--color-primary);outline-offset:-2px;}
+
+/* Уведомления */
+.notify-channels{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:var(--space-4);}
+.notify-channel{display:flex;flex-direction:column;gap:var(--space-2);padding:var(--space-3);border:1px solid var(--color-divider);border-radius:var(--radius-md);background:var(--color-surface-2);}
+.notify-channel-state{font-size:var(--text-sm);}
+.notify-channel-actions{display:flex;gap:var(--space-2);flex-wrap:wrap;}
+.notify-grid{display:grid;grid-template-columns:auto 140px minmax(180px,260px);gap:var(--space-3) var(--space-4);align-items:end;margin-bottom:var(--space-3);}
+.notify-alerts{display:flex;flex-direction:column;gap:var(--space-2);}
+.inline-number{width:4.5rem;min-height:2rem;padding:2px var(--space-2);margin:0 var(--space-1);text-align:right;}
+.notify-save{position:sticky;bottom:0;padding:var(--space-3) 0;background:linear-gradient(transparent,var(--color-bg) 35%);}
+.digest-preview{width:100%;height:60vh;border:1px solid var(--color-divider);border-radius:var(--radius-md);background:#fff;}
+.telegram-steps{margin:0 0 var(--space-3);padding-left:1.4em;display:flex;flex-direction:column;gap:var(--space-2);word-break:break-all;}
+#view-notify .panel-head .switch{flex-shrink:0;}
+@media (max-width:720px){.notify-grid{grid-template-columns:1fr;}}
