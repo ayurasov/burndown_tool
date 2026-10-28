@@ -7,7 +7,8 @@
       [папка]
         ABC-3 (103)        0,5 ч / — / 1 ч
     ABC-4 (104)            10 ч / 0 / 10 ч  (соседний корень, не входит в поддерево ABC-1)
-У ABC-1 агрегатные поля (с подзадачами): 14 ч / 7 ч / 18 ч. ABC-5 (106) — вне структуры.
+ABC-6 (107) — подзадача ABC-1 вне структуры: 4 ч / 2 ч / 6 ч (с ней ABC-1 даёт 14 / 7 / 18).
+ABC-5 (106) — вне структуры. customfield_10050 — числовое поле «Трудозатраты, ч» (в часах).
 """
 
 import base64
@@ -20,13 +21,23 @@ from werkzeug.serving import make_server
 H = 3600
 ISSUES = {
     101: {'key': 'ABC-1', 'timeestimate': 10 * H, 'timespent': 5 * H, 'timeoriginalestimate': 12 * H,
-          'aggregatetimeestimate': 14 * H, 'aggregatetimespent': 7 * H, 'aggregatetimeoriginalestimate': 18 * H},
+          'customfield_10050': 20, 'customfield_10060': 'текст'},
     102: {'key': 'ABC-2', 'timeestimate': 2 * H, 'timespent': 1 * H, 'timeoriginalestimate': 3 * H},
     103: {'key': 'ABC-3', 'timeestimate': H // 2, 'timespent': None, 'timeoriginalestimate': 1 * H},
     104: {'key': 'ABC-4', 'timeestimate': 10 * H, 'timespent': 0, 'timeoriginalestimate': 10 * H},
     105: {'key': 'ABC-9', 'hidden': True, 'timeestimate': 100 * H},
     106: {'key': 'ABC-5', 'timeestimate': 1 * H, 'timespent': 1 * H, 'timeoriginalestimate': 2 * H},
+    107: {'key': 'ABC-6', 'parent': 'ABC-1', 'timeestimate': 4 * H, 'timespent': 2 * H, 'timeoriginalestimate': 6 * H,
+          'customfield_10050': 5.5},
 }
+FIELDS = [
+    {'id': 'summary', 'name': 'Тема', 'custom': False, 'schema': {'type': 'string'}},
+    {'id': 'timeestimate', 'name': 'Remaining Estimate', 'custom': False, 'schema': {'type': 'number'}},
+    {'id': 'timespent', 'name': 'Time Spent', 'custom': False, 'schema': {'type': 'number'}},
+    {'id': 'timeoriginalestimate', 'name': 'Original Estimate', 'custom': False, 'schema': {'type': 'number'}},
+    {'id': 'customfield_10050', 'name': 'Трудозатраты, ч', 'custom': True, 'schema': {'type': 'number'}},
+    {'id': 'customfield_10060', 'name': 'Комментарий', 'custom': True, 'schema': {'type': 'string'}},
+]
 FORMULA = '1:0:101,2:1:102,6:1:105,3:1:5/9,4:2:103,5:0:104'
 STRUCTURES = [{'id': 7, 'name': 'Релиз 2026'}, {'id': 8, 'name': 'Бэклог'}]
 
@@ -70,7 +81,12 @@ def create_app(state):
 
     def search():
         body = request.get_json()
-        ids = [int(x) for x in re.findall(r'\d+', body['jql'])]
+        parents = re.match(r'parent in \(([^)]*)\)', body['jql'])
+        if parents:
+            keys = {k.strip() for k in parents.group(1).split(',')}
+            ids = [i for i, d in ISSUES.items() if d.get('parent') in keys]
+        else:
+            ids = [int(x) for x in re.findall(r'\d+', body['jql'])]
         issues = [_issue_json(i, body['fields']) for i in ids if i in ISSUES and not ISSUES[i].get('hidden')]
         state['search_bodies'].append(body)
         return jsonify({'issues': issues, 'total': len(issues)})
@@ -82,6 +98,10 @@ def create_app(state):
     @app.post('/rest/api/3/search/jql')
     def search_cloud():
         return search()
+
+    @app.get('/rest/api/<v>/field')
+    def fields(v):
+        return jsonify(FIELDS)
 
     @app.get('/rest/structure/2.0/structure')
     def structures():

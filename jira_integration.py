@@ -7,11 +7,11 @@
   - опция «не проверять TLS-сертификат» для корпоративных/самоподписанных сертификатов;
   - прокси берётся из переменных окружения сервера (HTTPS_PROXY и т. п.).
 
-Срез по эпику: для заданных задач берутся поля учёта времени Jira
-(timeestimate — остаток, timespent — затрачено, timeoriginalestimate — оценка; в секундах)
-и суммируются в часы. Если у кнопки указана структура и включено «с вложенными»,
-суммируются все задачи поддерева этих задач в структуре (каждая задача — один раз);
-без структуры «с вложенными» означает задачу вместе с подзадачами (агрегатные поля Jira).
+Срез по эпику: для заданных задач берутся поля Jira, сопоставленные метрикам кнопки
+(по умолчанию учёт времени: timeestimate — остаток, timespent — затрачено,
+timeoriginalestimate — оценка; в секундах), и суммируются в часы. Если у кнопки указана
+структура и включено «с вложенными», суммируются все задачи поддерева этих задач в структуре
+(каждая задача — один раз); без структуры «с вложенными» — задача вместе с подзадачами.
 """
 
 import base64
@@ -24,10 +24,16 @@ from cryptography.fernet import Fernet, InvalidToken
 
 INSTANCE_TYPES = ('cloud', 'server', 'server_basic')
 ISSUE_KEY_RE = re.compile(r'^[A-Z][A-Z0-9_]*-\d+$')
+METRICS = ('remaining', 'spent', 'estimate')
 TIME_FIELDS = {'remaining': 'timeestimate', 'spent': 'timespent', 'estimate': 'timeoriginalestimate'}
-AGGREGATE_FIELDS = {'remaining': 'aggregatetimeestimate', 'spent': 'aggregatetimespent',
-                    'estimate': 'aggregatetimeoriginalestimate'}
+TIME_FIELD_NAMES = {'timeestimate': 'Оставшаяся оценка', 'timespent': 'Затраченное время',
+                    'timeoriginalestimate': 'Первоначальная оценка'}
+# единица значения поля Jira → множитель для перевода в часы
+UNITS = {'seconds': 1 / 3600, 'hours': 1.0}
+DEFAULT_FIELD_MAP = {m: {'field': TIME_FIELDS[m], 'unit': 'seconds'} for m in METRICS}
+FIELD_ID_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]*$')
 SEARCH_BATCH = 100
+SEARCH_LIMIT = 5000
 MAX_ATTEMPTS = 3
 
 
@@ -111,8 +117,36 @@ def subtree_issue_ids(rows, root_issue_id):
 
 def seconds_to_hours(values):
     """Сумма секунд в часы (2 знака); None, если ни у одной задачи поле не заполнено."""
-    filled = [v for v in values if isinstance(v, (int, float))]
-    return round(sum(filled) / 3600, 2) if filled else None
+    return sum_hours(values, 'seconds')
+
+
+def sum_hours(values, unit):
+    """Сумма числовых значений поля в часах (2 знака); None, если ни у одной задачи поле не заполнено."""
+    filled = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    return round(sum(filled) * UNITS[unit], 2) if filled else None
+
+
+def normalize_field_map(raw):
+    """Проверенное сопоставление метрик и полей: {metric: {'field': id|'', 'unit': 'seconds'|'hours'}}.
+
+    Пустое поле — метрику не заполнять. Некорректные значения → ValueError с понятным текстом.
+    """
+    raw = raw or {}
+    out = {}
+    for metric in METRICS:
+        item = raw.get(metric, DEFAULT_FIELD_MAP[metric])
+        if not isinstance(item, dict):
+            raise ValueError('Некорректное сопоставление полей')
+        field = (item.get('field') or '').strip()
+        unit = item.get('unit') or 'seconds'
+        if field and not FIELD_ID_RE.match(field):
+            raise ValueError(f'Некорректный идентификатор поля Jira: {field}')
+        if unit not in UNITS:
+            raise ValueError('Единица измерения — секунды или часы')
+        out[metric] = {'field': field, 'unit': unit}
+    if not any(v['field'] for v in out.values()):
+        raise ValueError('Сопоставьте с полями Jira хотя бы одну метрику')
+    return out
 
 
 # ─── HTTP-клиент Jira ────────────────────────────────────────────
@@ -216,17 +250,47 @@ class JiraClient:
         self.check(resp, url)
         return resp.json()
 
+    def search(self, jql, fields):
+        """Все задачи по JQL (постранично: startAt в Server/DC, nextPageToken в Cloud) → {id: fields}."""
+        out = {}
+        start_at, token = 0, None
+        while True:
+            body = {'jql': jql, 'fields': list(fields), 'maxResults': SEARCH_BATCH}
+            if self.cloud:
+                if token:
+                    body['nextPageToken'] = token
+            else:
+                body['startAt'] = start_at
+            data = self.json('POST', self.api('search/jql' if self.cloud else 'search'), json=body)
+            issues = data.get('issues', [])
+            for issue in issues:
+                out[int(issue['id'])] = issue.get('fields') or {}
+            start_at += len(issues)
+            token = data.get('nextPageToken')
+            more = bool(token) if self.cloud else start_at < (data.get('total') or 0)
+            if not issues or not more or len(out) >= SEARCH_LIMIT:
+                return out
+
     def issues_by_ids(self, ids, fields):
         """{id: fields} для задач по ID (пакетами); недоступные пользователю задачи пропускаются."""
         out = {}
         ids = sorted(set(ids))
         for start in range(0, len(ids), SEARCH_BATCH):
             batch = ids[start:start + SEARCH_BATCH]
-            body = {'jql': 'id in (%s)' % ','.join(str(i) for i in batch), 'fields': list(fields),
-                    'maxResults': SEARCH_BATCH}
-            data = self.json('POST', self.api('search/jql' if self.cloud else 'search'), json=body)
-            for issue in data.get('issues', []):
-                out[int(issue['id'])] = issue.get('fields') or {}
+            out.update(self.search('id in (%s)' % ','.join(str(i) for i in batch), fields))
+        return out
+
+    def list_fields(self):
+        """Поля Jira, пригодные для среза: учёт времени и числовые (в т. ч. пользовательские)."""
+        data = self.json('GET', self.api('field'))
+        out = []
+        for f in data if isinstance(data, list) else []:
+            fid = f.get('id') or ''
+            ftype = (f.get('schema') or {}).get('type')
+            if fid in TIME_FIELD_NAMES or ftype == 'number':
+                out.append({'id': fid, 'name': TIME_FIELD_NAMES.get(fid) or f.get('name') or fid,
+                            'custom': bool(f.get('custom')), 'time': fid in TIME_FIELD_NAMES})
+        out.sort(key=lambda f: (not f['time'], f['name'].lower()))
         return out
 
 
@@ -244,14 +308,15 @@ def _error_text(resp):
 
 # ─── Расчёт среза ────────────────────────────────────────────────
 
-def compute_snapshot(client, structure_id, mappings):
+def compute_snapshot(client, structure_id, mappings, field_map=None):
     """Срез для кнопки.
 
     mappings: [{'serviceId', 'issueKeys': 'ABC-1, ABC-2', 'includeSubtree': bool}]
+    field_map: {metric: {'field', 'unit'}} (по умолчанию — учёт времени Jira)
     → [{'serviceId', 'remaining', 'spent', 'estimate', 'issueCount', 'warnings': [...]}]
     """
-    plain_fields = list(TIME_FIELDS.values())
-    root_fields = plain_fields + list(AGGREGATE_FIELDS.values())
+    field_map = field_map or DEFAULT_FIELD_MAP
+    fields = sorted({v['field'] for v in field_map.values() if v['field']})
     rows = None  # дерево структуры загружается один раз и только если нужно
     results = []
     for m in mappings:
@@ -262,18 +327,19 @@ def compute_snapshot(client, structure_id, mappings):
 
         roots = []
         for key in keys:
-            issue = client.issue(key, root_fields)
+            issue = client.issue(key, fields)
             if issue is None:
                 warnings.append(f'{key}: задача не найдена или нет прав на просмотр')
                 continue
             roots.append((key, int(issue['id']), issue.get('fields') or {}))
+        for _key, issue_id, root_fields in roots:
+            per_issue[issue_id] = root_fields
 
-        if structure_id and subtree:
+        if subtree and roots and structure_id:
             if rows is None:
                 rows = client.forest_rows(structure_id)
             need = set()
-            for key, issue_id, fields in roots:
-                per_issue[issue_id] = fields
+            for key, issue_id, _f in roots:
                 ids = subtree_issue_ids(rows, issue_id)
                 if ids is None:
                     warnings.append(f'{key}: задачи нет в структуре — учтена только она сама')
@@ -281,18 +347,24 @@ def compute_snapshot(client, structure_id, mappings):
                     need |= ids
             missing = need - set(per_issue)
             if missing:
-                found = client.issues_by_ids(missing, plain_fields)
+                found = client.issues_by_ids(missing, fields)
                 per_issue.update(found)
                 if len(found) < len(missing):
                     warnings.append(f'{len(missing) - len(found)} задач(и) структуры недоступны для просмотра — не учтены')
-            values = {name: seconds_to_hours([f.get(field) for f in per_issue.values()])
-                      for name, field in TIME_FIELDS.items()}
-        else:
-            src = AGGREGATE_FIELDS if subtree else TIME_FIELDS
-            for _key, issue_id, fields in roots:
-                per_issue[issue_id] = fields
-            values = {name: seconds_to_hours([f.get(field) for f in per_issue.values()])
-                      for name, field in src.items()}
+        elif subtree and roots:
+            children = client.search('parent in (%s)' % ', '.join(k for k, _i, _f in roots), fields)
+            per_issue.update({i: f for i, f in children.items() if i not in per_issue})
+
+        values = {}
+        for metric in METRICS:
+            spec = field_map[metric]
+            if not spec['field']:
+                values[metric] = None
+                continue
+            raw = [f.get(spec['field']) for f in per_issue.values()]
+            values[metric] = sum_hours(raw, spec['unit'])
+            if values[metric] is None and any(v not in (None, '') for v in raw):
+                warnings.append(f"Поле {spec['field']} не числовое — метрика не заполнена")
 
         if not keys and not invalid:
             warnings.append('Не указаны задачи')

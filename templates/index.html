@@ -45,6 +45,7 @@
       <a href="#" class="nav-item" data-view="services">Эпики (блоки задач)</a>
       <a href="#" class="nav-item" data-view="settings" id="navSettings">Настройки проекта</a>
       <a href="#" class="nav-item" data-view="jira" id="navJira">Связь с Jira</a>
+      <a href="#" class="nav-item" data-view="autofill" id="navAutofill">Автозаполнение</a>
     </nav>
 
     <nav class="nav-group" id="adminNav" style="display:none;">
@@ -307,6 +308,19 @@
           <button type="button" class="btn btn-primary btn-sm" id="jiraAddButton">+ Новая кнопка</button>
         </div>
         <div class="table-scroll"><table class="data-table" id="jiraButtonsTable"></table></div>
+      </div>
+    </section>
+
+    <!-- АВТОЗАПОЛНЕНИЕ -->
+    <section class="view" id="view-autofill">
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Автозаполнение замеров по расписанию</div>
+            <div class="section-note">В заданные дни и время сервер сам забирает срез по кнопке и сохраняет замер на текущую дату — без участия пользователя. Расписание включается для кнопки после её первого успешного среза.</div>
+          </div>
+        </div>
+        <div id="autofillList" class="autofill-list"></div>
       </div>
     </section>
 

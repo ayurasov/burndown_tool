@@ -1538,6 +1538,7 @@ function updateRoleUI(){
   ['navUsers','navProjects','navAudit','btnExport'].forEach(function(id){ document.getElementById(id).style.display = admin ? '' : 'none'; });
   document.getElementById('navSettings').style.display = canEdit() ? '' : 'none';
   document.getElementById('navJira').style.display = canEdit() ? '' : 'none';
+  document.getElementById('navAutofill').style.display = canEdit() ? '' : 'none';
   document.getElementById('sectionsNav').style.display = currentProjectId ? '' : 'none';
   if(currentUser){
     document.getElementById('userInfo').innerHTML = userAvatarHtml(currentUser, 'avatar')+
@@ -1560,6 +1561,7 @@ var titles = {
   services: ['Эпики (блоки задач)', 'Список эпиков проекта и целевых дат'],
   settings: ['Настройки проекта', 'Параметры прогноза и расчёта burn rate'],
   jira: ['Связь с Jira', 'Подключение и кнопки среза данных из Structure'],
+  autofill: ['Автозаполнение', 'Срез из Jira по расписанию'],
   users: ['Управление пользователями', 'Пользователи, роли и доступ к проектам'],
   projects: ['Управление проектами', 'Создание, редактирование и удаление проектов'],
   audit: ['Реестр изменений', 'Журнал всех изменений с фильтрами']
@@ -1573,7 +1575,7 @@ function projectTitleSuffix(){
 function navigate(view){
   var isAdminView = ADMIN_VIEWS.indexOf(view) !== -1;
   if(isAdminView && !isGlobalAdmin()) view = 'dashboard';
-  if((view === 'settings' || view === 'jira') && !canEdit()) view = 'dashboard';
+  if(['settings', 'jira', 'autofill'].indexOf(view) !== -1 && !canEdit()) view = 'dashboard';
   if(!isAdminView && !currentProjectId && isGlobalAdmin()) view = 'projects';
   currentView = view;
   navItems.forEach(function(n){ n.classList.toggle('active', n.dataset.view === view); });
@@ -1584,7 +1586,7 @@ function navigate(view){
     pageSub.textContent = titles[view][1] + (ADMIN_VIEWS.indexOf(view) === -1 ? projectTitleSuffix() : '');
   }
   var renderers = {dashboard:renderDashboard, stages:renderStagesView, data:renderDataView, services:renderServicesView,
-    settings:renderSettingsView, jira:renderJiraView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); }};
+    settings:renderSettingsView, jira:renderJiraView, autofill:renderAutofillView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); }};
   if(renderers[view] && (currentProjectId || ADMIN_VIEWS.indexOf(view) !== -1)) renderers[view]();
   var reportView = PDF_VIEWS.indexOf(view) !== -1 && currentProjectId;
   document.getElementById('btnPdf').style.display = reportView ? '' : 'none';
@@ -1831,6 +1833,7 @@ function loadJiraConfig(){
     STATE.jira = data;
     renderJiraSnapshotButtons();
     if(currentView === 'jira') renderJiraView();
+    if(currentView === 'autofill') renderAutofillView();
   }).catch(function(){});
 }
 
@@ -1859,6 +1862,10 @@ function runJiraSnapshot(bid, btn){
     /* порядок эпиков — как в проекте */
     STATE.services.forEach(function(s){ if(prefill[s.id]) services.push(s); });
     var b = data.button;
+    var before = jiraButtonById(b.id);
+    replaceJiraButton(b);
+    if(b.lastSuccessAt && before && !before.lastSuccessAt)
+      toast('Первый срез получен — для кнопки доступно автозаполнение по расписанию');
     openBulkMeasurement({
       title: 'Срез из Jira: ' + b.name,
       services: services, prefill: prefill, notes: notes,
@@ -1868,6 +1875,16 @@ function runJiraSnapshot(bid, btn){
   }).catch(function(){}).then(function(){
     if(btn){ btn.disabled = false; btn.textContent = label; }
   });
+}
+
+function jiraButtonById(id){
+  return STATE.jira ? STATE.jira.buttons.find(function(b){ return b.id === id; }) : null;
+}
+function replaceJiraButton(saved){
+  if(!STATE.jira) return;
+  STATE.jira.buttons = STATE.jira.buttons.map(function(x){ return x.id === saved.id ? saved : x; });
+  if(currentView === 'jira') renderJiraButtonsTable();
+  if(currentView === 'autofill') renderAutofillView();
 }
 
 function renderJiraView(){
@@ -1954,11 +1971,13 @@ function renderJiraButtonsTable(){
     return;
   }
   var serviceName = function(id){ var s = serviceById(id); return s ? s.name : '—'; };
-  table.innerHTML = '<thead><tr><th>Кнопка</th><th>Структура</th><th>Эпики и задачи</th><th></th></tr></thead><tbody>' +
+  table.innerHTML = '<thead><tr><th>Кнопка</th><th>Структура</th><th>Эпики и задачи</th><th>Поля Jira</th><th></th></tr></thead><tbody>' +
     buttons.map(function(b){
-      return '<tr data-bid="'+b.id+'"><td><b>'+escapeHtml(b.name)+'</b></td>'+
+      var auto = b.schedule && b.schedule.enabled ? '<div class="muted-cell">автозаполнение: ' + escapeHtml(scheduleSummary(b.schedule)) + '</div>' : '';
+      return '<tr data-bid="'+b.id+'"><td><b>'+escapeHtml(b.name)+'</b>'+auto+'</td>'+
         '<td>'+(b.structureId ? escapeHtml(b.structureName || ('Структура ' + b.structureId)) + ' <span class="muted-cell">#'+b.structureId+'</span>' : '<span class="muted-cell">без структуры</span>')+'</td>'+
         '<td>'+b.mappings.map(function(m){ return '<div class="jira-map-line"><span>'+escapeHtml(serviceName(m.serviceId))+'</span> ← <span class="mono">'+escapeHtml(m.issueKeys)+'</span>'+(m.includeSubtree ? ' <span class="muted-cell">с вложенными</span>' : '')+'</div>'; }).join('')+'</td>'+
+        '<td>'+fieldMapSummary(b.fieldMap)+'</td>'+
         '<td class="row-actions"><button type="button" class="btn btn-ghost btn-sm" data-action="snapshot"'+(connected ? '' : ' disabled title="Нет подключения к Jira"')+'>⇣ Срез</button>'+
           actionBtn('edit','Редактировать',ICON_EDIT)+actionBtn('delete','Удалить',ICON_DELETE)+'</td></tr>';
     }).join('') + '</tbody>';
@@ -1987,8 +2006,36 @@ function renderJiraButtonsTable(){
 document.getElementById('jiraAddButton').addEventListener('click', function(){ openJiraButtonEditor(null); });
 
 /* Редактор кнопки: структура + ассоциации «эпик ← задачи Jira» */
+var JIRA_METRICS = [['remaining', 'Остаток'], ['spent', 'Затрачено'], ['estimate', 'Оценка']];
+var JIRA_TIME_FIELDS = [{id: 'timeestimate', name: 'Оставшаяся оценка', time: true},
+  {id: 'timespent', name: 'Затраченное время', time: true},
+  {id: 'timeoriginalestimate', name: 'Первоначальная оценка', time: true}];
+var JIRA_DEFAULT_FIELD_MAP = {remaining: {field: 'timeestimate', unit: 'seconds'}, spent: {field: 'timespent', unit: 'seconds'},
+  estimate: {field: 'timeoriginalestimate', unit: 'seconds'}};
+
+function fieldMapSummary(fm){
+  fm = fm || JIRA_DEFAULT_FIELD_MAP;
+  return JIRA_METRICS.map(function(m){
+    var f = fm[m[0]] || {};
+    var known = JIRA_TIME_FIELDS.find(function(t){ return t.id === f.field; });
+    return '<div class="jira-map-line"><span>'+m[1]+'</span> ← '+(f.field ? '<span class="mono">'+escapeHtml(known ? known.name : f.field)+'</span>'+(f.unit === 'hours' ? ' <span class="muted-cell">ч</span>' : '') : '<span class="muted-cell">не заполняется</span>')+'</div>';
+  }).join('');
+}
+
+function fieldOptions(fields, selected){
+  var opts = '<option value="">— не заполнять —</option>';
+  var seen = !selected;
+  fields.forEach(function(f){
+    if(f.id === selected) seen = true;
+    opts += '<option value="'+escapeAttr(f.id)+'" data-time="'+(f.time ? 1 : 0)+'"'+(f.id === selected ? ' selected' : '')+'>'+escapeHtml(f.name)+(f.time ? '' : ' ('+escapeHtml(f.id)+')')+'</option>';
+  });
+  if(!seen) opts += '<option value="'+escapeAttr(selected)+'" data-time="0" selected>'+escapeHtml(selected)+'</option>';
+  return opts;
+}
+
 function openJiraButtonEditor(button){
-  var b = button || {name: '', structureId: null, structureName: '', mappings: []};
+  var b = button || {name: '', structureId: null, structureName: '', mappings: [], fieldMap: JIRA_DEFAULT_FIELD_MAP};
+  var fieldMap = b.fieldMap || JIRA_DEFAULT_FIELD_MAP;
   var mapOf = {};
   b.mappings.forEach(function(m){ mapOf[m.serviceId] = m; });
   var structureOptions = function(list, selectedId){
@@ -2011,6 +2058,16 @@ function openJiraButtonEditor(button){
           '<button type="button" class="btn btn-ghost btn-sm" id="jbLoadStructures">Загрузить из Jira</button></div>'+
           '<input type="number" id="jbStructureId" min="1" placeholder="ID структуры" hidden></div>'+
       '</div>'+
+      '<div class="jira-fields"><div class="jira-fields-head"><span class="small">Поля Jira для показателей замера</span>'+
+        '<button type="button" class="btn btn-ghost btn-sm" id="jbLoadFields">Загрузить поля из Jira</button></div>'+
+        '<div class="jira-fields-grid" id="jbFields">'+JIRA_METRICS.map(function(m){
+          var f = fieldMap[m[0]] || {field: '', unit: 'seconds'};
+          return '<label class="small" for="jbField_'+m[0]+'">'+m[1]+'</label>'+
+            '<select id="jbField_'+m[0]+'" data-metric="'+m[0]+'">'+fieldOptions(JIRA_TIME_FIELDS, f.field)+'</select>'+
+            '<select id="jbUnit_'+m[0]+'" aria-label="Единица: '+m[1]+'"><option value="seconds"'+(f.unit !== 'hours' ? ' selected' : '')+'>в секундах (учёт времени Jira)</option>'+
+              '<option value="hours"'+(f.unit === 'hours' ? ' selected' : '')+'>в часах</option></select>';
+        }).join('')+'</div>'+
+        '<p class="bulk-note">Значения суммируются по всем задачам эпика. Стандартные поля учёта времени Jira хранятся в секундах; для своих числовых полей выберите единицу, в которой они заполняются.</p></div>'+
       '<p class="bulk-note">Укажите для эпиков задачи Jira (ключи через запятую). «С вложенными»: со структурой — все задачи под указанными в дереве структуры, без структуры — задача вместе с подзадачами. Эпики без задач в срез не попадают.</p>'+
       '<div class="table-scroll"><table class="data-table compact-table jira-map-table" id="jbTable"><thead><tr><th>Эпик</th><th>Задачи Jira</th><th class="center">С вложенными</th></tr></thead><tbody>'+
       STATE.services.map(function(s){
@@ -2035,13 +2092,18 @@ function openJiraButtonEditor(button){
         if(keys) mappings.push({serviceId: parseInt(tr.dataset.sid, 10), issueKeys: keys,
                                 includeSubtree: tr.querySelector('[data-field="subtree"]').checked});
       });
+      var fm = {};
+      JIRA_METRICS.forEach(function(m){
+        fm[m[0]] = {field: document.getElementById('jbField_'+m[0]).value, unit: document.getElementById('jbUnit_'+m[0]).value};
+      });
       var body = {name: document.getElementById('jbName').value.trim(), structureId: structureId,
-                  structureName: structureName, mappings: mappings};
+                  structureName: structureName, mappings: mappings, fieldMap: fm};
       if(!body.name){ toast('Укажите название кнопки'); return false; }
+      if(!JIRA_METRICS.some(function(m){ return fm[m[0]].field; })){ toast('Сопоставьте с полями Jira хотя бы один показатель'); return false; }
       if(!mappings.length){ toast('Укажите задачи Jira хотя бы для одного эпика'); return false; }
       confirmOk.disabled = true;
       (button ? apiPut('/api/jira/buttons/'+button.id, body) : apiPost('/api/projects/'+currentProjectId+'/jira/buttons', body)).then(function(saved){
-        if(button) STATE.jira.buttons = STATE.jira.buttons.map(function(x){ return x.id === saved.id ? saved : x; });
+        if(button) replaceJiraButton(saved);
         else STATE.jira.buttons.push(saved);
         closeModal();
         renderJiraButtonsTable();
@@ -2050,6 +2112,25 @@ function openJiraButtonEditor(button){
       }).catch(function(){}).then(function(){ confirmOk.disabled = false; });
       return false;
     }
+  });
+  JIRA_METRICS.forEach(function(m){
+    /* поле учёта времени Jira — всегда в секундах; своё числовое поле обычно ведут в часах */
+    document.getElementById('jbField_'+m[0]).addEventListener('change', function(e){
+      var opt = e.target.selectedOptions[0];
+      if(opt && opt.value) document.getElementById('jbUnit_'+m[0]).value = opt.dataset.time === '1' ? 'seconds' : 'hours';
+    });
+  });
+  document.getElementById('jbLoadFields').addEventListener('click', function(){
+    var btn = this;
+    btn.disabled = true;
+    btn.textContent = 'Загрузка…';
+    api('/api/projects/'+currentProjectId+'/jira/fields').then(function(list){
+      JIRA_METRICS.forEach(function(m){
+        var sel = document.getElementById('jbField_'+m[0]);
+        sel.innerHTML = fieldOptions(list, sel.value);
+      });
+      toast('Числовых полей загружено: ' + list.length);
+    }).catch(function(){}).then(function(){ btn.disabled = false; btn.textContent = 'Загрузить поля из Jira'; });
   });
   var sel = document.getElementById('jbStructure');
   var manual = document.getElementById('jbStructureId');
@@ -2063,6 +2144,105 @@ function openJiraButtonEditor(button){
       sel.innerHTML = structureOptions(list, current);
       toast('Структур загружено: ' + list.length);
     }).catch(function(){}).then(function(){ btn.disabled = false; btn.textContent = 'Загрузить из Jira'; });
+  });
+}
+
+
+/* ════════════════════════════════════════════════════════════════
+   Автозаполнение: срез по кнопке по расписанию (выполняет сервер)
+════════════════════════════════════════════════════════════════ */
+var WEEKDAYS = [[1, 'Пн'], [2, 'Вт'], [3, 'Ср'], [4, 'Чт'], [5, 'Пт'], [6, 'Сб'], [7, 'Вс']];
+var TIMEZONES = ['Europe/Kaliningrad', 'Europe/Moscow', 'Europe/Samara', 'Asia/Yekaterinburg', 'Asia/Omsk',
+  'Asia/Novosibirsk', 'Asia/Krasnoyarsk', 'Asia/Irkutsk', 'Asia/Yakutsk', 'Asia/Vladivostok', 'Asia/Magadan',
+  'Asia/Kamchatka', 'Europe/Minsk', 'Asia/Almaty', 'Asia/Tashkent', 'Europe/London', 'Europe/Berlin', 'UTC'];
+
+function scheduleSummary(s){
+  var days = s.days.length === 7 ? 'ежедневно' : (s.days.join(',') === '1,2,3,4,5' ? 'по будням' :
+    WEEKDAYS.filter(function(d){ return s.days.indexOf(d[0]) !== -1; }).map(function(d){ return d[1]; }).join(', '));
+  return days + ' в ' + s.time;
+}
+function fmtLocalIso(v){
+  if(!v) return '—';
+  return v.slice(0, 10).split('-').reverse().join('.') + ' ' + v.slice(11, 16);
+}
+
+function renderAutofillView(){
+  var box = document.getElementById('autofillList');
+  var cfg = STATE.jira;
+  if(!cfg){ box.innerHTML = ''; return; }
+  if(!cfg.connection || !cfg.buttons.length){
+    box.innerHTML = '<div class="empty-cell autofill-empty">'+(!cfg.connection ?
+      'Сначала настройте подключение к Jira в разделе «Связь с Jira».' :
+      'Нет кнопок среза. Создайте кнопку в разделе «Связь с Jira», выполните по ней срез — после этого здесь можно включить расписание.')+'</div>';
+    return;
+  }
+  var browserTz = '';
+  try { browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch(e){}
+  box.innerHTML = cfg.buttons.map(function(b){
+    var s = b.schedule;
+    var locked = !b.lastSuccessAt;
+    var zones = TIMEZONES.slice();
+    [s.timezone, browserTz].forEach(function(z){ if(z && zones.indexOf(z) === -1) zones.push(z); });
+    var status = locked ?
+      '<div class="autofill-lock">🔒 Расписание станет доступно после первого успешного среза по этой кнопке. Выполните срез в разделе «Данные по датам» или «Связь с Jira».</div>' :
+      '<dl class="autofill-status">'+
+        '<dt>Последний успешный срез</dt><dd>'+fmtDateTime(b.lastSuccessAt)+'</dd>'+
+        '<dt>Последний автозапуск</dt><dd>'+(s.lastRunAt ? fmtDateTime(s.lastRunAt) + ' — <span class="autofill-result '+(s.lastStatus === 'ok' ? 'ok' : 'error')+'">'+escapeHtml(s.lastMessage || '')+'</span>' : '—')+'</dd>'+
+        '<dt>Следующий запуск</dt><dd>'+(s.enabled && s.nextRunAt ? fmtLocalIso(s.nextRunAt) + ' <span class="muted-cell">('+escapeHtml(s.timezone)+')</span>' : '<span class="muted-cell">расписание выключено</span>')+'</dd>'+
+      '</dl>';
+    return '<form class="autofill-card'+(locked ? ' locked' : '')+'" data-bid="'+b.id+'" novalidate>'+
+      '<div class="autofill-head"><div><div class="autofill-title">'+escapeHtml(b.name)+'</div>'+
+        '<div class="muted-cell">'+(b.structureId ? 'Структура «'+escapeHtml(b.structureName || ('#'+b.structureId))+'»' : 'Без структуры')+' · эпиков: '+b.mappings.length+'</div></div>'+
+        '<label class="switch"><input type="checkbox" data-f="enabled"'+(s.enabled ? ' checked' : '')+(locked ? ' disabled' : '')+'> <span>Автозаполнение включено</span></label></div>'+
+      status+
+      '<fieldset class="autofill-fields"'+(locked ? ' disabled' : '')+'>'+
+        '<div class="setting-item"><span class="small">Дни недели</span><div class="weekday-picker">'+WEEKDAYS.map(function(d){
+          return '<label><input type="checkbox" data-day="'+d[0]+'"'+(s.days.indexOf(d[0]) !== -1 ? ' checked' : '')+'><span>'+d[1]+'</span></label>';
+        }).join('')+'</div></div>'+
+        '<div class="setting-item"><label class="small">Время запуска</label><input type="time" data-f="time" value="'+escapeAttr(s.time)+'" required></div>'+
+        '<div class="setting-item"><label class="small">Часовой пояс</label><select data-f="timezone">'+zones.map(function(z){
+          return '<option value="'+escapeAttr(z)+'"'+(z === s.timezone ? ' selected' : '')+'>'+escapeHtml(z)+(z === browserTz ? ' — ваш' : '')+'</option>';
+        }).join('')+'</select></div>'+
+        '<label class="quick-filter-item autofill-overwrite"><input type="checkbox" data-f="overwrite"'+(s.overwrite ? ' checked' : '')+'> Перезаписывать замер, если на эту дату он уже внесён</label>'+
+      '</fieldset>'+
+      '<div class="form-actions">'+
+        '<button type="button" class="btn btn-ghost btn-sm" data-action="run"'+(locked ? ' disabled' : '')+'>Запустить сейчас</button>'+
+        '<button type="submit" class="btn btn-primary btn-sm"'+(locked ? ' disabled' : '')+'>Сохранить расписание</button>'+
+      '</div></form>';
+  }).join('');
+  box.querySelectorAll('.autofill-card').forEach(function(form){
+    var bid = parseInt(form.dataset.bid, 10);
+    form.addEventListener('submit', function(e){
+      e.preventDefault();
+      var body = {
+        enabled: form.querySelector('[data-f="enabled"]').checked,
+        days: Array.prototype.map.call(form.querySelectorAll('[data-day]:checked'), function(c){ return parseInt(c.dataset.day, 10); }),
+        time: form.querySelector('[data-f="time"]').value,
+        timezone: form.querySelector('[data-f="timezone"]').value,
+        overwrite: form.querySelector('[data-f="overwrite"]').checked
+      };
+      if(body.enabled && !body.days.length){ toast('Выберите хотя бы один день недели'); return; }
+      if(!body.time){ toast('Укажите время запуска'); return; }
+      apiPut('/api/jira/buttons/'+bid+'/schedule', body).then(function(saved){
+        replaceJiraButton(saved);
+        renderAutofillView();
+        toast(saved.schedule.enabled ? 'Расписание сохранено: ' + scheduleSummary(saved.schedule) : 'Автозаполнение выключено');
+      }).catch(function(){});
+    });
+    form.querySelector('[data-action="run"]').addEventListener('click', function(){
+      var btn = this;
+      btn.disabled = true;
+      btn.textContent = 'Срез из Jira…';
+      apiPost('/api/jira/buttons/'+bid+'/schedule/run').then(function(data){
+        replaceJiraButton(data.button);
+        renderAutofillView();
+        toast(data.message);
+        loadProjectData(currentProjectId);
+      }).catch(function(){
+        /* ошибку показал api(); статус запуска обновим */
+        loadJiraConfig();
+      }).then(function(){ btn.disabled = false; btn.textContent = 'Запустить сейчас'; });
+    });
   });
 }
 
@@ -2323,14 +2503,15 @@ var auditPageLabels = {
   services: 'Эпики', settings: 'Настройки', users: 'Пользователи',
   projects: 'Проекты', profile: 'Профиль', jira: 'Связь с Jira'
 };
-var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление' };
+var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление', autofill: 'Автозаполнение' };
 var auditEntityLabels = { project: 'Проект', service: 'Эпик', entry: 'Замер', user: 'Пользователь', stage_target: 'Цель этапа', settings: 'Настройки',
-  jira_connection: 'Подключение к Jira', jira_button: 'Кнопка среза' };
+  jira_connection: 'Подключение к Jira', jira_button: 'Кнопка среза', jira_schedule: 'Расписание автозаполнения' };
 var auditFieldLabels = {
   name: 'Название', description: 'Описание', etap: 'Этап', targetDate: 'Целевая дата', isDone: 'Сдано', stageGroup: 'Группа в своде',
   date: 'Дата', remaining: 'Остаток', spent: 'Затрачено', estimate: 'Оценка',
   username: 'Логин', displayName: 'Имя', email: 'Email', position: 'Должность', role: 'Роль',
   jiraUrl: 'Адрес Jira', jiraAuth: 'Тип подключения', jiraLogin: 'Логин Jira', jiraToken: 'Токен Jira',
+  autofill: 'Расписание', result: 'Результат',
   forecastMethod: 'Метод прогноза', riskBufferDays: 'Буфер риска', burnrateMethod: 'Метод burn rate', burnrateWindowDays: 'Окно burn rate'
 };
 /* В БД время хранится в UTC (CURRENT_TIMESTAMP) — показываем в локальном часовом поясе */

@@ -808,6 +808,73 @@ def test_jira_hidden_for_viewer(ui, make_user, admin, fake_jira):
     admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'mappings': [{'serviceId': 1, 'issueKeys': 'ABC-1'}]})
     make_user('viewer', project_id=1)
     ui.login('viewer', 'pw-12345')
-    assert not ui.page.is_visible('#navJira')
+    assert not ui.page.is_visible('#navJira') and not ui.page.is_visible('#navAutofill')
     ui.go('data')
     assert ui.page.locator('#jiraSnapshotButtons button').count() == 0
+
+
+def test_jira_field_mapping_in_editor(admin_ui, fake_jira, admin):
+    page = admin_ui.page
+    setup_jira_connection(admin_ui, fake_jira)
+    page.click('#jiraAddButton')
+    page.fill('#jbName', 'Свои поля')
+    assert page.input_value('#jbField_remaining') == 'timeestimate' and page.input_value('#jbUnit_remaining') == 'seconds'
+    page.click('#jbLoadFields')
+    admin_ui.expect_toast('Числовых полей загружено: 4')
+    page.select_option('#jbField_remaining', 'customfield_10050')
+    assert page.input_value('#jbUnit_remaining') == 'hours'  # своё числовое поле — по умолчанию в часах
+    page.select_option('#jbField_spent', '')
+    page.fill('#jbTable tr[data-sid="1"] input[data-field="keys"]', 'ABC-1')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Кнопка создана')
+    row = admin_ui.text('#jiraButtonsTable tbody tr')
+    assert 'customfield_10050' in row and 'не заполняется' in row
+    fm = admin.get('/api/projects/1/jira').get_json()['buttons'][0]['fieldMap']
+    assert fm['remaining'] == {'field': 'customfield_10050', 'unit': 'hours'} and fm['spent']['field'] == ''
+    admin_ui.go('data')
+    page.click('#jiraSnapshotButtons button:has-text("Свои поля")')
+    page.wait_for_selector('#confirmModal.show #bulkTable')
+    first = '#bulkTable tr[data-sid="1"]'
+    assert [page.input_value(f'{first} input[data-field="{f}"]') for f in ('remaining', 'spent', 'estimate')] == ['25.5', '', '18']
+
+
+def test_autofill_page_unlocks_after_snapshot(admin_ui, fake_jira, admin):
+    import datetime
+    page = admin_ui.page
+    setup_jira_connection(admin_ui, fake_jira)
+    bid = admin.post('/api/projects/1/jira/buttons', json={
+        'name': 'Ежедневный срез', 'structureId': 7, 'structureName': 'Релиз 2026',
+        'mappings': [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]}).get_json()['id']
+    page.reload()
+    admin_ui.go('autofill')
+    card = f'.autofill-card[data-bid="{bid}"]'
+    page.wait_for_selector(card)
+    assert 'после первого успешного среза' in admin_ui.text(card)
+    assert page.is_disabled(f'{card} [data-f="enabled"]') and page.is_disabled(f'{card} [data-action="run"]')
+    # первый срез вручную открывает расписание
+    admin_ui.go('data')
+    page.click('#jiraSnapshotButtons button:has-text("Ежедневный срез")')
+    admin_ui.expect_toast('Первый срез получен — для кнопки доступно автозаполнение по расписанию')
+    page.click('#confirmCancel')
+    admin_ui.go('autofill')
+    assert not page.is_disabled(f'{card} [data-f="enabled"]')
+    page.check(f'{card} [data-f="enabled"]')
+    page.click(f'{card} .weekday-picker label:has-text("Сб")')
+    page.fill(f'{card} [data-f="time"]', '07:30')
+    page.select_option(f'{card} [data-f="timezone"]', 'Asia/Novosibirsk')
+    page.click(f'{card} button[type="submit"]')
+    admin_ui.expect_toast('Расписание сохранено: Пн, Вт, Ср, Чт, Пт, Сб в 07:30')
+    s = admin.get('/api/projects/1/jira').get_json()['buttons'][0]['schedule']
+    assert s['enabled'] and s['days'] == [1, 2, 3, 4, 5, 6] and s['timezone'] == 'Asia/Novosibirsk'
+    assert '07:30' in admin_ui.text(card) and 'Asia/Novosibirsk' in admin_ui.text(card)
+    admin_ui.go('jira')
+    assert 'автозаполнение: Пн, Вт, Ср, Чт, Пт, Сб в 07:30' in admin_ui.text('#jiraButtonsTable tbody tr')
+    # «Запустить сейчас» — замер на сегодня сохранён, статус обновлён
+    admin_ui.go('autofill')
+    page.click(f'{card} [data-action="run"]')
+    page.wait_for_function('s => document.querySelector(s + " .autofill-result.ok")', arg=card)
+    assert 'Сохранено замеров' in admin_ui.text(card)
+    today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).date().isoformat()
+    entries = admin.get('/api/projects/1/data').get_json()['entries']
+    assert any(e['service_id'] == 1 and e['date'] == today and e['remaining'] == 12.5 for e in entries)
+    assert not admin_ui.errors

@@ -247,7 +247,7 @@ def test_snapshot_structure_subtree(admin, fake):
     assert fake.state['requests'].count(('POST', '/rest/structure/2.0/forest/latest')) == 1
 
 
-def test_snapshot_without_structure_uses_jira_aggregates(admin, fake):
+def test_snapshot_without_structure_sums_subtasks(admin, fake):
     connect(admin, fake)
     bid = create_button(admin, structureId=None, mappings=[
         {'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True},
@@ -256,7 +256,9 @@ def test_snapshot_without_structure_uses_jira_aggregates(admin, fake):
     items = snapshot(admin, bid)
     assert (items[1]['remaining'], items[1]['spent'], items[1]['estimate']) == (14, 7, 18)
     assert (items[2]['remaining'], items[2]['spent'], items[2]['estimate']) == (10, 5, 12)
+    assert items[1]['issueCount'] == 2 and items[2]['issueCount'] == 1
     assert ('POST', '/rest/structure/2.0/forest/latest') not in fake.state['requests']
+    assert fake.state['search_bodies'][-1]['jql'] == 'parent in (ABC-1)'
 
 
 def test_snapshot_cloud_uses_search_jql(admin, fake):

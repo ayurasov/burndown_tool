@@ -6,6 +6,7 @@ import threading
 
 import pytest
 
+os.environ.setdefault('BURNDOWN_SCHEDULER', '0')  # фоновый планировщик в тестах не нужен
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as app_module  # noqa: E402
