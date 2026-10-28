@@ -231,3 +231,65 @@ def test_changes_api(admin, button):
     assert issues['ABC-3']['prev'] == {'remaining': 0.5, 'spent': None, 'estimate': 1.0, 'category': 'indeterminate'}
     data = admin.get('/api/services/1/jira/issues?date=2026-11-02').get_json()
     assert data['prevDate'] is None and all(i['prev'] is None for i in data['issues'])
+
+
+# ─── Прогноз по burn-up и уровень этапа/проекта ──────────────────
+
+def pt(date, scope, done, total=2, done_count=0):
+    return {'date': date, 'scope': scope, 'done': done, 'total': total, 'doneCount': done_count,
+            'counts': {'new': total - done_count, 'indeterminate': 0, 'done': done_count}}
+
+
+def test_burnup_forecast():
+    from app import burnup_forecast
+    # выполнено растёт ~1,14 ч/день, объём стоит: 12 ч осталось → 11 дней
+    f = burnup_forecast([pt('2026-11-01', 20, 0), pt('2026-11-05', 20, 4), pt('2026-11-08', 20, 8)])
+    assert f['converges'] and f['date'] == '2026-11-19' and round(f['doneRate'], 2) == 1.14  # регрессия: 84/74 ч в день
+    # объём растёт быстрее, чем выполняется
+    f = burnup_forecast([pt('2026-11-01', 20, 0), pt('2026-11-08', 40, 5)])
+    assert not f['converges'] and f['date'] is None
+    # уже всё выполнено
+    assert burnup_forecast([pt('2026-11-01', 20, 10), pt('2026-11-08', 20, 20)])['date'] == '2026-11-08'
+    # мало данных
+    assert burnup_forecast([pt('2026-11-01', 20, 0)]) is None
+    assert burnup_forecast([pt('2026-11-01', 20, 0), pt('2026-11-01', 20, 5)]) is None
+    # скользящее окно: учитываются только срезы последних 7 дней (рывок в начале не влияет)
+    hist = [pt('2026-10-01', 20, 0), pt('2026-10-02', 20, 9), pt('2026-10-20', 20, 10), pt('2026-10-27', 20, 12)]
+    f = burnup_forecast(hist, {'burnrate_method': 'rolling', 'burnrate_window_days': 7})
+    assert f['date'] == '2026-11-24'  # 8 ч при 2/7 ч в день = 28 дней после 27.10
+
+
+def test_aggregate_composition_carries_forward():
+    from app import aggregate_composition
+    history = {1: [pt('2026-11-01', 10, 2, 2, 1), pt('2026-11-08', 12, 6, 3, 2)], 2: [pt('2026-11-05', 5, 0, 1, 0)]}
+    latest = {1: dict(history[1][-1], problems={'overspent': 1}), 2: dict(history[2][-1], problems={'overspent': 2})}
+    agg_history, agg_latest = aggregate_composition(history, latest, [1, 2])
+    assert [(p['date'], p['scope'], p['done'], p['total']) for p in agg_history] == [
+        ('2026-11-01', 10, 2, 2), ('2026-11-05', 15, 2, 3), ('2026-11-08', 17, 6, 4)]
+    assert agg_latest['problems'] == {'overspent': 3} and agg_latest['counts']['done'] == 2
+    assert aggregate_composition(history, latest, [3]) is None
+
+
+def test_pdf_burnup_forecast_and_totals(admin, fake):
+    import io
+    import fake_jira
+    from pypdf import PdfReader
+    connect(admin, fake)
+    bid = create_button(admin, mappings=[{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True},
+                                         {'serviceId': 2, 'issueKeys': 'ABC-4', 'includeSubtree': False}]).get_json()['id']
+    snap(admin, bid, '2026-11-02')
+    old = dict(fake_jira.ISSUES[103])
+    fake_jira.ISSUES[103]['category'] = 'done'
+    try:
+        snap(admin, bid, '2026-11-09')
+    finally:
+        fake_jira.ISSUES[103] = old
+
+    def text(page):
+        r = admin.get(f'/api/projects/1/pdf?page={page}')
+        return ''.join(p.extract_text() for p in PdfReader(io.BytesIO(r.data)).pages)
+    dash = text('dashboard')
+    # эпик 1: 12 ч при 1/7 ч в день → 84 дня после 09.11 = 01.02.2027 (позже цели 31.08.2026); эпик 2 не сходится
+    assert '01.02.2027 (позже)' in dash and 'не сходится' in dash and 'Итого по проекту' in dash
+    stages = text('stages')
+    assert 'Задачи Jira по этапам' in stages and 'Этап 4' in stages and 'Итого по проекту' in stages

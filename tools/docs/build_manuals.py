@@ -25,7 +25,7 @@ from pypdf import PdfReader, PdfWriter
 ROOT = Path(__file__).resolve().parents[2]
 MANUALS = ROOT / 'docs' / 'manuals'
 TOOLS = Path(__file__).resolve().parent
-VERSION = '1.3.0'
+VERSION = '1.4.0'
 DOCS = {
     'user-guide': 'Руководство пользователя',
     'admin-guide': 'Руководство администратора',
