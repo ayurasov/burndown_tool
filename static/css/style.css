@@ -86,7 +86,7 @@ table{border-collapse:collapse;width:100%;}
 .text-danger{color:var(--color-error)!important;}
 
 /* ── Form controls ────────────────────────────────────────────── */
-input[type=text],input[type=search],input[type=email],input[type=url],input[type=date],input[type=number],input[type=password],select,textarea{
+input[type=text],input[type=search],input[type=email],input[type=url],input[type=date],input[type=time],input[type=number],input[type=password],select,textarea{
   background:var(--color-surface-2);border:1px solid var(--color-border);border-radius:var(--radius-md);
   padding:var(--space-2) var(--space-3);font-size:var(--text-sm);color:var(--color-text);
   min-height:var(--control-h);max-width:100%;min-width:0;
@@ -97,7 +97,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--color-pr
 input:disabled,select:disabled{opacity:0.55;cursor:not-allowed;}
 input[readonly]{background:var(--color-surface-offset);cursor:default;}
 input[type=checkbox]{width:16px;height:16px;accent-color:var(--color-primary);cursor:pointer;flex-shrink:0;}
-label.small{font-size:var(--text-xs);color:var(--color-text-muted);font-weight:600;}
+label.small,.field-label{font-size:var(--text-xs);color:var(--color-text-muted);font-weight:600;}
 .select-wide{width:min(360px,100%);}
 .search-input{width:min(280px,100%);}
 
@@ -424,7 +424,7 @@ table.jira-map-table{min-width:560px;}
 .jira-snapshot-buttons{display:contents;}
 .jira-fields{display:flex;flex-direction:column;gap:var(--space-2);margin-top:var(--space-3);padding:var(--space-3);border:1px solid var(--color-divider);border-radius:var(--radius-md);background:var(--color-surface-2);}
 .jira-fields-head{display:flex;justify-content:space-between;align-items:center;gap:var(--space-2);}
-.jira-fields-grid{display:grid;grid-template-columns:auto minmax(0,2fr) minmax(0,1fr);gap:var(--space-2) var(--space-3);align-items:center;}
+.jira-fields-grid{display:grid;grid-template-columns:auto minmax(0,3fr) minmax(110px,1fr);gap:var(--space-2) var(--space-3);align-items:center;}
 .jira-fields-grid select{min-width:0;}
 @media (max-width:640px){.jira-fields-grid{grid-template-columns:1fr;}}
 

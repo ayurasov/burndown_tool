@@ -2058,14 +2058,14 @@ function openJiraButtonEditor(button){
           '<button type="button" class="btn btn-ghost btn-sm" id="jbLoadStructures">Загрузить из Jira</button></div>'+
           '<input type="number" id="jbStructureId" min="1" placeholder="ID структуры" hidden></div>'+
       '</div>'+
-      '<div class="jira-fields"><div class="jira-fields-head"><span class="small">Поля Jira для показателей замера</span>'+
+      '<div class="jira-fields"><div class="jira-fields-head"><span class="field-label">Поля Jira для показателей замера</span>'+
         '<button type="button" class="btn btn-ghost btn-sm" id="jbLoadFields">Загрузить поля из Jira</button></div>'+
         '<div class="jira-fields-grid" id="jbFields">'+JIRA_METRICS.map(function(m){
           var f = fieldMap[m[0]] || {field: '', unit: 'seconds'};
           return '<label class="small" for="jbField_'+m[0]+'">'+m[1]+'</label>'+
             '<select id="jbField_'+m[0]+'" data-metric="'+m[0]+'">'+fieldOptions(JIRA_TIME_FIELDS, f.field)+'</select>'+
-            '<select id="jbUnit_'+m[0]+'" aria-label="Единица: '+m[1]+'"><option value="seconds"'+(f.unit !== 'hours' ? ' selected' : '')+'>в секундах (учёт времени Jira)</option>'+
-              '<option value="hours"'+(f.unit === 'hours' ? ' selected' : '')+'>в часах</option></select>';
+            '<select id="jbUnit_'+m[0]+'" aria-label="Единица: '+m[1]+'"><option value="seconds"'+(f.unit !== 'hours' ? ' selected' : '')+'>секунды</option>'+
+              '<option value="hours"'+(f.unit === 'hours' ? ' selected' : '')+'>часы</option></select>';
         }).join('')+'</div>'+
         '<p class="bulk-note">Значения суммируются по всем задачам эпика. Стандартные поля учёта времени Jira хранятся в секундах; для своих числовых полей выберите единицу, в которой они заполняются.</p></div>'+
       '<p class="bulk-note">Укажите для эпиков задачи Jira (ключи через запятую). «С вложенными»: со структурой — все задачи под указанными в дереве структуры, без структуры — задача вместе с подзадачами. Эпики без задач в срез не попадают.</p>'+
@@ -2192,11 +2192,11 @@ function renderAutofillView(){
       '</dl>';
     return '<form class="autofill-card'+(locked ? ' locked' : '')+'" data-bid="'+b.id+'" novalidate>'+
       '<div class="autofill-head"><div><div class="autofill-title">'+escapeHtml(b.name)+'</div>'+
-        '<div class="muted-cell">'+(b.structureId ? 'Структура «'+escapeHtml(b.structureName || ('#'+b.structureId))+'»' : 'Без структуры')+' · эпиков: '+b.mappings.length+'</div></div>'+
+        '<div class="section-note">'+(b.structureId ? 'Структура «'+escapeHtml(b.structureName || ('#'+b.structureId))+'»' : 'Без структуры')+' · эпиков: '+b.mappings.length+'</div></div>'+
         '<label class="switch"><input type="checkbox" data-f="enabled"'+(s.enabled ? ' checked' : '')+(locked ? ' disabled' : '')+'> <span>Автозаполнение включено</span></label></div>'+
       status+
       '<fieldset class="autofill-fields"'+(locked ? ' disabled' : '')+'>'+
-        '<div class="setting-item"><span class="small">Дни недели</span><div class="weekday-picker">'+WEEKDAYS.map(function(d){
+        '<div class="setting-item"><span class="field-label">Дни недели</span><div class="weekday-picker">'+WEEKDAYS.map(function(d){
           return '<label><input type="checkbox" data-day="'+d[0]+'"'+(s.days.indexOf(d[0]) !== -1 ? ' checked' : '')+'><span>'+d[1]+'</span></label>';
         }).join('')+'</div></div>'+
         '<div class="setting-item"><label class="small">Время запуска</label><input type="time" data-f="time" value="'+escapeAttr(s.time)+'" required></div>'+

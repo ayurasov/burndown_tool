@@ -139,7 +139,7 @@ def test_scheduler_runs_once_per_day(admin, flask_app, button):
     # на следующий день — снова
     assert run_due(flask_app, datetime(2026, 11, 3, 6, 1, tzinfo=timezone.utc)) == 1
     s = next(b for b in admin.get('/api/projects/1/jira').get_json()['buttons'] if b['id'] == bid)['schedule']
-    assert s['lastStatus'] == 'ok' and 'Сохранено замеров за 2026-11-03: 1' in s['lastMessage']
+    assert s['lastStatus'] == 'ok' and 'Сохранено замеров за 03.11.2026: 1' in s['lastMessage']
     audit = admin.get('/api/audit?username=Автозаполнение').get_json()
     rows = audit['entries'] if isinstance(audit, dict) else audit
     assert any(r.get('username') == 'Автозаполнение' and r.get('action') == 'autofill' for r in rows)

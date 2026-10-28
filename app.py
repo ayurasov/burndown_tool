@@ -664,6 +664,13 @@ def api_bulk_measurements(pid):
     return jsonify({'entries': result})
 
 
+def _num_text(v):
+    """Число для реестра изменений: 420.0 → «420»."""
+    if v is None:
+        return None
+    return str(int(v)) if float(v).is_integer() else str(v)
+
+
 def save_measurements(db, pid, date, parsed, services, actor=None, overwrite=True):
     """Записать замеры на дату: [(serviceId, {remaining, spent, estimate})] → (сохранённые, число пропущенных).
 
@@ -685,8 +692,7 @@ def save_measurements(db, pid, date, parsed, services, actor=None, overwrite=Tru
                              (sid, date, vals['remaining'], vals['spent'], vals['estimate'])).lastrowid
             action = 'create'
         result.append(dict(id=eid, service_id=sid, date=date, **vals))
-        changes = [{'field': f, 'old': None if not existing or existing[f] is None else str(existing[f]),
-                    'new': None if vals[f] is None else str(vals[f])}
+        changes = [{'field': f, 'old': _num_text(existing[f]) if existing else None, 'new': _num_text(vals[f])}
                    for f in HOUR_FIELDS if not existing or existing[f] != vals[f]]
         if changes:
             audit_log('data', action, 'entry', eid, pid, changes, entity_name=services[sid]['name'], commit=False,
@@ -1202,7 +1208,7 @@ def run_autofill(db, button_row, local_date, actor, overwrite=True):
     saved, skipped = save_measurements(db, pid, local_date, parsed, services, actor=actor, overwrite=overwrite)
     db.execute('UPDATE jira_snapshot_buttons SET last_success_at = ? WHERE id = ?', (_utc_now_iso(), button_row['id']))
     warnings = sum(len(it['warnings']) for it in items)
-    message = f'Сохранено замеров за {local_date}: {len(saved)}'
+    message = f'Сохранено замеров за {datetime.strptime(local_date, "%Y-%m-%d"):%d.%m.%Y}: {len(saved)}'
     if skipped:
         message += f'; пропущено (замер уже был): {skipped}'
     if warnings:

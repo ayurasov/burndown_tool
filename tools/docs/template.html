@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>$title$</title>
+<style>
+$for(css)$
+$css$
+$endfor$
+</style>
+</head>
+<body>
+<section class="cover">
+  <div class="cover-bar"></div>
+  <div class="cover-inner">
+    <div class="cover-brand"><svg viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#01696f"/><path d="M7 21 L13 14 L17 17 L24 9" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M24 9 L24 13 M24 9 L20 9" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round"/><path d="M7 24 L24 24" stroke="#fff" stroke-width="1.5" opacity="0.5"/></svg>Burndown</div>
+    <div class="cover-tag">Трекер сгорания работ по эпикам и этапам</div>
+    <h1 class="cover-title">$cover-title$</h1>
+    <div class="cover-sub">$subtitle$</div>
+  </div>
+  <div class="cover-meta"><span>$date$</span><span>Burndown Tracker</span></div>
+</section>
+<nav class="toc" id="TOC">
+<h1>Содержание</h1>
+$table-of-contents$
+</nav>
+<main>
+$body$
+</main>
+</body>
+</html>
