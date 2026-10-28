@@ -8,7 +8,7 @@ var currentUser = null;
 var projects = [];
 var currentProjectId = null;
 var currentProjectRole = null; /* 'admin', 'manager', 'user' */
-var STATE = { services:[], entries:[], stageTargets:{}, settings:{}, jira:null };
+var STATE = { services:[], entries:[], stageTargets:{}, settings:{}, jira:null, jiraComp:null };
 var currentDataServiceId = null;
 var burnRangeOverride = null;
 var stageBurnRangeOverride = null;
@@ -87,6 +87,7 @@ function openModal(opts){
   confirmOk.className = 'btn ' + (opts.danger ? 'btn-danger' : 'btn-primary');
   confirmModal.classList.toggle('modal-wide', !!opts.wide);
   confirmModal.classList.toggle('modal-xl', opts.size === 'xl');
+  confirmCancel.hidden = !!opts.noCancel;
   modalOkHandler = opts.onOk || null;
   confirmModal.classList.add('show');
   var first = confirmBody.querySelector('input:not([type=file]):not([disabled]),select,textarea');
@@ -603,6 +604,7 @@ function renderEpicCharts(){
   renderEpicRemainingChart();
   renderEpicSpentChart();
   renderEpicEstimateChart();
+  renderBurnupChart();
 }
 
 function renderEpicRemainingChart(){
@@ -1066,6 +1068,7 @@ function enableEnterNavigation(table){
 
 function refreshDashboardParts(){
   refreshCharts();
+  renderJiraComposition();
   renderSummaryTable();
   renderKpis();
   renderBurnRateTable();
@@ -1618,6 +1621,7 @@ function renderDashboard(){
   populateServiceSelects();
   updateEpicTargetInput();
   renderKpis();
+  renderJiraComposition();
   renderSummaryTable();
   renderEpicCharts();
   renderAllEpicsCharts();
@@ -1852,7 +1856,7 @@ function renderJiraSnapshotButtons(){
 function runJiraSnapshot(bid, btn){
   var label = btn ? btn.textContent : '';
   if(btn){ btn.disabled = true; btn.textContent = 'Загрузка из Jira…'; }
-  return apiPost('/api/jira/buttons/'+bid+'/snapshot').then(function(data){
+  return apiPost('/api/jira/buttons/'+bid+'/snapshot', {date: todayIso()}).then(function(data){
     var prefill = {}, notes = {}, services = [];
     data.items.forEach(function(it){
       prefill[it.serviceId] = it;
@@ -1862,6 +1866,7 @@ function runJiraSnapshot(bid, btn){
     /* порядок эпиков — как в проекте */
     STATE.services.forEach(function(s){ if(prefill[s.id]) services.push(s); });
     var b = data.button;
+    loadJiraComposition();
     var before = jiraButtonById(b.id);
     replaceJiraButton(b);
     if(b.lastSuccessAt && before && !before.lastSuccessAt)
@@ -2145,6 +2150,150 @@ function openJiraButtonEditor(button){
       toast('Структур загружено: ' + list.length);
     }).catch(function(){}).then(function(){ btn.disabled = false; btn.textContent = 'Загрузить из Jira'; });
   });
+}
+
+
+/* ════════════════════════════════════════════════════════════════
+   Задачи Jira: состав эпиков, burn-up и качество данных
+════════════════════════════════════════════════════════════════ */
+var CATEGORY_LABELS = {done: 'Готово', indeterminate: 'В работе', 'new': 'Не начато'};
+var CATEGORY_ORDER = ['done', 'indeterminate', 'new'];
+
+function loadJiraComposition(){
+  STATE.jiraComp = null;
+  if(!currentProjectId) return Promise.resolve();
+  var pid = currentProjectId;
+  return api('/api/projects/'+pid+'/jira/composition').then(function(data){
+    if(pid !== currentProjectId) return;
+    STATE.jiraComp = data;
+    if(currentView === 'dashboard'){ renderJiraComposition(); renderBurnupChart(); }
+  }).catch(function(){});
+}
+
+function compositionOf(sid){
+  var c = STATE.jiraComp;
+  return c && c.latest ? c.latest[sid] : null;
+}
+
+function problemCount(latest){
+  return Object.keys(latest.problems || {}).reduce(function(n, k){ return n + latest.problems[k]; }, 0);
+}
+
+function compositionBar(latest){
+  var total = latest.total || 0;
+  var title = CATEGORY_ORDER.map(function(c){ return CATEGORY_LABELS[c] + ': ' + latest.counts[c]; }).join(' · ');
+  if(!total) return '<div class="comp-bar empty" title="Задач нет — только контейнеры"></div>';
+  return '<div class="comp-bar" title="'+escapeAttr(title)+'" role="img" aria-label="'+escapeAttr(title)+'">' +
+    CATEGORY_ORDER.map(function(c){
+      var n = latest.counts[c];
+      return n ? '<span class="comp-seg '+c+'" style="flex-grow:'+n+'"></span>' : '';
+    }).join('') + '</div>';
+}
+
+function renderJiraComposition(){
+  var panel = document.getElementById('jiraCompPanel');
+  var rows = visibleDashboardServices().filter(function(s){ return compositionOf(s.id); });
+  panel.hidden = !rows.length;
+  if(!rows.length) return;
+  var labels = STATE.jiraComp.problemLabels || {};
+  var table = document.getElementById('jiraCompTable');
+  table.innerHTML = '<thead><tr><th>Эпик</th><th class="comp-col">Состав задач</th><th class="num">Выполнено объёма</th>'+
+    '<th class="num">Задач готово</th><th class="num">Объём, ч</th><th>Данные</th><th>Срез</th></tr></thead><tbody>' +
+    rows.map(function(s){
+      var l = compositionOf(s.id);
+      var pct = l.scope > 0 ? Math.round(l.done / l.scope * 100) : null;
+      var probs = problemCount(l);
+      var probTitle = Object.keys(l.problems || {}).map(function(k){ return (labels[k] || k) + ': ' + l.problems[k]; }).join('\n');
+      return '<tr class="clickable'+(s.isDone ? ' done-row' : '')+'" data-sid="'+s.id+'" tabindex="0">'+
+        '<td>'+escapeHtml(s.name)+'</td><td class="comp-col">'+compositionBar(l)+'</td>'+
+        '<td class="num">'+(pct === null ? '—' : pct + '%')+'</td>'+
+        '<td class="num">'+l.doneCount+' / '+l.total+'</td>'+
+        '<td class="num">'+hoursToStr(l.scope)+'</td>'+
+        '<td class="nowrap">'+(probs ? '<span class="badge badge-risk" title="'+escapeAttr(probTitle)+'">⚠ '+probs+'</span>' : '<span class="badge badge-ok">✓ в порядке</span>')+'</td>'+
+        '<td class="mono nowrap">'+fmtDate(l.date)+'</td></tr>';
+    }).join('') + '</tbody>';
+  table.querySelectorAll('tr[data-sid]').forEach(function(tr){
+    var open = function(){ openJiraIssues(parseInt(tr.dataset.sid, 10)); };
+    tr.addEventListener('click', open);
+    tr.addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); open(); } });
+  });
+}
+
+function renderBurnupChart(){
+  destroyChart('epicBurnup');
+  var panel = document.getElementById('jiraBurnupPanel');
+  var sid = parseInt(document.getElementById('chartServiceSelect').value, 10);
+  var hist = STATE.jiraComp && STATE.jiraComp.history ? STATE.jiraComp.history[sid] : null;
+  panel.hidden = !(hist && hist.length);
+  if(panel.hidden) return;
+  var single = hist.length === 1;
+  var datasets = [
+    {label: 'Объём', data: hist.map(function(p){ return {x: p.date, y: p.scope, total: p.total}; }),
+     borderColor: getCss('--color-blue'), backgroundColor: 'transparent', borderWidth: 2, pointRadius: single ? 4 : 2, tension: 0},
+    {label: 'Выполнено', data: hist.map(function(p){ return {x: p.date, y: p.done, count: p.doneCount, total: p.total}; }),
+     borderColor: getCss('--color-success'), backgroundColor: getCss('--color-success') + '26', fill: 'origin', borderWidth: 2,
+     pointRadius: single ? 4 : 2, tension: 0}
+  ];
+  renderLegend('legendBurnup', datasets);
+  var opts = baseChartOptions('Часы');
+  opts.plugins.tooltip.callbacks.afterLabel = function(ctx){
+    var raw = ctx.raw || {};
+    return raw.count !== undefined ? 'Задач готово: ' + raw.count + ' из ' + raw.total : 'Задач: ' + raw.total;
+  };
+  charts.epicBurnup = new Chart(document.getElementById('chartBurnup'), {type: 'line', data: {datasets: datasets}, options: opts});
+}
+
+document.getElementById('jiraBurnupIssues').addEventListener('click', function(){
+  openJiraIssues(parseInt(document.getElementById('chartServiceSelect').value, 10));
+});
+
+function openJiraIssues(sid){
+  var svc = serviceById(sid);
+  if(!svc) return;
+  api('/api/services/'+sid+'/jira/issues').then(function(data){
+    var labels = data.problemLabels || {};
+    var issues = data.issues;
+    var problemTotal = issues.filter(function(i){ return i.problems.length; }).length;
+    var counts = {};
+    issues.forEach(function(i){ if(!i.container) counts[i.category] = (counts[i.category] || 0) + 1; });
+    var filters = [['all', 'Все', issues.length], ['problems', '⚠ С проблемами', problemTotal]].concat(
+      CATEGORY_ORDER.map(function(c){ return [c, CATEGORY_LABELS[c], counts[c] || 0]; }));
+    var link = function(key){
+      if(!data.baseUrl) return '<span class="mono">'+escapeHtml(key)+'</span>';
+      return '<a class="mono" href="'+escapeAttr(data.baseUrl + '/browse/' + encodeURIComponent(key))+'" target="_blank" rel="noopener">'+escapeHtml(key)+'</a>';
+    };
+    var badgeClass = {done: 'badge-ok', indeterminate: 'badge-info', 'new': 'badge-muted'};
+    openModal({
+      title: 'Задачи Jira: ' + svc.name, size: 'xl', okLabel: 'Закрыть', noCancel: true,
+      html: '<p class="bulk-intro">Срез от '+fmtDate(data.date)+'. Задач: '+issues.filter(function(i){ return !i.container; }).length+
+          (problemTotal ? ', с неполными данными: <b>'+problemTotal+'</b>' : '')+'. Ключ задачи открывает её в Jira.</p>'+
+        '<div class="seg-filter" id="jiFilter" role="group" aria-label="Фильтр задач">'+filters.map(function(f, i){
+          return '<button type="button" class="btn btn-ghost btn-sm'+(i === 0 ? ' active' : '')+'" data-filter="'+f[0]+'"'+(f[2] ? '' : ' disabled')+'>'+escapeHtml(f[1])+' <span class="muted-cell">'+f[2]+'</span></button>';
+        }).join('')+'</div>'+
+        '<div class="table-scroll jira-issues-scroll"><table class="data-table compact-table" id="jiTable"><thead><tr>'+
+          '<th>Задача</th><th>Тема</th><th>Статус</th><th class="num">Остаток</th><th class="num">Затрачено</th><th class="num">Оценка</th><th>Данные</th></tr></thead><tbody>'+
+        issues.map(function(i){
+          return '<tr data-cat="'+i.category+'"'+(i.problems.length ? ' data-problem="1"' : '')+(i.container ? ' class="container-row"' : '')+'>'+
+            '<td class="nowrap">'+link(i.key)+'</td>'+
+            '<td>'+escapeHtml(i.summary)+(i.container ? ' <span class="muted-cell">· содержит задачи</span>' : '')+'</td>'+
+            '<td class="nowrap"><span class="badge '+badgeClass[i.category]+'">'+escapeHtml(i.status || CATEGORY_LABELS[i.category])+'</span></td>'+
+            '<td class="num">'+(isNum(i.remaining) ? fmtNum(i.remaining) : '—')+'</td>'+
+            '<td class="num">'+(isNum(i.spent) ? fmtNum(i.spent) : '—')+'</td>'+
+            '<td class="num">'+(isNum(i.estimate) ? fmtNum(i.estimate) : '—')+'</td>'+
+            '<td class="issue-problems">'+i.problems.map(function(p){ return '<div>⚠ '+escapeHtml(labels[p] || p)+'</div>'; }).join('')+'</td></tr>';
+        }).join('')+'</tbody></table></div>',
+      onOk: function(){ closeModal(); return false; }
+    });
+    document.querySelectorAll('#jiFilter [data-filter]').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        var f = btn.dataset.filter;
+        document.querySelectorAll('#jiFilter [data-filter]').forEach(function(b){ b.classList.toggle('active', b === btn); });
+        document.querySelectorAll('#jiTable tbody tr').forEach(function(tr){
+          tr.hidden = !(f === 'all' || (f === 'problems' ? tr.dataset.problem : tr.dataset.cat === f));
+        });
+      });
+    });
+  }).catch(function(){});
 }
 
 
@@ -2458,6 +2607,7 @@ function loadProjectData(pid, view){
     STATE.stageTargets = data.stageTargets || {};
     STATE.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings || {});
     loadJiraConfig();
+    loadJiraComposition();
     if(!serviceById(currentDataServiceId)) currentDataServiceId = STATE.services.length ? STATE.services[0].id : null;
     navigate(view || currentView);
   });

@@ -62,6 +62,25 @@ def create_jira_tables(conn):
             last_message TEXT,
             FOREIGN KEY (button_id) REFERENCES jira_snapshot_buttons(id) ON DELETE CASCADE
         );
+        -- Состав эпика по задачам Jira на день среза (последний срез за день заменяет предыдущий)
+        CREATE TABLE IF NOT EXISTS jira_issue_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            service_id INTEGER NOT NULL,
+            snap_date TEXT NOT NULL,
+            issue_key TEXT NOT NULL,
+            summary TEXT,
+            status TEXT,
+            category TEXT,
+            remaining REAL,
+            spent REAL,
+            estimate REAL,
+            container INTEGER DEFAULT 0,
+            problems TEXT,
+            captured_at TEXT,
+            FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+            UNIQUE(service_id, snap_date, issue_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_jira_issue_snapshots ON jira_issue_snapshots(service_id, snap_date);
     ''')
     # колонки, добавленные после первого выпуска таблицы кнопок
     cols = {r[1] for r in conn.execute('PRAGMA table_info(jira_snapshot_buttons)')}
