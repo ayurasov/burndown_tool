@@ -1050,21 +1050,121 @@ def api_delete_jira_button(bid):
 @app.route('/api/jira/buttons/<int:bid>/snapshot', methods=['POST'])
 @login_required
 def api_jira_snapshot(bid):
-    """Срез из Jira по кнопке: значения для эпиков (в БД не сохраняется — сохраняет пользователь после проверки)."""
+    """Срез из Jira по кнопке: значения для эпиков. Замер сохраняет пользователь после проверки,
+    а состав эпиков по задачам фиксируется сразу — на день среза (date в теле запроса, по умолчанию сегодня)."""
     db = get_db()
     row, err = _jira_button_or_404(db, bid)
     if err:
         return err
+    snap_date = parse_date((request.get_json(silent=True) or {}).get('date'), 'Дата среза', required=False) \
+        or datetime.now().date().isoformat()
     button = _jira_button_json(db, row)
     try:
         items = jira.compute_snapshot(_jira_client(db, row['project_id']), row['structure_id'], button['mappings'],
                                       button['fieldMap'])
     except jira.JiraError as e:
         return _jira_error(e)
+    store_issue_snapshots(db, row['project_id'], items, snap_date)
     if _snapshot_has_values(items):
         _mark_snapshot_success(db, bid)
         button = _jira_button_json(db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone())
+    db.commit()
     return jsonify({'button': button, 'items': items})
+
+
+def store_issue_snapshots(db, pid, items, snap_date):
+    """Сохранить состав эпиков по задачам на день среза и убрать списки задач из items (ответ остаётся лёгким).
+
+    Повторный срез за тот же день заменяет состав эпика. Коммит — на стороне вызывающего.
+    """
+    services = {r['id'] for r in db.execute('SELECT id FROM services WHERE project_id = ?', (pid,))}
+    captured = _utc_now_iso()
+    for it in items:
+        issues = it.pop('issues', None) or []
+        if it['serviceId'] not in services or not issues:
+            continue
+        db.execute('DELETE FROM jira_issue_snapshots WHERE service_id = ? AND snap_date = ?', (it['serviceId'], snap_date))
+        db.executemany(
+            'INSERT OR REPLACE INTO jira_issue_snapshots (service_id, snap_date, issue_key, summary, status, category, '
+            'remaining, spent, estimate, container, problems, captured_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [(it['serviceId'], snap_date, i['key'], i['summary'], i['status'], i['category'], i['remaining'], i['spent'],
+              i['estimate'], 1 if i['container'] else 0, ','.join(i['problems']), captured) for i in issues])
+
+
+VOLUME_SQL = 'COALESCE(estimate, COALESCE(spent, 0) + COALESCE(remaining, 0))'
+
+
+@app.route('/api/projects/<int:pid>/jira/composition')
+@login_required
+def api_jira_composition(pid):
+    """Состав эпиков по задачам Jira: последний срез (статусы, объём, проблемы данных) и история для burn-up."""
+    if not can_view_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет доступа'}), 403
+    db = get_db()
+    history, latest = jira_composition(db, pid)
+    conn = db.execute('SELECT base_url FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()
+    return jsonify({'baseUrl': conn['base_url'] if conn else '', 'latest': latest, 'history': history,
+                    'problemLabels': jira.PROBLEMS})
+
+
+def jira_composition(db, pid):
+    """Состав эпиков проекта по срезам задач → (история по датам, последний срез с проблемами данных)."""
+    rows = db.execute(
+        f'''SELECT s.service_id, s.snap_date, s.category,
+                   SUM(CASE WHEN s.container THEN 0 ELSE 1 END) AS cnt,
+                   SUM({VOLUME_SQL}) AS volume, SUM(COALESCE(s.remaining, 0)) AS rem
+            FROM jira_issue_snapshots s JOIN services v ON v.id = s.service_id
+            WHERE v.project_id = ? GROUP BY s.service_id, s.snap_date, s.category
+            ORDER BY s.service_id, s.snap_date''', (pid,)).fetchall()
+    history, latest = {}, {}
+    for r in rows:
+        sid = r['service_id']
+        points = history.setdefault(sid, [])
+        if not points or points[-1]['date'] != r['snap_date']:
+            points.append({'date': r['snap_date'], 'scope': 0.0, 'done': 0.0, 'total': 0, 'doneCount': 0,
+                           'counts': {c: 0 for c in jira.STATUS_CATEGORIES},
+                           'volume': {c: 0.0 for c in jira.STATUS_CATEGORIES}})
+        p = points[-1]
+        cat = r['category'] if r['category'] in jira.STATUS_CATEGORIES else 'new'
+        p['counts'][cat] += r['cnt']
+        p['volume'][cat] = round(p['volume'][cat] + (r['volume'] or 0), 2)
+        p['total'] += r['cnt']
+        p['scope'] = round(p['scope'] + (r['volume'] or 0), 2)
+        if cat == 'done':
+            p['doneCount'] += r['cnt']
+            p['done'] = round(p['done'] + (r['volume'] or 0), 2)
+    for sid, points in history.items():
+        last = dict(points[-1], problems={})
+        for pr in db.execute('SELECT problems FROM jira_issue_snapshots WHERE service_id = ? AND snap_date = ? '
+                             "AND problems != ''", (sid, last['date'])):
+            for code in pr['problems'].split(','):
+                last['problems'][code] = last['problems'].get(code, 0) + 1
+        latest[sid] = last
+    return history, latest
+
+
+@app.route('/api/services/<int:sid>/jira/issues')
+@login_required
+def api_jira_service_issues(sid):
+    """Задачи Jira эпика на дату среза (по умолчанию — последний срез)."""
+    db = get_db()
+    svc = db.execute('SELECT * FROM services WHERE id = ?', (sid,)).fetchone()
+    if not svc:
+        return jsonify({'error': 'Эпик не найден'}), 404
+    if not can_view_project(session['user_id'], svc['project_id']):
+        return jsonify({'error': 'Нет доступа'}), 403
+    snap_date = parse_date(request.args.get('date'), 'Дата среза', required=False) or (db.execute(
+        'SELECT MAX(snap_date) FROM jira_issue_snapshots WHERE service_id = ?', (sid,)).fetchone()[0])
+    rows = db.execute('SELECT * FROM jira_issue_snapshots WHERE service_id = ? AND snap_date = ?',
+                      (sid, snap_date)).fetchall() if snap_date else []
+    issues = [{'key': r['issue_key'], 'summary': r['summary'] or '', 'status': r['status'] or '',
+               'category': r['category'], 'remaining': r['remaining'], 'spent': r['spent'], 'estimate': r['estimate'],
+               'container': bool(r['container']), 'problems': [p for p in (r['problems'] or '').split(',') if p]}
+              for r in rows]
+    issues.sort(key=lambda i: jira.issue_sort_key(i['key']))
+    conn = db.execute('SELECT base_url FROM jira_connections WHERE project_id = ?', (svc['project_id'],)).fetchone()
+    return jsonify({'date': snap_date, 'baseUrl': conn['base_url'] if conn else '', 'issues': issues,
+                    'problemLabels': jira.PROBLEMS})
 
 
 def _snapshot_has_values(items):
@@ -1196,6 +1296,7 @@ def run_autofill(db, button_row, local_date, actor, overwrite=True):
                                       button['fieldMap'])
     except jira.JiraError as e:
         return 'error', str(e)
+    store_issue_snapshots(db, pid, items, local_date)
     services = {s['id']: s for s in db.execute('SELECT * FROM services WHERE project_id = ?', (pid,)).fetchall()}
     parsed = []
     for it in items:
@@ -1723,6 +1824,21 @@ def api_export_pdf(pid):
             br_rows.append(['Итого по проекту'] + [_fmt_num(t) for t in totals])
             _pdf_table(pdf, ['Эпик'] + [_fmt_date(d)[:5] for d in dates], br_rows,
                        widths=[4] + [1] * len(dates), total_row=True)
+
+        _history, latest = jira_composition(db, pid)
+        comp_rows = []
+        for s in services:
+            c = latest.get(s['id'])
+            if not c:
+                continue
+            pct = f"{round(c['done'] / c['scope'] * 100)}%" if c['scope'] else '—'
+            comp_rows.append([s['name'], str(c['counts']['done']), str(c['counts']['indeterminate']),
+                              str(c['counts']['new']), pct, _fmt_num(c['scope']),
+                              str(sum(c['problems'].values()) or '—'), _fmt_date(c['date'])])
+        if comp_rows:
+            _pdf_heading(pdf, 'Задачи Jira по эпикам (последний срез)')
+            _pdf_table(pdf, ['Эпик', 'Готово', 'В работе', 'Не начато', 'Выполнено объёма', 'Объём, ч',
+                             'С неполными данными', 'Срез'], comp_rows, widths=[3.5, 1, 1, 1, 1.3, 1.1, 1.5, 1.1])
 
     elif page_type == 'stages':
         stage_groups = {}

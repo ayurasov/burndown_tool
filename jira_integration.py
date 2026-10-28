@@ -33,6 +33,14 @@ except ImportError:  # pragma: no cover
 INSTANCE_TYPES = ('cloud', 'server', 'server_basic')
 ISSUE_KEY_RE = re.compile(r'^[A-Z][A-Z0-9_]*-\d+$')
 METRICS = ('remaining', 'spent', 'estimate')
+ISSUE_FIELDS = ('summary', 'status', 'parent')  # для состава эпика по задачам
+STATUS_CATEGORIES = ('new', 'indeterminate', 'done')
+PROBLEMS = {
+    'no_estimate': 'Не закрыта, нет оценки и остатка',
+    'done_with_remaining': 'Закрыта, но остаток не обнулён',
+    'zero_remaining': 'В работе, остаток 0 при ненулевой оценке',
+    'overspent': 'Затрачено больше оценки',
+}
 TIME_FIELDS = {'remaining': 'timeestimate', 'spent': 'timespent', 'estimate': 'timeoriginalestimate'}
 TIME_FIELD_NAMES = {'timeestimate': 'Оставшаяся оценка', 'timespent': 'Затраченное время',
                     'timeoriginalestimate': 'Первоначальная оценка'}
@@ -268,7 +276,10 @@ class JiraClient:
         return resp.json()
 
     def search(self, jql, fields):
-        """Все задачи по JQL (постранично: startAt в Server/DC, nextPageToken в Cloud) → {id: fields}."""
+        """Все задачи по JQL (постранично: startAt в Server/DC, nextPageToken в Cloud) → {id: fields}.
+
+        В fields под ключом '__key' — ключ задачи (ABC-1).
+        """
         out = {}
         start_at, token = 0, None
         while True:
@@ -281,7 +292,7 @@ class JiraClient:
             data = self.json('POST', self.api('search/jql' if self.cloud else 'search'), json=body)
             issues = data.get('issues', [])
             for issue in issues:
-                out[int(issue['id'])] = issue.get('fields') or {}
+                out[int(issue['id'])] = dict(issue.get('fields') or {}, __key=issue.get('key'))
             start_at += len(issues)
             token = data.get('nextPageToken')
             more = bool(token) if self.cloud else start_at < (data.get('total') or 0)
@@ -333,8 +344,9 @@ def compute_snapshot(client, structure_id, mappings, field_map=None):
     → [{'serviceId', 'remaining', 'spent', 'estimate', 'issueCount', 'warnings': [...]}]
     """
     field_map = field_map or DEFAULT_FIELD_MAP
-    fields = sorted({v['field'] for v in field_map.values() if v['field']})
+    fields = sorted({v['field'] for v in field_map.values() if v['field']} | set(ISSUE_FIELDS))
     rows = None  # дерево структуры загружается один раз и только если нужно
+    containers = set()  # задачи, у которых в структуре есть вложенные строки
     results = []
     for m in mappings:
         keys, invalid = parse_issue_keys(m.get('issueKeys'))
@@ -348,13 +360,14 @@ def compute_snapshot(client, structure_id, mappings, field_map=None):
             if issue is None:
                 warnings.append(f'{key}: задача не найдена или нет прав на просмотр')
                 continue
-            roots.append((key, int(issue['id']), issue.get('fields') or {}))
+            roots.append((key, int(issue['id']), dict(issue.get('fields') or {}, __key=issue.get('key') or key)))
         for _key, issue_id, root_fields in roots:
             per_issue[issue_id] = root_fields
 
         if subtree and roots and structure_id:
             if rows is None:
                 rows = client.forest_rows(structure_id)
+                containers = parent_issue_ids(rows)
             need = set()
             for key, issue_id, _f in roots:
                 ids = subtree_issue_ids(rows, issue_id)
@@ -371,6 +384,9 @@ def compute_snapshot(client, structure_id, mappings, field_map=None):
         elif subtree and roots:
             children = client.search('parent in (%s)' % ', '.join(k for k, _i, _f in roots), fields)
             per_issue.update({i: f for i, f in children.items() if i not in per_issue})
+            parents = {(f.get('parent') or {}).get('key') for f in children.values()
+                       if isinstance(f.get('parent'), dict)}
+            containers |= {i for _k, i, f in roots if f['__key'] in parents}
 
         values = {}
         for metric in METRICS:
@@ -385,8 +401,67 @@ def compute_snapshot(client, structure_id, mappings, field_map=None):
 
         if not keys and not invalid:
             warnings.append('Не указаны задачи')
-        results.append(dict(serviceId=m['serviceId'], issueCount=len(per_issue), warnings=warnings, **values))
+        issues = [issue_detail(f, field_map, issue_id in containers) for issue_id, f in per_issue.items()]
+        issues.sort(key=lambda i: issue_sort_key(i['key']))
+        results.append(dict(serviceId=m['serviceId'], issueCount=len(per_issue), warnings=warnings, issues=issues,
+                            **values))
     return results
+
+
+# ─── Состав эпика по задачам и качество данных ───────────────────
+
+def parent_issue_ids(rows):
+    """Задачи структуры, под которыми есть вложенные строки (эпики, «папки»-задачи)."""
+    out = set()
+    for (depth, item), nxt in zip(rows, rows[1:]):
+        if item is not None and nxt[0] > depth:
+            out.add(item)
+    return out
+
+
+def issue_sort_key(key):
+    """ABC-2 раньше ABC-10."""
+    prefix, _, num = (key or '').rpartition('-')
+    return (prefix, int(num) if num.isdigit() else 0, key or '')
+
+
+def issue_detail(f, field_map, container=False):
+    """Поля задачи → строка среза: ключ, тема, статус, категория статуса, показатели (ч) и проблемы данных."""
+    status = f.get('status') if isinstance(f.get('status'), dict) else {}
+    category = (status.get('statusCategory') or {}).get('key')
+    out = {'key': f.get('__key') or '', 'summary': str(f.get('summary') or '')[:500],
+           'status': str(status.get('name') or ''),
+           'category': category if category in STATUS_CATEGORIES else 'new', 'container': bool(container)}
+    for metric in METRICS:
+        spec = field_map[metric]
+        out[metric] = sum_hours([f.get(spec['field'])], spec['unit']) if spec['field'] else None
+    out['problems'] = issue_problems(out, field_map)
+    return out
+
+
+def issue_problems(issue, field_map):
+    """Признаки, из-за которых сумма по эпику может вводить в заблуждение (только по сопоставленным полям)."""
+    mapped = {m: bool(field_map[m]['field']) for m in METRICS}
+    rem, spent, est = issue['remaining'], issue['spent'], issue['estimate']
+    done = issue['category'] == 'done'
+    out = []
+    if done and mapped['remaining'] and (rem or 0) > 0:
+        out.append('done_with_remaining')
+    if not done and not issue['container'] and (mapped['remaining'] or mapped['estimate']) \
+            and not ((rem or 0) > 0 or (est or 0) > 0):
+        out.append('no_estimate')
+    if issue['category'] == 'indeterminate' and mapped['remaining'] and not (rem or 0) > 0 and (est or 0) > 0:
+        out.append('zero_remaining')
+    if mapped['spent'] and mapped['estimate'] and (est or 0) > 0 and (spent or 0) > est:
+        out.append('overspent')
+    return out
+
+
+def issue_volume(issue):
+    """Объём задачи для burn-up: оценка, а если её нет — затрачено + остаток."""
+    if issue.get('estimate') is not None:
+        return issue['estimate']
+    return (issue.get('spent') or 0) + (issue.get('remaining') or 0)
 
 
 def connection_json(row):

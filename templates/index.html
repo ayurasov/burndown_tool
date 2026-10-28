@@ -128,6 +128,17 @@
           <div class="chart-wrap chart-wrap-sm"><canvas id="chartEstimateEpic"></canvas></div>
         </div>
       </div>
+      <div class="panel" id="jiraBurnupPanel" hidden>
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Объём и выполнение по задачам Jira (эпик)</div>
+            <div class="section-note">Burn-up по срезам задач: рост «Объёма» — добавились задачи или выросли оценки, рост «Выполнено» — задачи закрыты.</div>
+          </div>
+          <button type="button" class="btn btn-ghost btn-sm" id="jiraBurnupIssues">Задачи эпика</button>
+        </div>
+        <div class="legend-row" id="legendBurnup"></div>
+        <div class="chart-wrap chart-wrap-sm"><canvas id="chartBurnup"></canvas></div>
+      </div>
       <details class="collapsible" id="allEpicsBlock" open>
         <summary class="collapsible-summary">Графики по всем выбранным эпикам <span class="collapsible-hint">остаток, затраченное время и оценка</span></summary>
         <div class="view-stack">
@@ -155,6 +166,15 @@
           </div>
         </div>
       </details>
+      <div class="panel" id="jiraCompPanel" hidden>
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Задачи Jira по эпикам</div>
+            <div class="section-note">Последний срез из Jira: статусы задач, доля выполненного объёма и задачи с неполными данными. Щелчок по строке — список задач.</div>
+          </div>
+        </div>
+        <div class="table-scroll"><table class="data-table" id="jiraCompTable"></table></div>
+      </div>
       <div class="panel">
         <div class="panel-head"><div class="panel-title">Сводка по всем эпикам</div></div>
         <div class="table-scroll"><table class="data-table" id="summaryTable"></table></div>

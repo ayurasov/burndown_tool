@@ -878,3 +878,59 @@ def test_autofill_page_unlocks_after_snapshot(admin_ui, fake_jira, admin):
     entries = admin.get('/api/projects/1/data').get_json()['entries']
     assert any(e['service_id'] == 1 and e['date'] == today and e['remaining'] == 12.5 for e in entries)
     assert not admin_ui.errors
+
+
+def test_jira_composition_on_dashboard(admin_ui, fake_jira, admin):
+    page = admin_ui.page
+    assert page.is_hidden('#jiraCompPanel') and page.is_hidden('#jiraBurnupPanel')  # срезов ещё не было
+    admin.put('/api/projects/1/jira/connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
+    bid = admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'structureId': 7, 'mappings': [
+        {'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]}).get_json()['id']
+    for date in ('2026-11-02', '2026-11-03'):
+        admin.post(f'/api/jira/buttons/{bid}/snapshot', json={'date': date})
+    page.reload()
+    page.wait_for_selector('#jiraCompTable tbody tr[data-sid="1"]')
+    row = admin_ui.text('#jiraCompTable tbody tr[data-sid="1"]')
+    assert '19%' in row and '1 / 2' in row and '⚠ 1' in row and '03.11.2026' in row
+    assert page.locator('#jiraCompTable tbody tr').count() == 1  # только эпики со срезом
+    # burn-up выбранного эпика: две точки истории
+    page.select_option('#chartServiceSelect', '1')
+    page.wait_for_selector('#jiraBurnupPanel:not([hidden])')
+    assert page.evaluate("Chart.getChart('chartBurnup').data.datasets.map(d => d.data.length)") == [2, 2]
+    page.select_option('#chartServiceSelect', '2')
+    assert page.is_hidden('#jiraBurnupPanel')
+    # список задач эпика: ссылки в Jira и фильтр проблем
+    page.click('#jiraCompTable tbody tr[data-sid="1"]')
+    page.wait_for_selector('#jiTable tbody tr')
+    assert admin_ui.text('#confirmTitle') == 'Задачи Jira: ' + admin_ui.text('#jiraCompTable tbody tr[data-sid="1"] td')
+    assert page.get_attribute('#jiTable a:has-text("ABC-2")', 'href') == fake_jira.url + '/browse/ABC-2'
+    assert page.is_hidden('#confirmCancel')
+    page.click('#jiFilter [data-filter="problems"]')
+    visible = [t.strip() for t in page.locator('#jiTable tbody tr:not([hidden]) td:first-child').all_text_contents()]
+    assert visible == ['ABC-2']
+    assert 'Закрыта, но остаток не обнулён' in admin_ui.text('#jiTable tbody tr:not([hidden])')
+    page.click('#confirmOk')
+    page.wait_for_selector('#confirmModal:not(.show)', state='attached')
+    # в обычных окнах кнопка «Отмена» снова на месте
+    admin_ui.go('data')
+    page.click('#btnBulkMeasure')
+    assert page.is_visible('#confirmCancel')
+    page.click('#confirmCancel')
+    admin_ui.go('dashboard')
+    # фильтр эпиков дашборда скрывает и строку состава
+    page.uncheck('#dashEpicChecks input[data-sid="1"]')
+    assert page.is_hidden('#jiraCompPanel')
+    assert not admin_ui.errors
+
+
+def test_jira_composition_visible_for_viewer(ui, make_user, admin, fake_jira):
+    admin.put('/api/projects/1/jira/connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
+    bid = admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'mappings': [
+        {'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]}).get_json()['id']
+    admin.post(f'/api/jira/buttons/{bid}/snapshot', json={'date': '2026-11-02'})
+    make_user('viewer', project_id=1)
+    ui.login('viewer', 'pw-12345')
+    ui.page.wait_for_selector('#jiraCompTable tbody tr[data-sid="1"]')
+    ui.page.click('#jiraCompTable tbody tr[data-sid="1"]')
+    ui.page.wait_for_selector('#jiTable tbody tr')
+    assert ui.page.locator('#jiTable tbody tr').count() == 2  # ABC-1 и подзадача ABC-6

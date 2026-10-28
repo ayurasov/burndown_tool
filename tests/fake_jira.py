@@ -9,6 +9,7 @@
     ABC-4 (104)            10 ч / 0 / 10 ч  (соседний корень, не входит в поддерево ABC-1)
 ABC-6 (107) — подзадача ABC-1 вне структуры: 4 ч / 2 ч / 6 ч (с ней ABC-1 даёт 14 / 7 / 18).
 ABC-5 (106) — вне структуры. customfield_10050 — числовое поле «Трудозатраты, ч» (в часах).
+Статусы: ABC-1, ABC-3, ABC-6 — в работе; ABC-2 — готово (с ненулевым остатком); остальные — открыты.
 """
 
 import base64
@@ -20,14 +21,14 @@ from werkzeug.serving import make_server
 
 H = 3600
 ISSUES = {
-    101: {'key': 'ABC-1', 'timeestimate': 10 * H, 'timespent': 5 * H, 'timeoriginalestimate': 12 * H,
+    101: {'key': 'ABC-1', 'category': 'indeterminate', 'timeestimate': 10 * H, 'timespent': 5 * H, 'timeoriginalestimate': 12 * H,
           'customfield_10050': 20, 'customfield_10060': 'текст'},
-    102: {'key': 'ABC-2', 'timeestimate': 2 * H, 'timespent': 1 * H, 'timeoriginalestimate': 3 * H},
-    103: {'key': 'ABC-3', 'timeestimate': H // 2, 'timespent': None, 'timeoriginalestimate': 1 * H},
+    102: {'key': 'ABC-2', 'category': 'done', 'summary': 'Интеграция с ЕИС', 'timeestimate': 2 * H, 'timespent': 1 * H, 'timeoriginalestimate': 3 * H},
+    103: {'key': 'ABC-3', 'category': 'indeterminate', 'timeestimate': H // 2, 'timespent': None, 'timeoriginalestimate': 1 * H},
     104: {'key': 'ABC-4', 'timeestimate': 10 * H, 'timespent': 0, 'timeoriginalestimate': 10 * H},
     105: {'key': 'ABC-9', 'hidden': True, 'timeestimate': 100 * H},
     106: {'key': 'ABC-5', 'timeestimate': 1 * H, 'timespent': 1 * H, 'timeoriginalestimate': 2 * H},
-    107: {'key': 'ABC-6', 'parent': 'ABC-1', 'timeestimate': 4 * H, 'timespent': 2 * H, 'timeoriginalestimate': 6 * H,
+    107: {'key': 'ABC-6', 'category': 'indeterminate', 'parent': 'ABC-1', 'timeestimate': 4 * H, 'timespent': 2 * H, 'timeoriginalestimate': 6 * H,
           'customfield_10050': 5.5},
 }
 FIELDS = [
@@ -42,9 +43,24 @@ FORMULA = '1:0:101,2:1:102,6:1:105,3:1:5/9,4:2:103,5:0:104'
 STRUCTURES = [{'id': 7, 'name': 'Релиз 2026'}, {'id': 8, 'name': 'Бэклог'}]
 
 
+STATUS_NAMES = {'new': 'Открыта', 'indeterminate': 'В работе', 'done': 'Готово'}
+
+
+def _field(data, name):
+    """Поле задачи в формате Jira REST: parent и status — объекты."""
+    if name == 'parent':
+        return {'key': data['parent']} if data.get('parent') else None
+    if name == 'status':
+        category = data.get('category', 'new')
+        return {'name': data.get('status') or STATUS_NAMES[category], 'statusCategory': {'key': category}}
+    if name == 'summary':
+        return data.get('summary') or f"Задача {data['key']}"
+    return data.get(name)
+
+
 def _issue_json(issue_id, fields):
     data = ISSUES[issue_id]
-    return {'id': str(issue_id), 'key': data['key'], 'fields': {f: data.get(f) for f in fields}}
+    return {'id': str(issue_id), 'key': data['key'], 'fields': {f: _field(data, f) for f in fields}}
 
 
 def create_app(state):

@@ -30,21 +30,45 @@ import init_db  # noqa: E402
 H = 3600
 
 
-def demo_jira():
-    """Учебная Jira: структура «АИСУЗ — релиз 4.0», у каждого эпика — задача-эпик с тремя задачами."""
+HISTORY = ['2026-07-17', '2026-07-24', '2026-07-28', '2026-07-29']  # срезы состава задач для burn-up
+
+
+def demo_jira(step=3):
+    """Учебная Jira: структура «АИСУЗ — релиз 4.0», у каждого эпика — задача-эпик с задачами.
+
+    step 0…3 — состояние задач на даты HISTORY: задачи закрываются, в эпик «Работа с жалобами» добавляется
+    задача (рост объёма); к последнему срезу появляются задачи с неполными данными для примера проверок.
+    """
     totals = {  # эпик проекта: (ключ, остаток, затрачено, оценка), ч
         1: ('AISUZ-100', 330, 272, 410), 2: ('AISUZ-200', 198, 266, 330), 3: ('AISUZ-300', 96, 610, 526),
         4: ('AISUZ-400', 186, 2016, 1312), 5: ('AISUZ-500', 262, 2330, 1694), 6: ('AISUZ-600', 78, 377, 420)}
+    names = ['Анализ требований', 'Разработка API', 'Интерфейс пользователя', 'Интеграция с ЕИС', 'Миграция данных']
     issues, formula, row = {}, [], 1
     for epic, (key, rem, spent, est) in totals.items():
         root = epic * 100
-        issues[root] = {'key': key, 'timeestimate': None, 'timespent': None, 'timeoriginalestimate': None}
+        issues[root] = {'key': key, 'summary': 'Эпик ' + key, 'category': 'indeterminate',
+                        'timeestimate': None, 'timespent': None, 'timeoriginalestimate': None}
         formula.append(f'{row}:0:{root}')
         row += 1
-        for i, share in enumerate((0.5, 0.3, 0.2), start=1):
-            issues[root + i] = {'key': f'AISUZ-{root + i}', 'parent': key, 'timeestimate': int(rem * share * H),
-                                'timespent': int(spent * share * H), 'timeoriginalestimate': int(est * share * H),
-                                'customfield_10050': round(est * share / 8, 1)}
+        children = [(1, 0.5), (2, 0.3), (3, 0.2)]
+        if epic == 1 and step >= 2:
+            children.append((4, 0.1))  # новая задача — объём эпика вырос
+        if epic == 4 and step >= 3:
+            children.append((5, 0))    # заведена без оценки
+        for i, share in children:
+            done_at = {1: 1 + epic % 2, 2: 3, 3: 9, 4: 9, 5: 9}[i]
+            category = 'done' if step >= done_at else ('indeterminate' if step >= i - 1 else 'new')
+            left = 0 if category == 'done' else rem * share
+            issue = {'key': f'AISUZ-{root + i}', 'parent': key, 'summary': names[i - 1], 'category': category,
+                     'timeestimate': int(left * H), 'timespent': int(spent * share * H),
+                     'timeoriginalestimate': int(est * share * H), 'customfield_10050': round(est * share / 8, 1)}
+            if share == 0:
+                issue.update(timeestimate=None, timespent=None, timeoriginalestimate=None)
+            if epic == 2 and i == 1 and category == 'done':
+                issue['timeestimate'] = 6 * H  # закрыта, но остаток не обнулён
+            if epic == 5 and i == 2 and step >= 3:
+                issue['timespent'] = int(est * share * 1.4 * H)  # перерасход
+            issues[root + i] = issue
             formula.append(f'{row}:1:{root + i}')
             row += 1
     fake_jira.ISSUES = issues
@@ -55,6 +79,22 @@ def demo_jira():
         {'id': 'customfield_10051', 'name': 'Трудозатраты по плану, ч', 'custom': True, 'schema': {'type': 'number'}},
         {'id': 'customfield_10016', 'name': 'Story Points', 'custom': True, 'schema': {'type': 'number'}}]
     fake_jira.FIELDS[4] = dict(fake_jira.FIELDS[4], name='Трудозатраты, чел.-дни')
+
+
+def jira_history(api, base, jira_url):
+    """История состава задач: срезы на даты HISTORY через временную кнопку (состав хранится по эпикам)."""
+    api.put(base + '/api/projects/1/jira/connection', json={'baseUrl': jira_url, 'instanceType': 'server',
+                                                             'login': '', 'token': 'demo-pat'})
+    bid = api.post(base + '/api/projects/1/jira/buttons', json={
+        'name': 'история', 'structureId': 7, 'structureName': 'АИСУЗ — релиз 4.0',
+        'mappings': [{'serviceId': sid, 'issueKeys': f'AISUZ-{sid}00', 'includeSubtree': True}
+                     for sid in range(1, 7)]}).json()['id']
+    for step, date in enumerate(HISTORY):
+        demo_jira(step)
+        api.post(f'{base}/api/jira/buttons/{bid}/snapshot', json={'date': date}).raise_for_status()
+    api.delete(f'{base}/api/jira/buttons/{bid}')
+    api.delete(base + '/api/projects/1/jira/connection')
+    demo_jira()
 
 
 def start_app():
@@ -90,6 +130,7 @@ def main():
     jira = fake_jira.FakeJira(token='demo-pat')
     base = start_app()
     api = prepare(base, jira.url)
+    jira_history(api, base, jira.url)
     (OUT / 'user').mkdir(parents=True, exist_ok=True)
     (OUT / 'admin').mkdir(parents=True, exist_ok=True)
 
@@ -154,6 +195,18 @@ def main():
         shot(pg.locator('#allEpicsBlock'), 'user/08-all-epics.png')
         shot(pg.locator('#summaryTable').locator('xpath=ancestor::div[contains(@class,"panel")]'), 'user/09-summary.png')
         shot(pg.locator('#burnRateTable').locator('xpath=ancestor::div[contains(@class,"panel")]'), 'user/10-burnrate.png')
+        # задачи Jira: состав эпиков, burn-up, список задач эпика с проблемами данных
+        pg.wait_for_selector('#jiraCompTable tbody tr')
+        shot(pg.locator('#jiraCompPanel'), 'user/34-jira-composition.png')
+        shot(pg.locator('#jiraBurnupPanel'), 'user/35-jira-burnup.png')
+        pg.click('#jiraCompTable tr[data-sid="4"]')
+        pg.wait_for_selector('#jiTable tbody tr')
+        pg.wait_for_timeout(300)
+        shot(pg.locator('#confirmModal .modal'), 'user/36-jira-issues.png')
+        pg.click('#jiFilter [data-filter="problems"]')
+        pg.wait_for_timeout(200)
+        shot(pg.locator('#confirmModal .modal'), 'user/37-jira-issues-problems.png')
+        pg.keyboard.press('Escape')
 
         # ── Свод по этапам
         go('stages', '#stageSummaryTable tbody tr')
