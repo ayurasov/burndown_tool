@@ -30,6 +30,7 @@ from fake_notify import FakeSMTP, FakeTelegram  # noqa: E402
 import init_db  # noqa: E402
 
 H = 3600
+ADMIN_PASSWORD = 'Demo-Admin-2026'
 
 
 HISTORY = ['2026-07-17', '2026-07-24', '2026-07-28', '2026-07-29']  # срезы состава задач для burn-up
@@ -112,8 +113,9 @@ def start_app():
 def prepare(base, jira_url):
     s = requests.Session()
     s.post(base + '/api/auth/login', json={'username': 'admin', 'password': 'Test198!'})
+    # пароль по умолчанию сменён, как требует руководство, — иначе в меню будет предупреждение о нём
     s.put(base + '/api/profile', json={'displayName': 'Администратор', 'email': 'admin@example.ru',
-                                       'position': 'Администратор системы'})
+                                       'position': 'Администратор системы', 'password': ADMIN_PASSWORD})
     users = {}
     for login, name, pos, role in [('ivanov', 'Иванов Сергей', 'Руководитель проекта', 'manager'),
                                    ('petrova', 'Петрова Анна', 'Аналитик', 'user'),
@@ -186,7 +188,7 @@ def main():
         pg.goto(base + '/login')
         pg.wait_for_timeout(300)
         shot(pg, 'user/01-login.png')
-        login(pg, 'admin', 'Test198!')
+        login(pg, 'admin', ADMIN_PASSWORD)
         shot(pg, 'user/02-dashboard.png')
         shot(pg.locator('.sidebar'), 'user/03-sidebar.png')
         shot(pg.locator('#view-dashboard .quick-filter'), 'user/04-quick-filter.png')
@@ -433,7 +435,7 @@ def main():
         # ── Телефон
         ctx = context(viewport={'width': 390, 'height': 844}, is_mobile=True, has_touch=True)
         pg = ctx.new_page()
-        login(pg, 'admin', 'Test198!')
+        login(pg, 'admin', ADMIN_PASSWORD)
         shot(pg, 'user/22-mobile.png')
         pg.click('#sidebarToggle')
         pg.wait_for_timeout(400)

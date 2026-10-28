@@ -11,6 +11,7 @@
 import os
 import re
 import math
+import hashlib
 import secrets
 import sqlite3
 import json
@@ -28,20 +29,32 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from init_db import create_indexes, create_jira_tables, create_notify_tables
+from init_db import create_auth_tables, create_indexes, create_jira_tables, create_notify_tables
 import forecast as fc
 import jira_integration as jira
 import notify
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'burndown.db'))
+log = logging.getLogger('burndown')
+MIN_SECRET_KEY = 32  # короче — ключ подбирается или взят из примера (например, «замените-это» из README)
+
+
+def weak_secret_key():
+    """SECRET_KEY из окружения, который нельзя использовать: короче MIN_SECRET_KEY символов."""
+    env_key = os.environ.get('SECRET_KEY') or ''
+    return env_key if env_key and len(env_key) < MIN_SECRET_KEY else None
 
 
 def load_secret_key():
-    """SECRET_KEY из окружения; иначе случайный ключ, сохраняемый рядом с БД (общий для всех воркеров)."""
+    """SECRET_KEY из окружения; иначе (или если он слишком короткий) — случайный ключ, сохраняемый рядом с БД
+    (общий для всех воркеров)."""
     env_key = os.environ.get('SECRET_KEY')
-    if env_key:
+    if env_key and not weak_secret_key():
         return env_key
+    if env_key:
+        log.warning('SECRET_KEY короче %s символов — вместо него используется случайный ключ из файла .secret_key '
+                    'рядом с базой. Задайте длинный ключ: openssl rand -hex 32', MIN_SECRET_KEY)
     key_path = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), '.secret_key')
     try:
         with open(key_path, encoding='utf-8') as f:
@@ -59,6 +72,11 @@ def load_secret_key():
         # другой воркер успел создать файл — используем его ключ
         with open(key_path, encoding='utf-8') as f:
             return f.read().strip()
+    except OSError:
+        if env_key:  # нет прав на запись рядом с базой — остаётся ключ из окружения
+            log.error('Не удалось сохранить %s — используется короткий SECRET_KEY из окружения', key_path)
+            return env_key
+        raise
     return key
 
 
@@ -68,14 +86,28 @@ app.config.update(
     SESSION_COOKIE_SAMESITE='Lax',
     # при работе по HTTPS включите: SESSION_COOKIE_SECURE=1
     SESSION_COOKIE_SECURE=os.environ.get('SESSION_COOKIE_SECURE', '').lower() in ('1', 'true', 'yes'),
+    MAX_CONTENT_LENGTH=4 * 1024 * 1024,  # самый большой запрос — фото профиля (до 1,5 МБ в base64)
 )
+
+
+def _migration_lock():
+    """Межпроцессная блокировка на время миграции: воркеры gunicorn стартуют одновременно, и без неё два процесса
+    могут добавлять одну и ту же колонку (второй падает с «duplicate column name»)."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover — Windows: один процесс разработки
+        return None
+    lock = open(DB_PATH + '.migrate.lock', 'a')
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
 
 
 def migrate_db():
     """Дополняет таблицу services полями is_done и stage_group для старых баз и создаёт индексы."""
     if not os.path.exists(DB_PATH):
         return
-    conn = sqlite3.connect(DB_PATH)
+    lock = _migration_lock()
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     try:
         cols = [r[1] for r in conn.execute('PRAGMA table_info(services)')]
         if 'is_done' not in cols:
@@ -84,10 +116,38 @@ def migrate_db():
             conn.execute('ALTER TABLE services ADD COLUMN stage_group TEXT')
         create_jira_tables(conn)
         create_notify_tables(conn)
+        create_auth_tables(conn)
         create_indexes(conn)
         conn.commit()
+        rekey_secrets(conn)
     finally:
         conn.close()
+        if lock:
+            lock.close()
+
+
+def rekey_secrets(conn):
+    """Токены Jira, пароль SMTP и токен бота, зашифрованные прежним коротким SECRET_KEY, перешифровываются новым
+    ключом — после замены слабого ключа сохранённые подключения продолжают работать."""
+    old_key = weak_secret_key()
+    if not old_key or old_key == app.secret_key:
+        return
+    rows = [('jira_connections', 'project_id', r[0], 'token_encrypted', r[1])
+            for r in conn.execute('SELECT project_id, token_encrypted FROM jira_connections WHERE token_encrypted IS NOT NULL')]
+    rows += [('app_settings', 'key', r[0], 'value', r[1]) for r in conn.execute(
+        "SELECT key, value FROM app_settings WHERE key IN ('smtp_password', 'telegram_token') AND value IS NOT NULL")]
+    for table, id_col, ident, col, encrypted in rows:
+        try:
+            jira.decrypt_token(app.secret_key, encrypted)
+            continue  # уже зашифрован новым ключом
+        except jira.JiraError:
+            pass
+        try:
+            plain = jira.decrypt_token(old_key, encrypted)
+        except jira.JiraError:
+            continue
+        conn.execute(f'UPDATE {table} SET {col} = ? WHERE {id_col} = ?', (jira.encrypt_token(app.secret_key, plain), ident))
+    conn.commit()
 
 
 migrate_db()
@@ -151,11 +211,12 @@ def parse_date(value, field, required=True):
         if required:
             raise ValidationError(f'Укажите поле «{field}»')
         return value
+    if not isinstance(value, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+        raise ValidationError(f'Поле «{field}»: дата в формате ГГГГ-ММ-ДД')
     try:
-        datetime.strptime(str(value), '%Y-%m-%d')
+        return datetime.strptime(value, '%Y-%m-%d').date().isoformat()
     except ValueError:
         raise ValidationError(f'Поле «{field}»: некорректная дата')
-    return str(value)
 
 
 @app.errorhandler(ValidationError)
@@ -168,9 +229,81 @@ def handle_jira_error(err):
     return jsonify({'error': str(err)}), 502
 
 
-def text_value(value):
-    """Строковое поле запроса: None и нестроковые значения приводятся к строке без пробелов по краям."""
-    return '' if value is None else str(value).strip()
+MAX_TEXT = 2000  # названия, ключи задач, адреса — длиннее не бывает; ограничение защищает БД и отчёты PDF
+
+
+def text_value(value, limit=MAX_TEXT):
+    """Строковое поле запроса без пробелов по краям: None → '', число → строка; объект или список — ошибка 400."""
+    if value is None:
+        return ''
+    if isinstance(value, (dict, list)):
+        raise ValidationError('Ожидается текст, а не объект или список')
+    text = str(value).strip()
+    if len(text) > limit:
+        raise ValidationError(f'Слишком длинное значение: больше {limit} символов')
+    try:
+        text.encode('utf-8')
+    except UnicodeEncodeError:  # одиночный суррогат из «\ud800» в JSON — SQLite его не сохранит
+        raise ValidationError('Текст содержит недопустимые символы')
+    return text
+
+
+def json_body():
+    """Тело запроса — JSON-объект; пустое тело — {}; список или строка — ошибка 400 (а не 500)."""
+    data = request.get_json() if request.get_data(cache=True) else None
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValidationError('Тело запроса должно быть JSON-объектом')
+    return data
+
+
+def int_value(value, field, low=0, high=2 ** 31):
+    """Целое число из запроса в разумных пределах (SQLite не принимает числа больше 2^63)."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)) or not re.fullmatch(r'-?[0-9]{1,12}', str(value).strip()):
+        raise ValidationError(f'Поле «{field}»: ожидается целое число')
+    num = int(str(value).strip())
+    if not low <= num <= high:
+        raise ValidationError(f'Поле «{field}»: число от {low} до {high}')
+    return num
+
+
+def is_int_text(text):
+    """Строка из цифр 0–9 (str.isdigit пропускает и «²», на котором int() падает)."""
+    return bool(re.fullmatch(r'[0-9]{1,12}', text or ''))
+
+
+@app.errorhandler(OverflowError)
+def handle_overflow(err):
+    # слишком большое число в пути или теле запроса (SQLite: «Python int too large to convert»)
+    return jsonify({'error': 'Слишком большое число'}), 400
+
+
+@app.errorhandler(UnicodeEncodeError)
+def handle_bad_text(err):
+    return jsonify({'error': 'Текст содержит недопустимые символы'}), 400
+
+
+@app.errorhandler(413)
+def handle_too_large(err):
+    return jsonify({'error': 'Слишком большой запрос'}), 413
+
+
+@app.before_request
+def require_json_post():
+    """POST к API — только JSON. Форма с другого сайта (CSRF) не может отправить application/json без
+    разрешения CORS, поэтому такие запросы отклоняются до обработчика."""
+    if request.method == 'POST' and request.path.startswith('/api/') and not request.is_json:
+        return jsonify({'error': 'Запрос должен быть в формате JSON'}), 415
+
+
+@app.after_request
+def security_headers(resp):
+    resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    resp.headers.setdefault('X-Frame-Options', 'DENY')
+    resp.headers.setdefault('Referrer-Policy', 'same-origin')
+    resp.headers.setdefault('Content-Security-Policy', "frame-ancestors 'none'")
+    return resp
 
 
 MAX_PHOTO_CHARS = 2_200_000  # ~1,5 МБ изображения в base64 (как ограничение в интерфейсе)
@@ -212,11 +345,28 @@ def parse_entry_values(data):
 
 # ─── Auth helpers ────────────────────────────────────────────────
 
+def password_stamp(user):
+    """Отпечаток пароля в сессии: после смены пароля (пользователем или администратором) прежние сессии,
+    в том числе на других устройствах, перестают действовать."""
+    return hashlib.sha256(('session:' + user['password_hash']).encode()).hexdigest()[:16]
+
+
+def start_session(user, default_password=False):
+    session.clear()
+    session['user_id'] = user['id']
+    session['pw'] = password_stamp(user)
+    if default_password:
+        session['default_pw'] = True
+
+
 def get_current_user():
     if 'user_id' not in session:
         return None
     db = get_db()
-    return db.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],)).fetchone()
+    user = db.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],)).fetchone()
+    if user and session.get('pw') != password_stamp(user):
+        return None
+    return user
 
 
 def login_required(f):
@@ -315,19 +465,33 @@ def login_page():
 
 # ─── API: Auth ───────────────────────────────────────────────────
 
+DEFAULT_ADMIN_PASSWORD = 'Test198!'  # пароль из init_db — при входе с ним интерфейс просит его сменить
+LOGIN_MAX_FAILURES = 10
+LOGIN_LOCK = timedelta(minutes=15)
+
+
+def _login_failures(db, username):
+    since = (datetime.now(timezone.utc) - LOGIN_LOCK).isoformat()
+    return db.execute('SELECT COUNT(*) FROM login_failures WHERE username = ? AND ip = ? AND at > ?',
+                      (username, request.remote_addr or '', since)).fetchone()[0]
+
+
 @app.route('/api/auth/login', methods=['POST'])
 def api_login():
-    data = request.get_json() or {}
-    username = text_value(data.get('username'))
+    data = json_body()
+    username = text_value(data.get('username'), 150)
     password = data.get('password') or ''
     if not username or not password or not isinstance(password, str):
         return jsonify({'error': 'Введите логин и пароль'}), 400
 
     db = get_db()
+    if _login_failures(db, username) >= LOGIN_MAX_FAILURES:
+        return jsonify({'error': 'Слишком много неудачных попыток входа — попробуйте через 15 минут'}), 429
     user = db.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
     if user and check_password_hash(user['password_hash'], password):
-        session.clear()
-        session['user_id'] = user['id']
+        db.execute('DELETE FROM login_failures WHERE username = ? AND ip = ?', (username, request.remote_addr or ''))
+        db.commit()
+        start_session(user, default_password=password == DEFAULT_ADMIN_PASSWORD)
         return jsonify({
             'success': True,
             'user': {
@@ -340,6 +504,10 @@ def api_login():
                 'role': user['role']
             }
         })
+    db.execute('DELETE FROM login_failures WHERE at < ?', ((datetime.now(timezone.utc) - LOGIN_LOCK).isoformat(),))
+    db.execute('INSERT INTO login_failures (username, ip, at) VALUES (?, ?, ?)',
+               (username, request.remote_addr or '', datetime.now(timezone.utc).isoformat()))
+    db.commit()
     return jsonify({'error': 'Неверный логин или пароль'}), 401
 
 
@@ -363,7 +531,8 @@ def api_me():
             'position': user['position'] or '',
             'photo': user['photo'] or '',
             'role': user['role']
-        }
+        },
+        'defaultPassword': bool(session.get('default_pw')),
     })
 
 
@@ -401,34 +570,35 @@ def api_get_projects():
 @app.route('/api/projects', methods=['POST'])
 @admin_required
 def api_create_project():
-    data = request.get_json() or {}
+    data = json_body()
     name = text_value(data.get('name'))
     if not name:
         return jsonify({'error': 'Укажите название проекта'}), 400
 
+    description = text_value(data.get('description'))
     db = get_db()
     cur = db.execute(
         'INSERT INTO projects (name, description) VALUES (?, ?)',
-        (name, data.get('description', ''))
+        (name, description)
     )
     project_id = cur.lastrowid
     # Создаём настройки по умолчанию
     db.execute('INSERT INTO settings (project_id) VALUES (?)', (project_id,))
     db.commit()
     audit_log('projects', 'create', 'project', project_id, project_id, [{'field': 'name', 'old': None, 'new': name}])
-    return jsonify({'id': project_id, 'name': name, 'description': data.get('description', '')})
+    return jsonify({'id': project_id, 'name': name, 'description': description})
 
 
 @app.route('/api/projects/<int:pid>', methods=['PUT'])
 @admin_required
 def api_update_project(pid):
-    data = request.get_json() or {}
+    data = json_body()
     db = get_db()
     project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
     if not project:
         return jsonify({'error': 'Проект не найден'}), 404
     name = text_value(data.get('name', project['name']))
-    description = data.get('description', project['description'])
+    description = text_value(data.get('description', project['description']))
     if not name:
         return jsonify({'error': 'Укажите название проекта'}), 400
     changes = []
@@ -498,18 +668,20 @@ def api_get_project_data(pid):
 def api_create_service(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
-    data = request.get_json() or {}
-    parse_date(data.get('targetDate'), 'Целевая дата', required=False)
+    data = json_body()
+    target = parse_date(data.get('targetDate'), 'Целевая дата', required=False) or ''
+    etap, name, stage_group = (text_value(data.get(k), 300) for k in ('etap', 'name', 'stageGroup'))
     db = get_db()
+    if not db.execute('SELECT 1 FROM projects WHERE id = ?', (pid,)).fetchone():
+        return jsonify({'error': 'Проект не найден'}), 404
     max_order = db.execute('SELECT COALESCE(MAX(sort_order), 0) FROM services WHERE project_id = ?', (pid,)).fetchone()[0]
     cur = db.execute(
         'INSERT INTO services (project_id, etap, name, target_date, sort_order, is_done, stage_group) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        (pid, data.get('etap', ''), data.get('name', ''), data.get('targetDate', ''), max_order + 1,
-         1 if data.get('isDone') else 0, data.get('stageGroup', ''))
+        (pid, etap, name, target, max_order + 1, 1 if data.get('isDone') else 0, stage_group)
     )
     db.commit()
     audit_log('services', 'create', 'service', cur.lastrowid, pid,
-              [{'field': 'name', 'old': None, 'new': data.get('name', '')}], entity_name=data.get('name', ''))
+              [{'field': 'name', 'old': None, 'new': name}], entity_name=name)
     return jsonify({'id': cur.lastrowid})
 
 
@@ -522,9 +694,12 @@ def api_update_service(sid):
         return jsonify({'error': 'Не найдено'}), 404
     if not can_edit_project(session['user_id'], svc['project_id']):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
-    data = request.get_json() or {}
+    data = json_body()
     if 'targetDate' in data:
-        parse_date(data['targetDate'], 'Целевая дата', required=False)
+        data['targetDate'] = parse_date(data['targetDate'], 'Целевая дата', required=False)
+    for key in ('etap', 'name', 'stageGroup'):
+        if key in data:
+            data[key] = text_value(data[key], 300)
     is_done = 1 if data.get('isDone', bool(svc['is_done'])) else 0
     stage_group = data.get('stageGroup', svc['stage_group'])
     changes = []
@@ -572,7 +747,7 @@ def api_delete_service(sid):
 def api_reorder_services(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
-    data = request.get_json() or {}
+    data = json_body()
     orders = data.get('orders', [])  # list of {id, sortOrder}
     if not isinstance(orders, list) or not all(
             isinstance(o, dict) and isinstance(o.get('id'), int) and isinstance(o.get('sortOrder'), int) for o in orders):
@@ -596,15 +771,16 @@ def api_create_entry(sid):
         return jsonify({'error': 'Не найдено'}), 404
     if not can_edit_project(session['user_id'], svc['project_id']):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
-    data = request.get_json() or {}
+    data = json_body()
     date = parse_date(data.get('date'), 'Дата замера')
     vals = parse_entry_values(data)
-    if db.execute('SELECT 1 FROM entries WHERE service_id = ? AND date = ?', (sid, date)).fetchone():
+    try:
+        cur = db.execute(
+            'INSERT INTO entries (service_id, date, remaining, spent, estimate) VALUES (?, ?, ?, ?, ?)',
+            (sid, date, vals['remaining'], vals['spent'], vals['estimate'])
+        )
+    except sqlite3.IntegrityError:  # уникальный индекс (service_id, date)
         return jsonify({'error': 'Замер на эту дату уже есть'}), 400
-    cur = db.execute(
-        'INSERT INTO entries (service_id, date, remaining, spent, estimate) VALUES (?, ?, ?, ?, ?)',
-        (sid, date, vals['remaining'], vals['spent'], vals['estimate'])
-    )
     db.commit()
     audit_log('data', 'create', 'entry', cur.lastrowid, svc['project_id'],
               [{'field': 'date', 'old': None, 'new': data.get('date')}], entity_name=svc['name'])
@@ -621,9 +797,10 @@ def api_update_entry(eid):
     svc = db.execute('SELECT * FROM services WHERE id = ?', (entry['service_id'],)).fetchone()
     if not svc or not can_edit_project(session['user_id'], svc['project_id']):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
-    data = request.get_json() or {}
+    data = json_body()
     date = parse_date(data.get('date', entry['date']), 'Дата замера')
-    vals = parse_entry_values(data)
+    # поля, которых нет в запросе, не меняются; явный null очищает значение
+    vals = {f: parse_hours(data[f], label) if f in data else entry[f] for f, label in HOUR_FIELDS.items()}
     if date != entry['date'] and db.execute(
             'SELECT 1 FROM entries WHERE service_id = ? AND date = ? AND id != ?',
             (entry['service_id'], date, eid)).fetchone():
@@ -633,10 +810,13 @@ def api_update_entry(eid):
         if old_val != new_val:
             changes.append({'field': field, 'old': None if old_val is None else str(old_val),
                             'new': None if new_val is None else str(new_val)})
-    db.execute(
-        'UPDATE entries SET date = ?, remaining = ?, spent = ?, estimate = ? WHERE id = ?',
-        (date, vals['remaining'], vals['spent'], vals['estimate'], eid)
-    )
+    try:
+        db.execute(
+            'UPDATE entries SET date = ?, remaining = ?, spent = ?, estimate = ? WHERE id = ?',
+            (date, vals['remaining'], vals['spent'], vals['estimate'], eid)
+        )
+    except sqlite3.IntegrityError:
+        return jsonify({'error': 'Замер на эту дату уже есть'}), 400
     db.commit()
     if changes:
         audit_log('data', 'update', 'entry', eid, svc['project_id'], changes, entity_name=svc['name'])
@@ -649,7 +829,7 @@ def api_bulk_measurements(pid):
     """Замер на одну дату сразу по нескольким эпикам: существующие записи на дату обновляются, новые — создаются."""
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
-    data = request.get_json() or {}
+    data = json_body()
     date = parse_date(data.get('date'), 'Дата замера')
     items = data.get('items') or []
     if not isinstance(items, list) or not items:
@@ -659,11 +839,15 @@ def api_bulk_measurements(pid):
     parsed = []
     for item in items:
         sid = item.get('serviceId') if isinstance(item, dict) else None
-        if sid not in services:
+        if not isinstance(sid, int) or sid not in services:
             return jsonify({'error': 'Эпик не найден в проекте'}), 400
         vals = parse_entry_values(item)
         if all(v is None for v in vals.values()):
             continue  # пустые строки формы пропускаем
+        # пустое поле не затирает значение, уже внесённое на эту дату (как при автозаполнении)
+        existing = db.execute('SELECT * FROM entries WHERE service_id = ? AND date = ?', (sid, date)).fetchone()
+        if existing:
+            vals = {f: existing[f] if v is None else v for f, v in vals.items()}
         parsed.append((sid, vals))
     if not parsed:
         return jsonify({'error': 'Заполните хотя бы одно значение'}), 400
@@ -696,8 +880,11 @@ def save_measurements(db, pid, date, parsed, services, actor=None, overwrite=Tru
                        (vals['remaining'], vals['spent'], vals['estimate'], existing['id']))
             eid, action = existing['id'], 'update'
         else:
-            eid = db.execute('INSERT INTO entries (service_id, date, remaining, spent, estimate) VALUES (?, ?, ?, ?, ?)',
-                             (sid, date, vals['remaining'], vals['spent'], vals['estimate'])).lastrowid
+            # ON CONFLICT: замер на ту же дату мог появиться параллельно (автозапуск и «Запустить сейчас»)
+            eid = db.execute('INSERT INTO entries (service_id, date, remaining, spent, estimate) VALUES (?, ?, ?, ?, ?) '
+                             'ON CONFLICT(service_id, date) DO UPDATE SET remaining = excluded.remaining, '
+                             'spent = excluded.spent, estimate = excluded.estimate RETURNING id',
+                             (sid, date, vals['remaining'], vals['spent'], vals['estimate'])).fetchone()[0]
             action = 'create'
         result.append(dict(id=eid, service_id=sid, date=date, **vals))
         changes = [{'field': f, 'old': _num_text(existing[f]) if existing else None, 'new': _num_text(vals[f])}
@@ -732,8 +919,8 @@ def api_delete_entry(eid):
 def api_update_stage_target(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
-    data = request.get_json() or {}
-    stage_name = data.get('stageName')
+    data = json_body()
+    stage_name = text_value(data.get('stageName'), 300)
     target_date = parse_date(data.get('targetDate'), 'Целевая дата', required=False)
     if not stage_name:
         return jsonify({'error': 'Укажите название этапа'}), 400
@@ -763,7 +950,7 @@ def api_update_stage_target(pid):
 def api_update_settings(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
-    data = {k: v for k, v in (request.get_json() or {}).items() if v is not None}  # null — не менять
+    data = {k: v for k, v in json_body().items() if v is not None}  # null — не менять
     if 'forecastMethod' in data and data['forecastMethod'] not in ('linear', 'average'):
         raise ValidationError('Недопустимый метод прогноза')
     if 'burnrateMethod' in data and data['burnrateMethod'] not in ('all', 'rolling'):
@@ -846,6 +1033,8 @@ def _jira_client(db, pid, override=None):
     login = text_value(conf.get('login')) if override else (saved['login'] or '')
     insecure = bool(conf.get('acceptInvalidCerts')) if override else bool(saved['accept_invalid_certs'])
     token = conf.get('token') or ''
+    if not isinstance(token, str) or not isinstance(instance_type, str):
+        raise jira.JiraError('Некорректные данные подключения')
     if not token:
         # сохранённый токен уходит только на тот же адрес Jira, для которого он был введён
         if not saved or not saved['token_encrypted'] or base_url.rstrip('/') != saved['base_url']:
@@ -867,14 +1056,14 @@ def _parse_jira_button(db, pid, data):
     structure_id = data.get('structureId')
     if structure_id in (None, ''):
         structure_id = None
-    elif isinstance(structure_id, bool) or not str(structure_id).isdigit():
+    elif isinstance(structure_id, bool) or not is_int_text(str(structure_id)):
         raise ValidationError('ID структуры — целое число')
     else:
         structure_id = int(structure_id)
     project_services = {r['id'] for r in db.execute('SELECT id FROM services WHERE project_id = ?', (pid,))}
     mappings, bad_keys = [], []
     for m in data.get('mappings') or []:
-        if not isinstance(m, dict) or m.get('serviceId') not in project_services:
+        if not isinstance(m, dict) or not isinstance(m.get('serviceId'), int) or m['serviceId'] not in project_services:
             raise ValidationError('Эпик не найден в проекте')
         keys, invalid = jira.parse_issue_keys(text_value(m.get('issueKeys')))
         bad_keys += invalid
@@ -924,13 +1113,15 @@ def api_get_jira(pid):
 def api_save_jira_connection(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
-    data = request.get_json() or {}
+    data = json_body()
     base_url = text_value(data.get('baseUrl')).rstrip('/')
     instance_type = data.get('instanceType')
     login = text_value(data.get('login'))
     token = data.get('token') or ''
-    if not re.match(r'^https?://\S+$', base_url):
-        raise ValidationError('Адрес Jira должен начинаться с http:// или https://')
+    try:
+        base_url = jira.check_base_url(base_url)
+    except jira.JiraError as e:
+        raise ValidationError(str(e))
     if instance_type not in jira.INSTANCE_TYPES:
         raise ValidationError('Недопустимый тип подключения')
     if instance_type != 'server' and not login:
@@ -983,7 +1174,7 @@ def api_delete_jira_connection(pid):
 def api_test_jira_connection(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
-    data = request.get_json(silent=True) or None
+    data = json_body() or None
     try:
         user = _jira_client(get_db(), pid, override=data).myself()
     except jira.JiraError as e:
@@ -1008,7 +1199,7 @@ def api_create_jira_button(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     db = get_db()
-    name, structure_id, structure_name, mappings, field_map = _parse_jira_button(db, pid, request.get_json() or {})
+    name, structure_id, structure_name, mappings, field_map = _parse_jira_button(db, pid, json_body())
     order = db.execute('SELECT COALESCE(MAX(sort_order), 0) FROM jira_snapshot_buttons WHERE project_id = ?',
                        (pid,)).fetchone()[0]
     bid = db.execute('INSERT INTO jira_snapshot_buttons (project_id, name, structure_id, structure_name, sort_order, '
@@ -1028,7 +1219,7 @@ def api_update_jira_button(bid):
     if err:
         return err
     name, structure_id, structure_name, mappings, field_map = _parse_jira_button(
-        db, row['project_id'], request.get_json() or {})
+        db, row['project_id'], json_body())
     db.execute('UPDATE jira_snapshot_buttons SET name = ?, structure_id = ?, structure_name = ?, field_map = ? '
                'WHERE id = ?', (name, structure_id, structure_name, json.dumps(field_map), bid))
     _save_jira_mappings(db, bid, mappings)
@@ -1382,7 +1573,7 @@ def _zone(name):
 
 
 def _schedule_days(text):
-    return [int(d) for d in (text or '').split(',') if d.strip().isdigit()]
+    return [int(d) for d in (text or '').split(',') if is_int_text(d.strip())]
 
 
 def _next_run(sched, now_utc=None):
@@ -1424,7 +1615,7 @@ def api_save_jira_schedule(bid):
     row, err = _jira_button_or_404(db, bid)
     if err:
         return err
-    data = request.get_json() or {}
+    data = json_body()
     enabled = bool(data.get('enabled'))
     days = data.get('days') or []
     if not isinstance(days, list) or not all(isinstance(d, int) and 1 <= d <= 7 for d in days):
@@ -1521,9 +1712,15 @@ def api_run_jira_schedule(bid):
     tz = _zone(sched['timezone'] if sched else 'Europe/Moscow')
     if not sched:
         db.execute('INSERT INTO jira_schedules (button_id) VALUES (?)', (bid,))
+        db.commit()  # транзакция не должна оставаться открытой на время запросов к Jira — иначе БД заблокирована
         sched = db.execute('SELECT * FROM jira_schedules WHERE button_id = ?', (bid,)).fetchone()
     local_date = datetime.now(timezone.utc).astimezone(tz).date().isoformat()
-    status, message = run_autofill(db, row, local_date, None, overwrite=bool(sched['overwrite']))
+    try:
+        status, message = run_autofill(db, row, local_date, None, overwrite=bool(sched['overwrite']))
+    except Exception as e:  # noqa: BLE001 — результат запуска записывается в карточку и при внутренней ошибке
+        db.rollback()
+        logger.exception('autofill run-now failed for button %s', bid)
+        status, message = 'error', f'Внутренняя ошибка: {e}'
     _finish_autofill(db, row, status, message, None)
     button = _jira_button_json(db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone())
     return jsonify({'status': status, 'message': message, 'button': button}), (200 if status == 'ok' else 502)
@@ -1569,7 +1766,7 @@ def api_start_jira_history(bid):
     row, err = _jira_button_or_404(db, bid)
     if err:
         return err
-    data = request.get_json() or {}
+    data = json_body()
     date_from = parse_date(data.get('from'), 'Дата «с»')
     date_to = parse_date(data.get('to'), 'Дата «по»')
     step = data.get('step') or 'week'
@@ -1799,7 +1996,7 @@ def api_get_notify_settings():
 @admin_required
 def api_save_notify_settings():
     db = get_db()
-    data = request.get_json() or {}
+    data = json_body()
     smtp = data.get('smtp') if isinstance(data.get('smtp'), dict) else {}
     host = text_value(smtp.get('host'))
     security = smtp.get('security') or 'starttls'
@@ -1857,7 +2054,7 @@ def api_save_notify_settings():
 @admin_required
 def api_test_email():
     db = get_db()
-    to = text_value((request.get_json() or {}).get('to'))
+    to = text_value(json_body().get('to'))
     if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', to):
         raise ValidationError('Укажите email получателя')
     try:
@@ -2000,7 +2197,7 @@ def api_save_notifications(pid):
         return jsonify({'error': 'Нет доступа'}), 403
     db = get_db()
     user = get_current_user()
-    data = request.get_json() or {}
+    data = json_body()
     digest = data.get('digest') if isinstance(data.get('digest'), dict) else {}
     alerts = data.get('alerts') if isinstance(data.get('alerts'), dict) else {}
     via_email, via_tg = bool(data.get('viaEmail')), bool(data.get('viaTelegram'))
@@ -2428,6 +2625,12 @@ def queue_autofill_error(db, button_row, message):
 def deliver_outbox():
     db = get_db()
     done = 0
+    # отправленное не копится бесконечно: очередь — 30 дней, журнал отправок — год
+    now = datetime.now(timezone.utc)
+    db.execute("DELETE FROM notification_outbox WHERE status != 'pending' AND created_at < ?",
+               ((now - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S'),))
+    db.execute('DELETE FROM notification_log WHERE created_at < ?', ((now - timedelta(days=365)).strftime('%Y-%m-%d %H:%M:%S'),))
+    db.commit()
     for item in db.execute("SELECT * FROM notification_outbox WHERE status = 'pending' ORDER BY id").fetchall():
         claimed = db.execute("UPDATE notification_outbox SET status = 'sending' WHERE id = ? AND status = 'pending'",
                              (item['id'],)).rowcount
@@ -2502,12 +2705,14 @@ def api_get_users():
 @app.route('/api/users', methods=['POST'])
 @admin_required
 def api_create_user():
-    data = request.get_json() or {}
-    username = text_value(data.get('username'))
+    data = json_body()
+    username = text_value(data.get('username'), 150)
     password = data.get('password') or ''
     if not username or not password or not isinstance(password, str):
         return jsonify({'error': 'Укажите логин и пароль'}), 400
     parse_photo(data.get('photo'))
+    for key in ('displayName', 'email', 'position'):
+        data[key] = text_value(data.get(key), 300)
 
     db = get_db()
     existing = db.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
@@ -2528,7 +2733,7 @@ def api_create_user():
 @app.route('/api/users/<int:uid>', methods=['PUT'])
 @admin_required
 def api_update_user(uid):
-    data = request.get_json() or {}
+    data = json_body()
     db = get_db()
     user = db.execute('SELECT * FROM users WHERE id = ?', (uid,)).fetchone()
     if not user:
@@ -2551,6 +2756,9 @@ def api_update_user(uid):
         return jsonify({'error': 'Нельзя снять с себя роль администратора'}), 400
     photo = parse_photo(data.get('photo', user['photo']))
     password = data.get('password')
+    if password is not None and not isinstance(password, str):
+        raise ValidationError('Пароль — строка')
+    display_name, email, position = (text_value(v, 300) for v in (display_name, email, position))
 
     if password:
         db.execute(
@@ -2563,6 +2771,8 @@ def api_update_user(uid):
             (new_username, display_name, email, position, photo, role, uid)
         )
     db.commit()
+    if password and uid == session['user_id']:
+        start_session(db.execute('SELECT * FROM users WHERE id = ?', (uid,)).fetchone())
     changes = []
     for field, old_val, new_val in [
         ('username', user['username'], new_username),
@@ -2616,11 +2826,11 @@ def api_get_user_projects(uid):
 @app.route('/api/users/<int:uid>/projects', methods=['POST'])
 @admin_required
 def api_assign_user_project(uid):
-    data = request.get_json() or {}
-    project_id = data.get('projectId')
-    role = data.get('role', 'user')
-    if not project_id:
+    data = json_body()
+    if not data.get('projectId'):
         return jsonify({'error': 'Укажите проект'}), 400
+    project_id = int_value(data.get('projectId'), 'Проект', low=1)
+    role = data.get('role', 'user')
     if role not in ('user', 'manager'):
         return jsonify({'error': 'Недопустимая роль'}), 400
 
@@ -2658,7 +2868,7 @@ def api_unassign_user_project(uid, pid):
 @app.route('/api/profile', methods=['PUT'])
 @login_required
 def api_update_profile():
-    data = request.get_json() or {}
+    data = json_body()
     db = get_db()
     uid = session['user_id']
     user = db.execute('SELECT * FROM users WHERE id = ?', (uid,)).fetchone()
@@ -2666,14 +2876,18 @@ def api_update_profile():
         return jsonify({'error': 'Пользователь не найден'}), 404
     photo = parse_photo(data.get('photo', user['photo']))
     password = data.get('password')
+    if password is not None and not isinstance(password, str):
+        raise ValidationError('Пароль — строка')
     # ФИО, email и должность меняет только администратор (как в интерфейсе); остальным — фото и пароль
     is_admin = user['role'] == 'admin'
-    display_name = data.get('displayName', user['display_name']) if is_admin else user['display_name']
-    email = data.get('email', user['email']) if is_admin else user['email']
-    position = data.get('position', user['position']) if is_admin else user['position']
+    display_name = text_value(data.get('displayName', user['display_name']), 300) if is_admin else user['display_name']
+    email = text_value(data.get('email', user['email']), 300) if is_admin else user['email']
+    position = text_value(data.get('position', user['position']), 300) if is_admin else user['position']
     if password:
         db.execute('UPDATE users SET photo = ?, display_name = ?, email = ?, position = ?, password_hash = ? WHERE id = ?',
                    (photo, display_name, email, position, generate_password_hash(password), uid))
+        # сессии на других устройствах завершаются, текущая остаётся
+        start_session(db.execute('SELECT * FROM users WHERE id = ?', (uid,)).fetchone())
     else:
         db.execute('UPDATE users SET photo = ?, display_name = ?, email = ?, position = ? WHERE id = ?',
                    (photo, display_name, email, position, uid))
@@ -2730,15 +2944,15 @@ def api_get_audit_log():
     if page:
         conditions.append('page = ?')
         params.append(page)
-    if project_id.isdigit():
+    if is_int_text(project_id):
         conditions.append('project_id = ?')
         params.append(int(project_id))
     before_id = request.args.get('beforeId', '').strip()
-    if before_id.isdigit():
+    if is_int_text(before_id):
         conditions.append('id < ?')
         params.append(int(before_id))
     limit = request.args.get('limit', '')
-    limit = min(max(int(limit), 1), 1000) if limit.isdigit() else AUDIT_PAGE_SIZE
+    limit = min(max(int(limit), 1), 1000) if is_int_text(limit) else AUDIT_PAGE_SIZE
     where_clause = ' WHERE ' + ' AND '.join(conditions) if conditions else ''
     rows = db.execute(
         f'SELECT * FROM audit_log{where_clause} ORDER BY id DESC LIMIT ?',
@@ -2810,7 +3024,7 @@ def build_project_pdf(db, project, page_type, epics_arg=None, show_done=False):
 
     # Фильтры интерфейса: выбранные эпики дашборда, учёт сданных эпиков в своде по этапам
     if page_type == 'dashboard' and epics_arg is not None:
-        selected = {int(x) for x in epics_arg.split(',') if x.strip().isdigit()}
+        selected = {int(x) for x in epics_arg.split(',') if is_int_text(x.strip())}
         services = [s for s in services if s['id'] in selected]
     elif page_type == 'stages' and not show_done:
         services = [s for s in services if not s['is_done']]
@@ -3018,12 +3232,17 @@ def _pdf_heading(pdf, text):
 
 def _pdf_fit(pdf, text, width):
     """Обрезает текст с многоточием под ширину ячейки."""
-    text = str(text)
+    text = str(text)[:400]  # в ячейку A4 больше не поместится; длинные названия не замедляют отчёт
     if pdf.get_string_width(text) <= width:
         return text
-    while text and pdf.get_string_width(text + '…') > width:
-        text = text[:-1]
-    return text + '…'
+    lo, hi = 0, len(text)  # самый длинный префикс, который помещается вместе с многоточием
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if pdf.get_string_width(text[:mid] + '…') <= width:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + '…'
 
 
 def _pdf_table(pdf, headers, rows, widths=None, total_row=False):
@@ -3065,4 +3284,5 @@ if __name__ == '__main__':
     if not os.path.exists(DB_PATH):
         from init_db import init_db
         init_db()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # только для разработки; в продакшене — gunicorn (см. README)
+    app.run(host='127.0.0.1', port=5000, debug=os.environ.get('FLASK_DEBUG') == '1')

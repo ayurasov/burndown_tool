@@ -5,6 +5,7 @@ import sys
 import threading
 
 import pytest
+from flask.testing import FlaskClient
 
 os.environ.setdefault('BURNDOWN_SCHEDULER', '0')  # фоновый планировщик в тестах не нужен
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,9 +25,19 @@ def db_path(tmp_path, monkeypatch):
     return path
 
 
+class JsonClient(FlaskClient):
+    """Как интерфейс: POST к API всегда в JSON (сервер отклоняет другие POST — защита от CSRF)."""
+
+    def open(self, *args, **kwargs):
+        if kwargs.get('method') == 'POST' and not any(k in kwargs for k in ('json', 'data', 'content_type')):
+            kwargs['json'] = {}
+        return super().open(*args, **kwargs)
+
+
 @pytest.fixture
 def flask_app(db_path):
     app_module.app.config.update(TESTING=True)
+    app_module.app.test_client_class = JsonClient
     return app_module.app
 
 

@@ -99,7 +99,6 @@ User=burndown
 Group=burndown
 WorkingDirectory=/opt/burndown
 Environment="PATH=/opt/burndown/venv/bin"
-Environment="SECRET_KEY=ваш-секретный-ключ-замените-это"
 Environment="DB_PATH=/opt/burndown/burndown.db"
 ExecStart=/opt/burndown/venv/bin/gunicorn -w 4 -b 127.0.0.1:5000 app:app
 Restart=always
@@ -110,9 +109,14 @@ WantedBy=multi-user.target
 ```
 
 > **Секретный ключ сессий.** Если `SECRET_KEY` не задан, при первом запуске генерируется случайный ключ
-> и сохраняется в файл `.secret_key` рядом с базой данных (права 600). Ключ из переменной окружения
-> имеет приоритет. При работе через HTTPS добавьте `Environment="SESSION_COOKIE_SECURE=1"` —
+> и сохраняется в файл `.secret_key` рядом с базой данных (права 600) — обычно этого достаточно. Чтобы задать
+> ключ явно, сгенерируйте его (`openssl rand -hex 32`) и добавьте `Environment="SECRET_KEY=<ключ>"`. Ключ
+> короче 32 символов не используется: вместо него берётся `.secret_key`, а токены, зашифрованные коротким
+> ключом, автоматически перешифровываются. При работе через HTTPS добавьте `Environment="SESSION_COOKIE_SECURE=1"` —
 > cookie сессии будет передаваться только по защищённому соединению.
+>
+> **Пароль администратора.** `init_db.py` создаёт `admin` / `Test198!`. Пока пароль не сменён, в меню
+> показывается предупреждение — смените его в профиле сразу после установки.
 
 Запуск:
 
@@ -326,7 +330,7 @@ gunicorn app:app --bind 0.0.0.0:39661
 ```bash
 # С указанием ключа и путей к БД
 gunicorn app:app --bind 0.0.0.0:39661 \
-  --env SECRET_KEY=ваш-секретный-ключ \
+  --env SECRET_KEY=$(openssl rand -hex 32) \
   --env DB_PATH=/opt/burndown/burndown.db
 
 # С 4 воркерами для боевой нагрузки

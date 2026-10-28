@@ -1651,6 +1651,7 @@ function updateRoleUI(){
   document.getElementById('navJira').style.display = canEdit() ? '' : 'none';
   document.getElementById('navAutofill').style.display = canEdit() ? '' : 'none';
   document.getElementById('sectionsNav').style.display = currentProjectId ? '' : 'none';
+  document.getElementById('defaultPwWarning').hidden = !(currentUser && currentUser.defaultPassword);
   if(currentUser){
     document.getElementById('userInfo').innerHTML = userAvatarHtml(currentUser, 'avatar')+
       '<div class="user-info-text"><span class="user-info-name">'+escapeHtml(currentUser.displayName||currentUser.username)+'</span>'+roleBadge(currentUser.role)+'</div>';
@@ -1861,7 +1862,7 @@ function openBulkMeasurement(opts){
         '<button type="button" class="btn btn-ghost btn-sm" id="bulkFillPrev" title="Заполнить пустые поля значениями предыдущего замера">Подставить прошлые значения</button>'+
       '</div>'+
       (opts.intro ? '<p class="bulk-note bulk-intro">'+opts.intro+'</p>' : '')+
-      '<p class="bulk-note">Пустые строки не сохраняются. Если замер на эту дату уже есть, он будет обновлён. Серым показаны значения предыдущего замера'+(opts.services ? '' : '; сданные эпики не выводятся')+'.</p>'+
+      '<p class="bulk-note">Пустые строки не сохраняются. Если замер на эту дату уже есть, он будет обновлён; пустое поле не меняет уже внесённое значение. Серым показаны значения предыдущего замера'+(opts.services ? '' : '; сданные эпики не выводятся')+'.</p>'+
       '<div class="table-scroll"><table class="data-table compact-table bulk-table" id="bulkTable"><thead><tr><th>Эпик</th><th class="num">Остаток, ч</th><th class="num">Затрачено, ч</th><th class="num">Оценка, ч</th></tr></thead><tbody>'+
       services.map(function(s){
         return '<tr data-sid="'+s.id+'"><td><span class="bulk-etap">'+escapeHtml(s.etap)+'</span> '+escapeHtml(s.name)+noteHtml(s.id)+'</td>'+
@@ -3214,6 +3215,12 @@ function readPhoto(file, cb){
 }
 
 /* Профиль — открывается по клику на блок пользователя */
+document.getElementById('defaultPwWarning').addEventListener('click', function(){
+  openProfile();
+  var pw = document.getElementById('profilePassword');
+  if(pw) pw.focus();
+});
+
 function openProfile(){
   var admin = isGlobalAdmin();
   var photo = currentUser.photo || '';  /* итоговое фото после правок в окне */
@@ -3257,6 +3264,7 @@ function openProfile(){
       if(pw) data.password = pw;
       apiPut('/api/profile', data).then(function(){
         Object.assign(currentUser, data);
+        if(data.password) currentUser.defaultPassword = false;
         delete currentUser.password;
         updateRoleUI();
         toast('Профиль обновлён');
@@ -3400,6 +3408,7 @@ function loadProjects(){
 function init(){
   api('/api/auth/me').then(function(data){
     currentUser = data.user;
+    currentUser.defaultPassword = !!data.defaultPassword;
     updateRoleUI();
     loadProjects();
   }).catch(function(){

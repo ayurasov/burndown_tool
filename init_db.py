@@ -9,6 +9,7 @@
 
 import sqlite3
 import os
+from datetime import datetime
 from werkzeug.security import generate_password_hash
 
 DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'burndown.db'))
@@ -191,9 +192,57 @@ def create_notify_tables(conn):
         conn.execute('ALTER TABLE users ADD COLUMN telegram_link_code TEXT')
 
 
+def create_auth_tables(conn):
+    """Неудачные попытки входа — для ограничения подбора пароля."""
+    conn.execute('CREATE TABLE IF NOT EXISTS login_failures (username TEXT, ip TEXT, at TEXT)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_login_failures ON login_failures(username, ip, at)')
+
+
+def _iso_date(value):
+    """Дата из старых записей (например, «2026-7-9») → «2026-07-09»; нераспознанное — как есть."""
+    text = str(value).strip()
+    try:
+        return datetime.strptime(text, '%Y-%m-%d').date().isoformat()
+    except ValueError:
+        return value
+
+
+def normalize_dates(conn):
+    """Даты замеров и целей — строго ГГГГ-ММ-ДД: прежние версии принимали «2026-7-9», из-за чего ломались
+    сортировка и поиск замера на дату."""
+    canon = "'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'"
+    for table, col in (('entries', 'date'), ('services', 'target_date'), ('stage_targets', 'target_date')):
+        rows = conn.execute(f"SELECT id, {col} FROM {table} WHERE {col} IS NOT NULL AND {col} != '' "
+                            f"AND {col} NOT GLOB {canon}").fetchall()
+        for row_id, value in rows:
+            fixed = _iso_date(value)
+            if fixed != value:
+                conn.execute(f'UPDATE {table} SET {col} = ? WHERE id = ?', (fixed, row_id))
+
+
+def dedupe_entries(conn):
+    """Один замер эпика на дату. Дубликаты (одновременное сохранение в прежних версиях) объединяются в самую
+    позднюю запись: её пустые показатели дополняются значениями из более ранних."""
+    dups = conn.execute('SELECT service_id, date FROM entries GROUP BY service_id, date HAVING COUNT(*) > 1').fetchall()
+    for service_id, day in dups:
+        rows = conn.execute('SELECT id, remaining, spent, estimate FROM entries WHERE service_id = ? AND date = ? '
+                            'ORDER BY id DESC', (service_id, day)).fetchall()
+        keep = list(rows[0])
+        for row in rows[1:]:
+            for i in (1, 2, 3):
+                if keep[i] is None:
+                    keep[i] = row[i]
+        conn.execute('UPDATE entries SET remaining = ?, spent = ?, estimate = ? WHERE id = ?', (*keep[1:], keep[0]))
+        conn.executemany('DELETE FROM entries WHERE id = ?', [(row[0],) for row in rows[1:]])
+
+
 def create_indexes(conn):
-    """Индексы для частых выборок; создаются идемпотентно и не меняют данные."""
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_entries_service_date ON entries(service_id, date)')
+    """Индексы для частых выборок; создаются идемпотентно. Замеры: даты приводятся к ГГГГ-ММ-ДД, дубликаты на дату
+    объединяются, затем уникальный индекс не даёт создать второй замер эпика на ту же дату."""
+    normalize_dates(conn)
+    dedupe_entries(conn)
+    conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS ux_entries_service_date ON entries(service_id, date)')
+    conn.execute('DROP INDEX IF EXISTS idx_entries_service_date')  # заменён уникальным
     conn.execute('CREATE INDEX IF NOT EXISTS idx_services_project ON services(project_id)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_audit_project ON audit_log(project_id)')
 
@@ -406,6 +455,7 @@ def init_db():
 
     create_jira_tables(conn)
     create_notify_tables(conn)
+    create_auth_tables(conn)
     create_indexes(conn)
 
     conn.commit()
