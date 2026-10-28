@@ -8,7 +8,7 @@ var currentUser = null;
 var projects = [];
 var currentProjectId = null;
 var currentProjectRole = null; /* 'admin', 'manager', 'user' */
-var STATE = { services:[], entries:[], stageTargets:{}, settings:{} };
+var STATE = { services:[], entries:[], stageTargets:{}, settings:{}, jira:null };
 var currentDataServiceId = null;
 var burnRangeOverride = null;
 var stageBurnRangeOverride = null;
@@ -86,6 +86,7 @@ function openModal(opts){
   confirmOk.textContent = opts.okLabel || 'OK';
   confirmOk.className = 'btn ' + (opts.danger ? 'btn-danger' : 'btn-primary');
   confirmModal.classList.toggle('modal-wide', !!opts.wide);
+  confirmModal.classList.toggle('modal-xl', opts.size === 'xl');
   modalOkHandler = opts.onOk || null;
   confirmModal.classList.add('show');
   var first = confirmBody.querySelector('input:not([type=file]):not([disabled]),select,textarea');
@@ -1536,6 +1537,7 @@ function updateRoleUI(){
   document.getElementById('adminNav').style.display = admin ? '' : 'none';
   ['navUsers','navProjects','navAudit','btnExport'].forEach(function(id){ document.getElementById(id).style.display = admin ? '' : 'none'; });
   document.getElementById('navSettings').style.display = canEdit() ? '' : 'none';
+  document.getElementById('navJira').style.display = canEdit() ? '' : 'none';
   document.getElementById('sectionsNav').style.display = currentProjectId ? '' : 'none';
   if(currentUser){
     document.getElementById('userInfo').innerHTML = userAvatarHtml(currentUser, 'avatar')+
@@ -1557,6 +1559,7 @@ var titles = {
   data: ['Данные по датам', 'Внесение и редактирование замеров'],
   services: ['Эпики (блоки задач)', 'Список эпиков проекта и целевых дат'],
   settings: ['Настройки проекта', 'Параметры прогноза и расчёта burn rate'],
+  jira: ['Связь с Jira', 'Подключение и кнопки среза данных из Structure'],
   users: ['Управление пользователями', 'Пользователи, роли и доступ к проектам'],
   projects: ['Управление проектами', 'Создание, редактирование и удаление проектов'],
   audit: ['Реестр изменений', 'Журнал всех изменений с фильтрами']
@@ -1570,7 +1573,7 @@ function projectTitleSuffix(){
 function navigate(view){
   var isAdminView = ADMIN_VIEWS.indexOf(view) !== -1;
   if(isAdminView && !isGlobalAdmin()) view = 'dashboard';
-  if(view === 'settings' && !canEdit()) view = 'dashboard';
+  if((view === 'settings' || view === 'jira') && !canEdit()) view = 'dashboard';
   if(!isAdminView && !currentProjectId && isGlobalAdmin()) view = 'projects';
   currentView = view;
   navItems.forEach(function(n){ n.classList.toggle('active', n.dataset.view === view); });
@@ -1581,7 +1584,7 @@ function navigate(view){
     pageSub.textContent = titles[view][1] + (ADMIN_VIEWS.indexOf(view) === -1 ? projectTitleSuffix() : '');
   }
   var renderers = {dashboard:renderDashboard, stages:renderStagesView, data:renderDataView, services:renderServicesView,
-    settings:renderSettingsView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); }};
+    settings:renderSettingsView, jira:renderJiraView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); }};
   if(renderers[view] && (currentProjectId || ADMIN_VIEWS.indexOf(view) !== -1)) renderers[view]();
   var reportView = PDF_VIEWS.indexOf(view) !== -1 && currentProjectId;
   document.getElementById('btnPdf').style.display = reportView ? '' : 'none';
@@ -1715,24 +1718,35 @@ function lastValuesBefore(serviceId, date){
   return res;
 }
 
-function openBulkMeasurement(){
+/* opts (необязательно): title, intro, services — список эпиков, prefill — {serviceId: {remaining, spent, estimate}}
+   (готовые значения, например срез из Jira), notes — {serviceId: {text, warnings[]}} под названием эпика */
+function openBulkMeasurement(opts){
+  opts = opts || {};
   if(!canEdit()){ toast('Нет прав на редактирование'); return; }
-  var services = STATE.services.filter(function(s){ return !s.isDone; });
-  if(!services.length) services = STATE.services.slice();
+  var services = opts.services || STATE.services.filter(function(s){ return !s.isDone; });
+  if(!opts.services && !services.length) services = STATE.services.slice();
   if(!services.length){ toast('Сначала добавьте эпик'); return; }
+  var prefill = opts.prefill || null, notes = opts.notes || {};
+  var noteHtml = function(sid){
+    var n = notes[sid];
+    if(!n) return '';
+    return '<div class="bulk-row-note">'+escapeHtml(n.text || '')+'</div>'+
+      (n.warnings || []).map(function(w){ return '<div class="bulk-row-note warn">⚠ '+escapeHtml(w)+'</div>'; }).join('');
+  };
   var fields = ['remaining', 'spent', 'estimate'];
   var FIELD_LABELS = {remaining:'Остаток, ч', spent:'Затрачено, ч', estimate:'Оценка, ч'};
   openModal({
-    title: 'Замер по всем эпикам', okLabel: 'Сохранить', wide: true,
+    title: opts.title || 'Замер по всем эпикам', okLabel: 'Сохранить', wide: true,
     html:
       '<div class="bulk-head">'+
         '<label class="small" for="bulkDate">Дата замера</label><input type="date" id="bulkDate" value="'+todayIso()+'">'+
         '<button type="button" class="btn btn-ghost btn-sm" id="bulkFillPrev" title="Заполнить пустые поля значениями предыдущего замера">Подставить прошлые значения</button>'+
       '</div>'+
-      '<p class="bulk-note">Пустые строки не сохраняются. Если замер на эту дату уже есть, он будет обновлён. Серым показаны значения предыдущего замера; сданные эпики не выводятся.</p>'+
+      (opts.intro ? '<p class="bulk-note bulk-intro">'+opts.intro+'</p>' : '')+
+      '<p class="bulk-note">Пустые строки не сохраняются. Если замер на эту дату уже есть, он будет обновлён. Серым показаны значения предыдущего замера'+(opts.services ? '' : '; сданные эпики не выводятся')+'.</p>'+
       '<div class="table-scroll"><table class="data-table compact-table bulk-table" id="bulkTable"><thead><tr><th>Эпик</th><th class="num">Остаток, ч</th><th class="num">Затрачено, ч</th><th class="num">Оценка, ч</th></tr></thead><tbody>'+
       services.map(function(s){
-        return '<tr data-sid="'+s.id+'"><td><span class="bulk-etap">'+escapeHtml(s.etap)+'</span> '+escapeHtml(s.name)+'</td>'+
+        return '<tr data-sid="'+s.id+'"><td><span class="bulk-etap">'+escapeHtml(s.etap)+'</span> '+escapeHtml(s.name)+noteHtml(s.id)+'</td>'+
           fields.map(function(f){ return '<td data-label="'+FIELD_LABELS[f]+'"><input type="number" step="0.01" min="0" data-field="'+f+'" aria-label="'+FIELD_LABELS[f]+'"></td>'; }).join('')+'</tr>';
       }).join('')+
       '</tbody></table></div>',
@@ -1768,23 +1782,25 @@ function openBulkMeasurement(){
   });
 
   var dateEl = document.getElementById('bulkDate');
-  /* при смене даты подставляем уже существующие значения на эту дату и подсказки с прошлого замера */
-  var fill = function(){
+  /* при смене даты подставляем уже существующие значения на эту дату и подсказки с прошлого замера;
+     готовые значения (prefill) задаются один раз и при смене даты не перезаписываются */
+  var fill = function(initial){
     var date = dateEl.value;
     document.querySelectorAll('#bulkTable tbody tr').forEach(function(tr){
       var sid = parseInt(tr.dataset.sid, 10);
       var existing = STATE.entries.find(function(e){ return e.service_id === sid && e.date === date; });
       var prev = lastValuesBefore(sid, date || '9999-12-31');
+      var source = prefill ? prefill[sid] : existing;
       tr.querySelectorAll('input').forEach(function(inp){
         var f = inp.dataset.field;
-        inp.value = existing && isNum(existing[f]) ? existing[f] : '';
+        if(!prefill || initial) inp.value = source && isNum(source[f]) ? source[f] : '';
         inp.placeholder = isNum(prev[f]) ? (Math.round(prev[f]*100)/100).toLocaleString('ru-RU', {maximumFractionDigits:2, useGrouping:false}) : '';
         inp.dataset.prev = isNum(prev[f]) ? prev[f] : '';
       });
     });
   };
-  dateEl.addEventListener('change', fill);
-  fill();
+  dateEl.addEventListener('change', function(){ fill(false); });
+  fill(true);
   document.getElementById('bulkFillPrev').addEventListener('click', function(){
     document.querySelectorAll('#bulkTable input[data-field]').forEach(function(inp){
       if(inp.value === '' && inp.dataset.prev !== '') inp.value = inp.dataset.prev;
@@ -1792,7 +1808,264 @@ function openBulkMeasurement(){
   });
   enableEnterNavigation(document.getElementById('bulkTable'));
 }
-document.getElementById('btnBulkMeasure').addEventListener('click', openBulkMeasurement);
+document.getElementById('btnBulkMeasure').addEventListener('click', function(){ openBulkMeasurement(); });
+/* ════════════════════════════════════════════════════════════════
+   Связь с Jira: подключение, кнопки среза из Structure
+════════════════════════════════════════════════════════════════ */
+var JIRA_TYPE_TEXTS = {
+  server: {login: 'Логин (необязательно)', token: 'Personal Access Token', loginPh: '', tokenPh: 'Вставьте PAT',
+           hint: 'PAT создаётся в профиле Jira: «Профиль → Personal Access Tokens» (Jira Server/DC 8.14 и новее).'},
+  server_basic: {login: 'Логин (username)', token: 'Пароль', loginPh: 'Ваш логин в Jira', tokenPh: 'Пароль от Jira',
+                 hint: '⚠ Basic Auth передаёт пароль в base64 — используйте только по HTTPS.'},
+  cloud: {login: 'Email', token: 'API-токен', loginPh: 'you@company.com', tokenPh: 'Вставьте API-токен',
+          hint: 'API-токен создаётся на id.atlassian.com → Security → API tokens.'}
+};
+
+function loadJiraConfig(){
+  STATE.jira = null;
+  renderJiraSnapshotButtons();
+  if(!canEdit() || !currentProjectId) return Promise.resolve();
+  var pid = currentProjectId;
+  return api('/api/projects/'+pid+'/jira').then(function(data){
+    if(pid !== currentProjectId) return;
+    STATE.jira = data;
+    renderJiraSnapshotButtons();
+    if(currentView === 'jira') renderJiraView();
+  }).catch(function(){});
+}
+
+/* Кнопки среза в разделе «Данные по датам» */
+function renderJiraSnapshotButtons(){
+  var box = document.getElementById('jiraSnapshotButtons');
+  var buttons = (canEdit() && STATE.jira && STATE.jira.connection) ? STATE.jira.buttons : [];
+  box.innerHTML = buttons.map(function(b){
+    return '<button type="button" class="btn btn-ghost btn-sm" data-jira-snapshot="'+b.id+'" title="Забрать срез из Jira'+(b.structureName ? ' (структура «'+escapeAttr(b.structureName)+'»)' : '')+'">⇣ '+escapeHtml(b.name)+'</button>';
+  }).join('');
+  box.querySelectorAll('[data-jira-snapshot]').forEach(function(btn){
+    btn.addEventListener('click', function(){ runJiraSnapshot(parseInt(btn.dataset.jiraSnapshot, 10), btn); });
+  });
+}
+
+function runJiraSnapshot(bid, btn){
+  var label = btn ? btn.textContent : '';
+  if(btn){ btn.disabled = true; btn.textContent = 'Загрузка из Jira…'; }
+  return apiPost('/api/jira/buttons/'+bid+'/snapshot').then(function(data){
+    var prefill = {}, notes = {}, services = [];
+    data.items.forEach(function(it){
+      prefill[it.serviceId] = it;
+      var count = it.issueCount;
+      notes[it.serviceId] = {text: 'Задач Jira учтено: ' + count, warnings: it.warnings};
+    });
+    /* порядок эпиков — как в проекте */
+    STATE.services.forEach(function(s){ if(prefill[s.id]) services.push(s); });
+    var b = data.button;
+    openBulkMeasurement({
+      title: 'Срез из Jira: ' + b.name,
+      services: services, prefill: prefill, notes: notes,
+      intro: 'Значения получены из Jira' + (b.structureName ? ' (структура «' + escapeHtml(b.structureName) + '»)' : '') +
+        '. Проверьте их и при необходимости поправьте — замер будет сохранён на выбранную дату.'
+    });
+  }).catch(function(){}).then(function(){
+    if(btn){ btn.disabled = false; btn.textContent = label; }
+  });
+}
+
+function renderJiraView(){
+  var cfg = STATE.jira;
+  if(!cfg){ document.getElementById('jiraButtonsTable').innerHTML = ''; return; }
+  var c = cfg.connection;
+  document.getElementById('jiraUrl').value = c ? c.baseUrl : '';
+  document.getElementById('jiraType').value = c ? c.instanceType : 'server';
+  document.getElementById('jiraLogin').value = c ? c.login : '';
+  document.getElementById('jiraToken').value = '';
+  document.getElementById('jiraInsecure').checked = !!(c && c.acceptInvalidCerts);
+  document.getElementById('jiraDisconnect').hidden = !c;
+  setJiraStatus(c ? 'Подключение сохранено' + (c.hasToken ? '' : ' (без токена)') : 'Подключение не настроено', c ? 'ok' : '');
+  updateJiraFormLabels();
+  renderJiraButtonsTable();
+}
+
+function setJiraStatus(text, kind){
+  var el = document.getElementById('jiraStatus');
+  el.textContent = text || '';
+  el.className = 'jira-status' + (kind ? ' ' + kind : '');
+}
+
+function updateJiraFormLabels(){
+  var t = JIRA_TYPE_TEXTS[document.getElementById('jiraType').value];
+  var c = STATE.jira && STATE.jira.connection;
+  document.getElementById('jiraLoginLabel').textContent = t.login;
+  document.getElementById('jiraTokenLabel').textContent = t.token;
+  document.getElementById('jiraLogin').placeholder = t.loginPh;
+  document.getElementById('jiraToken').placeholder = (c && c.hasToken) ? 'Сохранён — оставьте пустым, чтобы не менять' : t.tokenPh;
+  document.getElementById('jiraHint').textContent = t.hint;
+}
+
+function jiraFormData(){
+  return {
+    baseUrl: document.getElementById('jiraUrl').value.trim().replace(/\/+$/, ''),
+    instanceType: document.getElementById('jiraType').value,
+    login: document.getElementById('jiraLogin').value.trim(),
+    token: document.getElementById('jiraToken').value,
+    acceptInvalidCerts: document.getElementById('jiraInsecure').checked
+  };
+}
+
+document.getElementById('jiraType').addEventListener('change', updateJiraFormLabels);
+document.getElementById('jiraUrl').addEventListener('change', function(e){
+  /* как в jira_mass_logger: адрес *.atlassian.net — это Jira Cloud */
+  if(/atlassian\.net/i.test(e.target.value)) { document.getElementById('jiraType').value = 'cloud'; updateJiraFormLabels(); }
+});
+document.getElementById('jiraTest').addEventListener('click', function(){
+  var btn = this;
+  btn.disabled = true;
+  setJiraStatus('Проверка подключения…');
+  apiPost('/api/projects/'+currentProjectId+'/jira/connection/test', jiraFormData()).then(function(data){
+    setJiraStatus('✓ Соединение установлено' + (data.user ? ': ' + data.user : ''), 'ok');
+  }).catch(function(e){ setJiraStatus(e.message, 'error'); }).then(function(){ btn.disabled = false; });
+});
+document.getElementById('jiraForm').addEventListener('submit', function(e){
+  e.preventDefault();
+  apiPut('/api/projects/'+currentProjectId+'/jira/connection', jiraFormData()).then(function(conn){
+    STATE.jira.connection = conn;
+    renderJiraView();
+    renderJiraSnapshotButtons();
+    toast('Подключение к Jira сохранено');
+  }).catch(function(err){ setJiraStatus(err.message, 'error'); });
+});
+document.getElementById('jiraDisconnect').addEventListener('click', function(){
+  askConfirm('Отключить Jira?', 'Подключение и сохранённый токен будут удалены. Настроенные кнопки среза сохранятся, но не будут работать до нового подключения.', function(){
+    apiDelete('/api/projects/'+currentProjectId+'/jira/connection').then(function(){
+      STATE.jira.connection = null;
+      renderJiraView();
+      renderJiraSnapshotButtons();
+      toast('Jira отключена');
+    });
+  }, 'Отключить');
+});
+
+function renderJiraButtonsTable(){
+  var table = document.getElementById('jiraButtonsTable');
+  var buttons = STATE.jira ? STATE.jira.buttons : [];
+  var connected = !!(STATE.jira && STATE.jira.connection);
+  document.getElementById('jiraAddButton').disabled = !STATE.services.length;
+  if(!buttons.length){
+    emptyTable(table, 'Кнопок пока нет', connected ? 'Создайте кнопку: выберите структуру и укажите задачи Jira для эпиков.' : 'Сначала настройте подключение к Jira выше, затем создайте кнопку.');
+    return;
+  }
+  var serviceName = function(id){ var s = serviceById(id); return s ? s.name : '—'; };
+  table.innerHTML = '<thead><tr><th>Кнопка</th><th>Структура</th><th>Эпики и задачи</th><th></th></tr></thead><tbody>' +
+    buttons.map(function(b){
+      return '<tr data-bid="'+b.id+'"><td><b>'+escapeHtml(b.name)+'</b></td>'+
+        '<td>'+(b.structureId ? escapeHtml(b.structureName || ('Структура ' + b.structureId)) + ' <span class="muted-cell">#'+b.structureId+'</span>' : '<span class="muted-cell">без структуры</span>')+'</td>'+
+        '<td>'+b.mappings.map(function(m){ return '<div class="jira-map-line"><span>'+escapeHtml(serviceName(m.serviceId))+'</span> ← <span class="mono">'+escapeHtml(m.issueKeys)+'</span>'+(m.includeSubtree ? ' <span class="muted-cell">с вложенными</span>' : '')+'</div>'; }).join('')+'</td>'+
+        '<td class="row-actions"><button type="button" class="btn btn-ghost btn-sm" data-action="snapshot"'+(connected ? '' : ' disabled title="Нет подключения к Jira"')+'>⇣ Срез</button>'+
+          actionBtn('edit','Редактировать',ICON_EDIT)+actionBtn('delete','Удалить',ICON_DELETE)+'</td></tr>';
+    }).join('') + '</tbody>';
+  var buttonOf = function(el){ var bid = parseInt(el.closest('tr').dataset.bid, 10); return buttons.find(function(b){ return b.id === bid; }); };
+  table.querySelectorAll('[data-action="snapshot"]').forEach(function(el){
+    el.addEventListener('click', function(){ runJiraSnapshot(buttonOf(el).id, el); });
+  });
+  table.querySelectorAll('[data-action="edit"]').forEach(function(el){
+    el.addEventListener('click', function(){ openJiraButtonEditor(buttonOf(el)); });
+  });
+  table.querySelectorAll('[data-action="delete"]').forEach(function(el){
+    el.addEventListener('click', function(){
+      var b = buttonOf(el);
+      askConfirm('Удалить кнопку «'+b.name+'»?', 'Ассоциации эпиков с задачами Jira для этой кнопки будут удалены. Замеры не затрагиваются.', function(){
+        apiDelete('/api/jira/buttons/'+b.id).then(function(){
+          STATE.jira.buttons = STATE.jira.buttons.filter(function(x){ return x.id !== b.id; });
+          renderJiraButtonsTable();
+          renderJiraSnapshotButtons();
+          toast('Кнопка удалена');
+        });
+      });
+    });
+  });
+}
+
+document.getElementById('jiraAddButton').addEventListener('click', function(){ openJiraButtonEditor(null); });
+
+/* Редактор кнопки: структура + ассоциации «эпик ← задачи Jira» */
+function openJiraButtonEditor(button){
+  var b = button || {name: '', structureId: null, structureName: '', mappings: []};
+  var mapOf = {};
+  b.mappings.forEach(function(m){ mapOf[m.serviceId] = m; });
+  var structureOptions = function(list, selectedId){
+    var opts = '<option value="">— без структуры: задача и её подзадачи —</option>';
+    var seen = false;
+    (list || []).forEach(function(st){
+      if(st.id === selectedId) seen = true;
+      opts += '<option value="'+st.id+'" data-name="'+escapeAttr(st.name)+'"'+(st.id === selectedId ? ' selected' : '')+'>'+escapeHtml(st.name)+' (#'+st.id+')</option>';
+    });
+    if(selectedId && !seen) opts += '<option value="'+selectedId+'" data-name="'+escapeAttr(b.structureName || '')+'" selected>'+escapeHtml(b.structureName || 'Структура')+' (#'+selectedId+')</option>';
+    return opts + '<option value="__manual">Указать ID вручную…</option>';
+  };
+  openModal({
+    title: button ? 'Кнопка среза: ' + b.name : 'Новая кнопка среза', okLabel: 'Сохранить', size: 'xl', wide: true,
+    html:
+      '<div class="form-grid">'+
+        field('Название кнопки', '<input type="text" id="jbName" value="'+escapeAttr(b.name)+'" placeholder="Например: Срез из структуры релиза">')+
+        '<div class="setting-item"><label class="small" for="jbStructure">Структура Jira</label>'+
+          '<div class="jira-structure-row"><select id="jbStructure">'+structureOptions([], b.structureId)+'</select>'+
+          '<button type="button" class="btn btn-ghost btn-sm" id="jbLoadStructures">Загрузить из Jira</button></div>'+
+          '<input type="number" id="jbStructureId" min="1" placeholder="ID структуры" hidden></div>'+
+      '</div>'+
+      '<p class="bulk-note">Укажите для эпиков задачи Jira (ключи через запятую). «С вложенными»: со структурой — все задачи под указанными в дереве структуры, без структуры — задача вместе с подзадачами. Эпики без задач в срез не попадают.</p>'+
+      '<div class="table-scroll"><table class="data-table compact-table jira-map-table" id="jbTable"><thead><tr><th>Эпик</th><th>Задачи Jira</th><th class="center">С вложенными</th></tr></thead><tbody>'+
+      STATE.services.map(function(s){
+        var m = mapOf[s.id];
+        return '<tr data-sid="'+s.id+'"'+(s.isDone ? ' class="done-row"' : '')+'><td><span class="bulk-etap">'+escapeHtml(s.etap)+'</span> '+escapeHtml(s.name)+'</td>'+
+          '<td><input type="text" data-field="keys" value="'+escapeAttr(m ? m.issueKeys : '')+'" placeholder="ABC-123, ABC-124" aria-label="Задачи Jira"></td>'+
+          '<td class="center"><input type="checkbox" data-field="subtree"'+(!m || m.includeSubtree ? ' checked' : '')+' aria-label="С вложенными"></td></tr>';
+      }).join('')+
+      '</tbody></table></div>',
+    onOk: function(){
+      var sel = document.getElementById('jbStructure');
+      var structureId = null, structureName = '';
+      if(sel.value === '__manual'){
+        structureId = document.getElementById('jbStructureId').value.trim() || null;
+      } else if(sel.value){
+        structureId = parseInt(sel.value, 10);
+        structureName = sel.selectedOptions[0].dataset.name || '';
+      }
+      var mappings = [];
+      document.querySelectorAll('#jbTable tbody tr').forEach(function(tr){
+        var keys = tr.querySelector('[data-field="keys"]').value.trim();
+        if(keys) mappings.push({serviceId: parseInt(tr.dataset.sid, 10), issueKeys: keys,
+                                includeSubtree: tr.querySelector('[data-field="subtree"]').checked});
+      });
+      var body = {name: document.getElementById('jbName').value.trim(), structureId: structureId,
+                  structureName: structureName, mappings: mappings};
+      if(!body.name){ toast('Укажите название кнопки'); return false; }
+      if(!mappings.length){ toast('Укажите задачи Jira хотя бы для одного эпика'); return false; }
+      confirmOk.disabled = true;
+      (button ? apiPut('/api/jira/buttons/'+button.id, body) : apiPost('/api/projects/'+currentProjectId+'/jira/buttons', body)).then(function(saved){
+        if(button) STATE.jira.buttons = STATE.jira.buttons.map(function(x){ return x.id === saved.id ? saved : x; });
+        else STATE.jira.buttons.push(saved);
+        closeModal();
+        renderJiraButtonsTable();
+        renderJiraSnapshotButtons();
+        toast(button ? 'Кнопка обновлена' : 'Кнопка создана');
+      }).catch(function(){}).then(function(){ confirmOk.disabled = false; });
+      return false;
+    }
+  });
+  var sel = document.getElementById('jbStructure');
+  var manual = document.getElementById('jbStructureId');
+  sel.addEventListener('change', function(){ manual.hidden = sel.value !== '__manual'; if(!manual.hidden) manual.focus(); });
+  document.getElementById('jbLoadStructures').addEventListener('click', function(){
+    var btn = this;
+    btn.disabled = true;
+    btn.textContent = 'Загрузка…';
+    var current = sel.value && sel.value !== '__manual' ? parseInt(sel.value, 10) : null;
+    api('/api/projects/'+currentProjectId+'/jira/structures').then(function(list){
+      sel.innerHTML = structureOptions(list, current);
+      toast('Структур загружено: ' + list.length);
+    }).catch(function(){}).then(function(){ btn.disabled = false; btn.textContent = 'Загрузить из Jira'; });
+  });
+}
+
 
 document.getElementById('btnAddService').addEventListener('click', function(){
   if(!canEdit()){ toast('Нет прав на редактирование'); return; }
@@ -2004,6 +2277,7 @@ function loadProjectData(pid, view){
     STATE.entries = data.entries || [];
     STATE.stageTargets = data.stageTargets || {};
     STATE.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings || {});
+    loadJiraConfig();
     if(!serviceById(currentDataServiceId)) currentDataServiceId = STATE.services.length ? STATE.services[0].id : null;
     navigate(view || currentView);
   });
@@ -2047,14 +2321,16 @@ function init(){
 var auditPageLabels = {
   dashboard: 'Дашборд', stages: 'Свод по этапам', data: 'Данные по датам',
   services: 'Эпики', settings: 'Настройки', users: 'Пользователи',
-  projects: 'Проекты', profile: 'Профиль'
+  projects: 'Проекты', profile: 'Профиль', jira: 'Связь с Jira'
 };
 var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление' };
-var auditEntityLabels = { project: 'Проект', service: 'Эпик', entry: 'Замер', user: 'Пользователь', stage_target: 'Цель этапа', settings: 'Настройки' };
+var auditEntityLabels = { project: 'Проект', service: 'Эпик', entry: 'Замер', user: 'Пользователь', stage_target: 'Цель этапа', settings: 'Настройки',
+  jira_connection: 'Подключение к Jira', jira_button: 'Кнопка среза' };
 var auditFieldLabels = {
   name: 'Название', description: 'Описание', etap: 'Этап', targetDate: 'Целевая дата', isDone: 'Сдано', stageGroup: 'Группа в своде',
   date: 'Дата', remaining: 'Остаток', spent: 'Затрачено', estimate: 'Оценка',
   username: 'Логин', displayName: 'Имя', email: 'Email', position: 'Должность', role: 'Роль',
+  jiraUrl: 'Адрес Jira', jiraAuth: 'Тип подключения', jiraLogin: 'Логин Jira', jiraToken: 'Токен Jira',
   forecastMethod: 'Метод прогноза', riskBufferDays: 'Буфер риска', burnrateMethod: 'Метод burn rate', burnrateWindowDays: 'Окно burn rate'
 };
 /* В БД время хранится в UTC (CURRENT_TIMESTAMP) — показываем в локальном часовом поясе */

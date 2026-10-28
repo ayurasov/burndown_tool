@@ -24,7 +24,8 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from init_db import create_indexes
+from init_db import create_indexes, create_jira_tables
+import jira_integration as jira
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'burndown.db'))
@@ -75,6 +76,7 @@ def migrate_db():
             conn.execute('ALTER TABLE services ADD COLUMN is_done INTEGER DEFAULT 0')
         if 'stage_group' not in cols:
             conn.execute('ALTER TABLE services ADD COLUMN stage_group TEXT')
+        create_jira_tables(conn)
         create_indexes(conn)
         conn.commit()
     finally:
@@ -772,6 +774,244 @@ def api_update_settings(pid):
     if changes:
         audit_log('settings', 'update', 'settings', None, pid, changes)
     return jsonify({'success': True})
+
+
+# ─── API: Связь с Jira (срез данных из Structure) ────────────────
+
+def _jira_button_json(db, row):
+    mappings = db.execute('SELECT service_id, issue_keys, include_subtree FROM jira_snapshot_mappings '
+                          'WHERE button_id = ? ORDER BY id', (row['id'],)).fetchall()
+    return {'id': row['id'], 'name': row['name'], 'structureId': row['structure_id'],
+            'structureName': row['structure_name'] or '',
+            'mappings': [{'serviceId': m['service_id'], 'issueKeys': m['issue_keys'],
+                          'includeSubtree': bool(m['include_subtree'])} for m in mappings]}
+
+
+def _jira_client(db, pid, override=None):
+    """Клиент Jira по сохранённому подключению проекта; override — данные формы (для проверки до сохранения)."""
+    saved = db.execute('SELECT * FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()
+    conf = dict(override or {})
+    if not override and not saved:
+        raise jira.JiraError('Подключение к Jira для проекта не настроено')
+    base_url = text_value(conf.get('baseUrl')) if override else saved['base_url']
+    instance_type = conf.get('instanceType') if override else saved['instance_type']
+    login = text_value(conf.get('login')) if override else (saved['login'] or '')
+    insecure = bool(conf.get('acceptInvalidCerts')) if override else bool(saved['accept_invalid_certs'])
+    token = conf.get('token') or ''
+    if not token:
+        # сохранённый токен уходит только на тот же адрес Jira, для которого он был введён
+        if not saved or not saved['token_encrypted'] or base_url.rstrip('/') != saved['base_url']:
+            raise jira.JiraError('Укажите токен или пароль')
+        token = jira.decrypt_token(app.secret_key, saved['token_encrypted'])
+    if instance_type != 'server' and not login:
+        raise jira.JiraError('Укажите email или логин')
+    return jira.JiraClient(base_url, instance_type, login, token, accept_invalid_certs=insecure)
+
+
+def _jira_error(e):
+    return jsonify({'error': str(e)}), 502
+
+
+def _parse_jira_button(db, pid, data):
+    name = text_value(data.get('name'))
+    if not name:
+        raise ValidationError('Укажите название кнопки')
+    structure_id = data.get('structureId')
+    if structure_id in (None, ''):
+        structure_id = None
+    elif isinstance(structure_id, bool) or not str(structure_id).isdigit():
+        raise ValidationError('ID структуры — целое число')
+    else:
+        structure_id = int(structure_id)
+    project_services = {r['id'] for r in db.execute('SELECT id FROM services WHERE project_id = ?', (pid,))}
+    mappings, bad_keys = [], []
+    for m in data.get('mappings') or []:
+        if not isinstance(m, dict) or m.get('serviceId') not in project_services:
+            raise ValidationError('Эпик не найден в проекте')
+        keys, invalid = jira.parse_issue_keys(text_value(m.get('issueKeys')))
+        bad_keys += invalid
+        if keys:
+            mappings.append((m['serviceId'], ', '.join(keys), 1 if m.get('includeSubtree', True) else 0))
+    if bad_keys:
+        raise ValidationError('Некорректные ключи задач: ' + ', '.join(bad_keys))
+    if not mappings:
+        raise ValidationError('Укажите задачи Jira хотя бы для одного эпика')
+    return name, structure_id, text_value(data.get('structureName')) or None, mappings
+
+
+def _save_jira_mappings(db, button_id, mappings):
+    db.execute('DELETE FROM jira_snapshot_mappings WHERE button_id = ?', (button_id,))
+    db.executemany('INSERT INTO jira_snapshot_mappings (button_id, service_id, issue_keys, include_subtree) '
+                   'VALUES (?, ?, ?, ?)', [(button_id, *m) for m in mappings])
+
+
+def _jira_button_or_404(db, bid):
+    row = db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone()
+    if not row:
+        return None, (jsonify({'error': 'Кнопка не найдена'}), 404)
+    if not can_edit_project(session['user_id'], row['project_id']):
+        return None, (jsonify({'error': 'Нет прав на редактирование'}), 403)
+    return row, None
+
+
+@app.route('/api/projects/<int:pid>/jira')
+@login_required
+def api_get_jira(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    db = get_db()
+    conn_row = db.execute('SELECT * FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()
+    buttons = db.execute('SELECT * FROM jira_snapshot_buttons WHERE project_id = ? ORDER BY sort_order, id',
+                         (pid,)).fetchall()
+    return jsonify({'connection': jira.connection_json(conn_row),
+                    'buttons': [_jira_button_json(db, b) for b in buttons]})
+
+
+@app.route('/api/projects/<int:pid>/jira/connection', methods=['PUT'])
+@login_required
+def api_save_jira_connection(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    data = request.get_json() or {}
+    base_url = text_value(data.get('baseUrl')).rstrip('/')
+    instance_type = data.get('instanceType')
+    login = text_value(data.get('login'))
+    token = data.get('token') or ''
+    if not re.match(r'^https?://\S+$', base_url):
+        raise ValidationError('Адрес Jira должен начинаться с http:// или https://')
+    if instance_type not in jira.INSTANCE_TYPES:
+        raise ValidationError('Недопустимый тип подключения')
+    if instance_type != 'server' and not login:
+        raise ValidationError('Укажите email или логин')
+    if not isinstance(token, str):
+        raise ValidationError('Токен — строка')
+    db = get_db()
+    existing = db.execute('SELECT * FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()
+    if not token and not (existing and existing['token_encrypted']):
+        raise ValidationError('Укажите токен или пароль')
+    if not token and existing['base_url'] != base_url:
+        raise ValidationError('Адрес Jira изменён — введите токен или пароль заново')
+    encrypted = jira.encrypt_token(app.secret_key, token) if token else existing['token_encrypted']
+    insecure = 1 if data.get('acceptInvalidCerts') else 0
+    if existing:
+        db.execute('UPDATE jira_connections SET base_url = ?, instance_type = ?, login = ?, token_encrypted = ?, '
+                   'accept_invalid_certs = ? WHERE project_id = ?',
+                   (base_url, instance_type, login, encrypted, insecure, pid))
+    else:
+        db.execute('INSERT INTO jira_connections (project_id, base_url, instance_type, login, token_encrypted, '
+                   'accept_invalid_certs) VALUES (?, ?, ?, ?, ?, ?)',
+                   (pid, base_url, instance_type, login, encrypted, insecure))
+    db.commit()
+    changes = [text_change(existing['base_url'] if existing else None, base_url, 'jiraUrl'),
+               text_change(existing['instance_type'] if existing else None, instance_type, 'jiraAuth'),
+               text_change(existing['login'] if existing else None, login, 'jiraLogin')]
+    changes = [c for c in changes if c['old'] != c['new']]
+    if token:
+        changes.append({'field': 'jiraToken', 'old': None, 'new': 'изменён'})
+    if changes:
+        audit_log('jira', 'update' if existing else 'create', 'jira_connection', None, pid, changes)
+    return jsonify(jira.connection_json(
+        db.execute('SELECT * FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()))
+
+
+@app.route('/api/projects/<int:pid>/jira/connection', methods=['DELETE'])
+@login_required
+def api_delete_jira_connection(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    db = get_db()
+    if db.execute('DELETE FROM jira_connections WHERE project_id = ?', (pid,)).rowcount:
+        db.commit()
+        audit_log('jira', 'delete', 'jira_connection', None, pid)
+    return jsonify({'success': True})
+
+
+@app.route('/api/projects/<int:pid>/jira/connection/test', methods=['POST'])
+@login_required
+def api_test_jira_connection(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    data = request.get_json(silent=True) or None
+    try:
+        user = _jira_client(get_db(), pid, override=data).myself()
+    except jira.JiraError as e:
+        return _jira_error(e)
+    return jsonify({'success': True, 'user': user})
+
+
+@app.route('/api/projects/<int:pid>/jira/structures')
+@login_required
+def api_jira_structures(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    try:
+        return jsonify(_jira_client(get_db(), pid).list_structures())
+    except jira.JiraError as e:
+        return _jira_error(e)
+
+
+@app.route('/api/projects/<int:pid>/jira/buttons', methods=['POST'])
+@login_required
+def api_create_jira_button(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    db = get_db()
+    name, structure_id, structure_name, mappings = _parse_jira_button(db, pid, request.get_json() or {})
+    order = db.execute('SELECT COALESCE(MAX(sort_order), 0) FROM jira_snapshot_buttons WHERE project_id = ?',
+                       (pid,)).fetchone()[0]
+    bid = db.execute('INSERT INTO jira_snapshot_buttons (project_id, name, structure_id, structure_name, sort_order) '
+                     'VALUES (?, ?, ?, ?, ?)', (pid, name, structure_id, structure_name, order + 1)).lastrowid
+    _save_jira_mappings(db, bid, mappings)
+    db.commit()
+    audit_log('jira', 'create', 'jira_button', bid, pid, [{'field': 'name', 'old': None, 'new': name}], entity_name=name)
+    return jsonify(_jira_button_json(db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone()))
+
+
+@app.route('/api/jira/buttons/<int:bid>', methods=['PUT'])
+@login_required
+def api_update_jira_button(bid):
+    db = get_db()
+    row, err = _jira_button_or_404(db, bid)
+    if err:
+        return err
+    name, structure_id, structure_name, mappings = _parse_jira_button(db, row['project_id'], request.get_json() or {})
+    db.execute('UPDATE jira_snapshot_buttons SET name = ?, structure_id = ?, structure_name = ? WHERE id = ?',
+               (name, structure_id, structure_name, bid))
+    _save_jira_mappings(db, bid, mappings)
+    db.commit()
+    audit_log('jira', 'update', 'jira_button', bid, row['project_id'],
+              [text_change(row['name'], name, 'name')] if row['name'] != name else None, entity_name=name)
+    return jsonify(_jira_button_json(db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone()))
+
+
+@app.route('/api/jira/buttons/<int:bid>', methods=['DELETE'])
+@login_required
+def api_delete_jira_button(bid):
+    db = get_db()
+    row, err = _jira_button_or_404(db, bid)
+    if err:
+        return err
+    db.execute('DELETE FROM jira_snapshot_buttons WHERE id = ?', (bid,))
+    db.commit()
+    audit_log('jira', 'delete', 'jira_button', bid, row['project_id'],
+              [{'field': 'name', 'old': row['name'], 'new': None}], entity_name=row['name'])
+    return jsonify({'success': True})
+
+
+@app.route('/api/jira/buttons/<int:bid>/snapshot', methods=['POST'])
+@login_required
+def api_jira_snapshot(bid):
+    """Срез из Jira по кнопке: значения для эпиков (в БД не сохраняется — сохраняет пользователь после проверки)."""
+    db = get_db()
+    row, err = _jira_button_or_404(db, bid)
+    if err:
+        return err
+    button = _jira_button_json(db, row)
+    try:
+        items = jira.compute_snapshot(_jira_client(db, row['project_id']), row['structure_id'], button['mappings'])
+    except jira.JiraError as e:
+        return _jira_error(e)
+    return jsonify({'button': button, 'items': items})
 
 
 # ─── API: Users (admin only) ─────────────────────────────────────

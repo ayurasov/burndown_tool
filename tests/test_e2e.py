@@ -676,3 +676,138 @@ def test_deleted_user_is_sent_to_login(ui, make_user, admin):
     ui.page.click('.nav-item[data-view="stages"]')
     ui.page.reload()
     ui.page.wait_for_url(ui.base + '/login')
+
+
+# ─── Связь с Jira ────────────────────────────────────────────────
+
+@pytest.fixture
+def fake_jira():
+    from fake_jira import FakeJira
+    server = FakeJira()
+    yield server
+    server.stop()
+
+
+def setup_jira_connection(ui, fake_jira):
+    page = ui.page
+    ui.go('jira')
+    page.fill('#jiraUrl', fake_jira.url)
+    page.select_option('#jiraType', 'server')
+    page.fill('#jiraToken', 'secret-pat')
+    page.click('#jiraSave')
+    ui.expect_toast('Подключение к Jira сохранено')
+
+
+def test_jira_connection_form(admin_ui, fake_jira):
+    page = admin_ui.page
+    admin_ui.go('jira')
+    assert admin_ui.text('#jiraStatus') == 'Подключение не настроено'
+    page.fill('#jiraUrl', 'https://corp.atlassian.net')
+    page.dispatch_event('#jiraUrl', 'change')
+    assert page.input_value('#jiraType') == 'cloud' and admin_ui.text('#jiraLoginLabel') == 'Email'
+    page.select_option('#jiraType', 'server_basic')
+    assert admin_ui.text('#jiraTokenLabel') == 'Пароль' and 'HTTPS' in admin_ui.text('#jiraHint')
+    # неверный токен — понятная ошибка
+    page.fill('#jiraUrl', fake_jira.url)
+    page.select_option('#jiraType', 'server')
+    page.fill('#jiraToken', 'wrong')
+    page.click('#jiraTest')
+    page.wait_for_selector('#jiraStatus.error')
+    assert '401' in admin_ui.text('#jiraStatus')
+    page.fill('#jiraToken', 'secret-pat')
+    page.click('#jiraTest')
+    page.wait_for_selector('#jiraStatus.ok:has-text("Тестовый Пользователь")')
+    page.click('#jiraSave')
+    admin_ui.expect_toast('Подключение к Jira сохранено')
+    # токен не возвращается в форму, вместо него — подсказка
+    assert page.input_value('#jiraToken') == ''
+    assert 'Сохранён' in page.get_attribute('#jiraToken', 'placeholder')
+    assert page.is_visible('#jiraDisconnect')
+
+
+def test_jira_snapshot_button_flow(admin_ui, fake_jira, admin):
+    import datetime
+    page = admin_ui.page
+    setup_jira_connection(admin_ui, fake_jira)
+    page.click('#jiraAddButton')
+    page.fill('#jbName', 'Срез релиза')
+    page.click('#jbLoadStructures')
+    admin_ui.expect_toast('Структур загружено: 2')
+    page.select_option('#jbStructure', '7')
+    page.fill('#jbTable tr[data-sid="1"] input[data-field="keys"]', 'abc-1')
+    page.fill('#jbTable tr[data-sid="2"] input[data-field="keys"]', 'ABC-4')
+    page.uncheck('#jbTable tr[data-sid="2"] input[data-field="subtree"]')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Кнопка создана')
+    row = admin_ui.text('#jiraButtonsTable tbody tr')
+    assert 'Срез релиза' in row and 'Релиз 2026' in row and 'ABC-1' in row
+
+    admin_ui.go('data')
+    page.click('#jiraSnapshotButtons button:has-text("Срез релиза")')
+    page.wait_for_selector('#confirmModal.show #bulkTable')
+    assert admin_ui.text('#confirmTitle') == 'Срез из Jira: Срез релиза'
+    assert page.locator('#bulkTable tbody tr').count() == 2
+    first = '#bulkTable tr[data-sid="1"]'
+    assert [page.input_value(f'{first} input[data-field="{f}"]') for f in ('remaining', 'spent', 'estimate')] == ['12.5', '6', '16']
+    assert 'Задач Jira учтено: 3' in admin_ui.text(first) and 'недоступны' in admin_ui.text(first)
+    assert page.input_value('#bulkDate') == datetime.date.today().isoformat()
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Сохранено замеров: 2')
+    today = datetime.date.today().isoformat()
+    saved = {e['service_id']: e for e in admin.get('/api/projects/1/data').get_json()['entries'] if e['date'] == today}
+    assert (saved[1]['remaining'], saved[1]['spent'], saved[1]['estimate']) == (12.5, 6, 16)
+    assert saved[2]['remaining'] == 10
+
+
+def test_jira_button_edit_and_delete(admin_ui, fake_jira):
+    page = admin_ui.page
+    setup_jira_connection(admin_ui, fake_jira)
+    page.click('#jiraAddButton')
+    page.fill('#jbName', 'Без структуры')
+    page.fill('#jbTable tr[data-sid="3"] input[data-field="keys"]', 'ABC-1')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Кнопка создана')
+    assert 'без структуры' in admin_ui.text('#jiraButtonsTable tbody tr')
+    # некорректный ключ — ошибка сервера, окно остаётся открытым
+    page.click('#jiraButtonsTable [data-action="edit"]')
+    page.select_option('#jbStructure', '__manual')
+    page.fill('#jbStructureId', '7')
+    page.fill('#jbTable tr[data-sid="3"] input[data-field="keys"]', 'ABC-1, не-ключ')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Некорректные ключи задач: не-ключ')
+    assert page.is_visible('#confirmModal.show')
+    page.fill('#jbTable tr[data-sid="3"] input[data-field="keys"]', 'ABC-1')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Кнопка обновлена')
+    assert '#7' in admin_ui.text('#jiraButtonsTable tbody tr')
+    page.click('#jiraButtonsTable [data-action="delete"]')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Кнопка удалена')
+    assert 'Кнопок пока нет' in admin_ui.text('#jiraButtonsTable')
+
+
+def test_jira_snapshot_error_is_shown(admin_ui, fake_jira):
+    page = admin_ui.page
+    setup_jira_connection(admin_ui, fake_jira)
+    page.click('#jiraAddButton')
+    page.fill('#jbName', 'Срез')
+    page.select_option('#jbStructure', '__manual')
+    page.fill('#jbStructureId', '99')
+    page.fill('#jbTable tr[data-sid="1"] input[data-field="keys"]', 'ABC-1')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Кнопка создана')
+    admin_ui.go('data')
+    page.click('#jiraSnapshotButtons button')
+    admin_ui.expect_toast('Структура 99 не найдена или плагин Structure недоступен')
+    assert not page.is_visible('#confirmModal.show')
+    assert page.is_enabled('#jiraSnapshotButtons button')
+
+
+def test_jira_hidden_for_viewer(ui, make_user, admin, fake_jira):
+    admin.put('/api/projects/1/jira/connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
+    admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'mappings': [{'serviceId': 1, 'issueKeys': 'ABC-1'}]})
+    make_user('viewer', project_id=1)
+    ui.login('viewer', 'pw-12345')
+    assert not ui.page.is_visible('#navJira')
+    ui.go('data')
+    assert ui.page.locator('#jiraSnapshotButtons button').count() == 0
