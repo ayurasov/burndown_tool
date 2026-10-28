@@ -134,7 +134,10 @@
             <div class="panel-title">Объём и выполнение по задачам Jira (эпик)</div>
             <div class="section-note">Burn-up по срезам задач: рост «Объёма» — добавились задачи или выросли оценки, рост «Выполнено» — задачи закрыты.</div>
           </div>
-          <button type="button" class="btn btn-ghost btn-sm" id="jiraBurnupIssues">Задачи эпика</button>
+          <div class="panel-controls">
+            <button type="button" class="btn btn-ghost btn-sm" id="jiraBurnupChanges">Что изменилось</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="jiraBurnupIssues">Задачи эпика</button>
+          </div>
         </div>
         <div class="legend-row" id="legendBurnup"></div>
         <div class="chart-wrap chart-wrap-sm"><canvas id="chartBurnup"></canvas></div>
@@ -283,6 +286,7 @@
           <li><b>Прогноз</b> — линейная регрессия по факту либо продолжение текущего burn rate.</li>
           <li><b>Целевая линия</b> — прямая от последнего заполненного остатка к нулю на целевую дату.</li>
           <li><b>Статус</b>: прогноз достигает нуля к цели — «успеваем», в пределах буфера — «риск», позже — «не успеваем».</li>
+          <li><b>Шанс успеть</b> — вероятность обнулить остаток к цели: 2000 сценариев будущего, собранных из реальных интервалов между замерами (с учётом метода burn rate). На графике эпика — диапазон 70%: между оптимистичной (P15) и пессимистичной (P85) датой.</li>
         </ul>
       </div>
     </section>

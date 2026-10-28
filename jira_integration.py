@@ -16,6 +16,7 @@ timeoriginalestimate — оценка; в секундах), и суммирую
 
 import base64
 import hashlib
+from datetime import datetime
 import re
 import time
 
@@ -49,6 +50,7 @@ UNITS = {'seconds': 1 / 3600, 'hours': 1.0}
 DEFAULT_FIELD_MAP = {m: {'field': TIME_FIELDS[m], 'unit': 'seconds'} for m in METRICS}
 FIELD_ID_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]*$')
 SEARCH_BATCH = 100
+HISTORY_BATCH = 50  # задач в одном запросе с журналом изменений
 SEARCH_LIMIT = 5000
 MAX_ATTEMPTS = 3
 
@@ -280,10 +282,16 @@ class JiraClient:
 
         В fields под ключом '__key' — ключ задачи (ABC-1).
         """
-        out = {}
-        start_at, token = 0, None
+        return {int(issue['id']): dict(issue.get('fields') or {}, __key=issue.get('key'))
+                for issue in self._search_issues(jql, fields)}
+
+    def _search_issues(self, jql, fields, expand_changelog=False):
+        """Задачи по JQL в исходном виде Jira, постранично."""
+        found, start_at, token = 0, 0, None
         while True:
             body = {'jql': jql, 'fields': list(fields), 'maxResults': SEARCH_BATCH}
+            if expand_changelog:
+                body['expand'] = 'changelog' if self.cloud else ['changelog']
             if self.cloud:
                 if token:
                     body['nextPageToken'] = token
@@ -291,13 +299,49 @@ class JiraClient:
                 body['startAt'] = start_at
             data = self.json('POST', self.api('search/jql' if self.cloud else 'search'), json=body)
             issues = data.get('issues', [])
-            for issue in issues:
-                out[int(issue['id'])] = dict(issue.get('fields') or {}, __key=issue.get('key'))
+            yield from issues
+            found += len(issues)
             start_at += len(issues)
             token = data.get('nextPageToken')
             more = bool(token) if self.cloud else start_at < (data.get('total') or 0)
-            if not issues or not more or len(out) >= SEARCH_LIMIT:
+            if not issues or not more or found >= SEARCH_LIMIT:
+                return
+
+    def issues_with_changelog(self, keys, fields, progress=None):
+        """{ключ: (поля, история изменений)} для задач по ключам; progress(сделано, всего) — после каждого пакета."""
+        out = {}
+        keys = sorted(set(keys))
+        for start in range(0, len(keys), HISTORY_BATCH):
+            batch = keys[start:start + HISTORY_BATCH]
+            for issue in self._search_issues('key in (%s)' % ', '.join(batch), fields, expand_changelog=True):
+                log = issue.get('changelog') or {}
+                histories = log.get('histories') or []
+                if (log.get('total') or 0) > len(histories):  # Cloud отдаёт в поиске только часть журнала
+                    histories = self.changelog(issue['key'])
+                out[issue['key']] = (dict(issue.get('fields') or {}, __key=issue['key']), histories)
+            if progress:
+                progress(min(start + HISTORY_BATCH, len(keys)), len(keys))
+        return out
+
+    def changelog(self, key):
+        """Полный журнал изменений задачи."""
+        if not self.cloud:
+            data = self.json('GET', self.api(f'issue/{key}'), params={'expand': 'changelog', 'fields': 'created'})
+            return (data.get('changelog') or {}).get('histories') or []
+        out, start_at = [], 0
+        while True:
+            data = self.json('GET', self.api(f'issue/{key}/changelog'), params={'startAt': start_at, 'maxResults': 100})
+            values = data.get('values') or []
+            out.extend(values)
+            start_at += len(values)
+            if not values or data.get('isLast', True) or start_at >= (data.get('total') or 0):
                 return out
+
+    def statuses(self):
+        """{id статуса: (название, категория)}."""
+        data = self.json('GET', self.api('status'))
+        return {str(st.get('id')): (st.get('name') or '', (st.get('statusCategory') or {}).get('key') or 'new')
+                for st in (data if isinstance(data, list) else [])}
 
     def issues_by_ids(self, ids, fields):
         """{id: fields} для задач по ID (пакетами); недоступные пользователю задачи пропускаются."""
@@ -471,3 +515,100 @@ def connection_json(row):
     return {'baseUrl': row['base_url'], 'instanceType': row['instance_type'], 'login': row['login'] or '',
             'acceptInvalidCerts': bool(row['accept_invalid_certs']), 'hasToken': bool(row['token_encrypted'])}
 
+
+
+# ─── Восстановление истории по журналу изменений Jira ────────────
+
+def parse_jira_time(value):
+    """'2026-07-17T10:15:30.000+0300' → datetime с часовым поясом."""
+    for fmt in ('%Y-%m-%dT%H:%M:%S.%f%z', '%Y-%m-%dT%H:%M:%S%z'):
+        try:
+            return datetime.strptime(value, fmt)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _history_value(item, side):
+    """Значение из записи журнала: from/to (сырое), иначе fromString/toString; число или None."""
+    raw = item.get(side)
+    if raw in (None, ''):
+        raw = item.get(side + 'String')
+    try:
+        return float(raw) if raw not in (None, '') else None
+    except (TypeError, ValueError):
+        return None
+
+
+def issue_state_at(fields, histories, field_ids, moment):
+    """Значения полей и id статуса задачи на момент moment (откат журнала изменений от текущего состояния).
+
+    → (значения, id статуса, поля, по которым в журнале были изменения) или None, если задачи ещё не было.
+    """
+    created = parse_jira_time(fields.get('created'))
+    if created and created > moment:
+        return None
+    values = {f: fields.get(f) for f in field_ids}
+    status_id = str((fields.get('status') or {}).get('id') or '')
+    seen = set()
+    timed = [(parse_jira_time(h.get('created')), h) for h in histories]
+    for when, h in sorted((t for t in timed if t[0]), key=lambda t: t[0], reverse=True):
+        if when <= moment:
+            break
+        for item in h.get('items') or []:
+            fid = item.get('fieldId') or item.get('field')
+            if fid == 'status':
+                status_id = str(item.get('from') or status_id)
+            elif fid in values:
+                values[fid] = _history_value(item, 'from')
+                seen.add(fid)
+    for h in histories:  # поля, по которым журнал вообще есть (для предупреждений о пользовательских полях)
+        for item in h.get('items') or []:
+            seen.add(item.get('fieldId') or item.get('field'))
+    return values, status_id, seen
+
+
+def compute_history(client, structure_id, mappings, field_map, moments, progress=None):
+    """Срезы на прошлые моменты по текущему составу задач кнопки.
+
+    moments: {дата 'YYYY-MM-DD': datetime конца дня}. → ({дата: items как у compute_snapshot}, предупреждения).
+    Состав берётся текущий: задачи, добавленные в структуру позже, учитываются с даты создания.
+    """
+    field_map = field_map or DEFAULT_FIELD_MAP
+    field_ids = sorted({v['field'] for v in field_map.values() if v['field']})
+    current = compute_snapshot(client, structure_id, mappings, field_map)
+    keys = {i['key'] for it in current for i in it['issues']}
+    data = client.issues_with_changelog(keys, set(field_ids) | {'created', 'status', 'summary'}, progress)
+    statuses = client.statuses()
+    warnings = sorted({w for it in current for w in it['warnings']})
+    with_history = set()
+    out = {}
+    for day, moment in sorted(moments.items()):
+        items = []
+        for it in current:
+            issues = []
+            for cur in it['issues']:
+                if cur['key'] not in data:
+                    continue
+                fields, histories = data[cur['key']]
+                state = issue_state_at(fields, histories, field_ids, moment)
+                if state is None:
+                    continue
+                values, status_id, seen = state
+                with_history |= seen
+                name, category = statuses.get(status_id, (cur['status'], cur['category']))
+                f = dict(values, __key=cur['key'], summary=cur['summary'],
+                         status={'name': name, 'statusCategory': {'key': category}})
+                issues.append(issue_detail(f, field_map, cur['container']))
+            totals = {}
+            for metric in METRICS:
+                spec = field_map[metric]
+                totals[metric] = sum_hours([i[metric] for i in issues], 'hours') if spec['field'] else None
+            items.append(dict(serviceId=it['serviceId'], issueCount=len(issues), warnings=[], issues=issues, **totals))
+        out[day] = items
+    if keys and not any(it['issueCount'] for items in out.values() for it in items):
+        warnings.insert(0, 'На выбранные даты задач кнопки в Jira ещё не было (созданы позже) — восстанавливать нечего')
+    for fid in field_ids:
+        if fid not in TIME_FIELDS.values() and fid not in with_history:
+            warnings.append(f'По полю {fid} изменений в журнале Jira не найдено — для прошлых дат взято текущее значение')
+    return out, warnings

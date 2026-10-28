@@ -72,6 +72,7 @@ def demo_jira(step=3):
             formula.append(f'{row}:1:{root + i}')
             row += 1
     fake_jira.ISSUES = issues
+    fake_jira.CREATED_DEFAULT = '2026-07-01T10:00:00.000+0300'  # задачи заведены до первых замеров
     fake_jira.FORMULA = ','.join(formula)
     fake_jira.STRUCTURES = [{'id': 7, 'name': 'АИСУЗ — релиз 4.0'}, {'id': 8, 'name': 'Портфель проектов 2026'},
                             {'id': 9, 'name': 'Бэклог сопровождения'}]
@@ -207,6 +208,20 @@ def main():
         pg.wait_for_timeout(200)
         shot(pg.locator('#confirmModal .modal'), 'user/37-jira-issues-problems.png')
         pg.keyboard.press('Escape')
+        # что изменилось в эпике за неделю: каскад объёма и списки задач
+        pg.select_option('#chartServiceSelect', '1')
+        pg.click('#jiraBurnupChanges')
+        pg.wait_for_selector('#chFrom')
+        pg.select_option('#chFrom', '2026-07-24')
+        pg.wait_for_selector('#chFrom option[value="2026-07-24"][selected]', state='attached')
+        pg.wait_for_selector('#chartScopeChanges')
+        pg.wait_for_timeout(500)
+        shot(pg.locator('#confirmModal .modal'), 'user/38-jira-changes.png')
+        pg.keyboard.press('Escape')
+        # шанс успеть: подсказка с диапазоном прогноза
+        pg.hover('#summaryTable tbody tr:first-child .prob')
+        shot(pg.locator('#summaryTable').locator('xpath=ancestor::div[contains(@class,"panel")]'),
+             'user/39-probability.png')
 
         # ── Свод по этапам
         go('stages', '#stageSummaryTable tbody tr')
@@ -313,6 +328,20 @@ def main():
         shot(pg.locator('#view-autofill .panel'), 'user/31-autofill.png')
         shot(pg.locator(f'.autofill-card[data-bid="{bid1}"]'), 'user/32-autofill-card.png')
         shot(pg.locator(f'.autofill-card[data-bid="{bid2}"]'), 'user/33-autofill-locked.png')
+
+        # ── Восстановление истории по журналу изменений Jira
+        go('jira', '#jiraButtonsTable [data-action="history"]')
+        pg.click(f'#jiraButtonsTable tr[data-bid="{bid1}"] [data-action="history"]')
+        pg.fill('#hrFrom', '2026-08-03')
+        pg.fill('#hrTo', '2026-08-31')
+        pg.select_option('#hrTz', 'Europe/Moscow')
+        modal('user/40-history-restore.png')
+        pg.click('#confirmOk')
+        pg.wait_for_selector('#hrProgress[data-status="done"]', timeout=30000)
+        pg.wait_for_timeout(300)
+        hide_toast()
+        modal('user/41-history-done.png')
+        pg.click('#confirmOk')
 
         # ── Администрирование
         go('users', '#usersTable tbody tr')

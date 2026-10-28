@@ -481,3 +481,34 @@ table.jira-map-table{min-width:560px;}
 #jiTable tr.container-row td{color:var(--color-text-muted);}
 .issue-problems{font-size:var(--text-xs);color:var(--color-warning);min-width:150px;}
 .issue-problems div + div{margin-top:2px;}
+.link-btn{background:none;border:0;padding:0;font:inherit;color:inherit;cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px;}
+.link-btn:focus-visible{outline:2px solid var(--color-primary);outline-offset:2px;border-radius:2px;}
+.delta-up{color:var(--color-warning);}
+.delta-down{color:var(--color-success);}
+.cell-delta{font-size:var(--text-xs);font-family:var(--font-mono);}
+.badge-new{background:oklch(from var(--color-orange) l c h / 0.15);color:var(--color-warning);}
+.changes-period{display:flex;align-items:center;gap:var(--space-2);flex-wrap:wrap;margin-bottom:var(--space-2);}
+.changes-lists{display:flex;flex-direction:column;gap:var(--space-2);margin-top:var(--space-3);max-height:38vh;overflow:auto;}
+.change-group{border:1px solid var(--color-divider);border-radius:var(--radius-md);padding:var(--space-2) var(--space-3);}
+.change-group summary{cursor:pointer;font-size:var(--text-sm);}
+.change-group table{margin-top:var(--space-2);}
+.prob{font-weight:600;font-family:var(--font-mono);}
+.prob-high{color:var(--color-success);}
+.prob-mid{color:var(--color-warning);}
+.prob-low{color:var(--color-error);}
+.legend-dot.legend-range{border:1px solid var(--color-orange);}
+.history-form{grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:var(--space-3);}
+.history-notes{margin:var(--space-3) 0 0;padding-left:1.2em;display:flex;flex-direction:column;gap:var(--space-1);}
+.history-progress{display:flex;flex-direction:column;gap:var(--space-3);padding:var(--space-2) 0;}
+.progress-bar{height:10px;border-radius:var(--radius-full);background:var(--color-surface-offset);overflow:hidden;}
+.progress-bar span{display:block;height:100%;background:var(--color-primary);border-radius:inherit;transition:width .4s ease;}
+.progress-bar.active span{min-width:6%;background-image:linear-gradient(90deg,var(--color-primary),oklch(from var(--color-primary) calc(l + .12) c h),var(--color-primary));background-size:200% 100%;animation:progress-move 1.4s linear infinite;}
+@keyframes progress-move{from{background-position:200% 0;}to{background-position:0 0;}}
+.history-message{margin:0;font-size:var(--text-sm);}
+.history-message.ok{color:var(--color-success);}
+.history-message.error{color:var(--color-error);}
+@media (max-width:640px){.history-form{grid-template-columns:1fr;}}
+/* Сводки с шансом успеть: заголовки переносятся, чтобы таблица помещалась без прокрутки */
+#summaryTable th,#stageSummaryTable th{white-space:normal;vertical-align:bottom;}
+#summaryTable td,#stageSummaryTable td{padding-left:var(--space-2);padding-right:var(--space-2);}
+#summaryTable td:nth-child(2){min-width:9rem;}

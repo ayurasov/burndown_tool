@@ -81,6 +81,21 @@ def create_jira_tables(conn):
             UNIQUE(service_id, snap_date, issue_key)
         );
         CREATE INDEX IF NOT EXISTS idx_jira_issue_snapshots ON jira_issue_snapshots(service_id, snap_date);
+        -- Восстановление истории по журналу изменений Jira (фоновая задача с прогрессом)
+        CREATE TABLE IF NOT EXISTS jira_history_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            button_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running',
+            progress INTEGER DEFAULT 0,
+            total INTEGER DEFAULT 0,
+            message TEXT,
+            params TEXT,
+            created_by TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            finished_at TEXT,
+            FOREIGN KEY (button_id) REFERENCES jira_snapshot_buttons(id) ON DELETE CASCADE
+        );
     ''')
     # колонки, добавленные после первого выпуска таблицы кнопок
     cols = {r[1] for r in conn.execute('PRAGMA table_info(jira_snapshot_buttons)')}

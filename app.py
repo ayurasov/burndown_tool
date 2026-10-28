@@ -826,6 +826,8 @@ def _jira_button_json(db, row):
             'fieldMap': _button_field_map(row),
             'lastSuccessAt': row['last_success_at'],
             'schedule': _schedule_json(sched),
+            'history': _history_job_json(db.execute('SELECT * FROM jira_history_jobs WHERE button_id = ? '
+                                                    'ORDER BY id DESC LIMIT 1', (row['id'],)).fetchone()),
             'mappings': [{'serviceId': m['service_id'], 'issueKeys': m['issue_keys'],
                           'includeSubtree': bool(m['include_subtree'])} for m in mappings]}
 
@@ -1153,18 +1155,102 @@ def api_jira_service_issues(sid):
         return jsonify({'error': 'Эпик не найден'}), 404
     if not can_view_project(session['user_id'], svc['project_id']):
         return jsonify({'error': 'Нет доступа'}), 403
-    snap_date = parse_date(request.args.get('date'), 'Дата среза', required=False) or (db.execute(
-        'SELECT MAX(snap_date) FROM jira_issue_snapshots WHERE service_id = ?', (sid,)).fetchone()[0])
-    rows = db.execute('SELECT * FROM jira_issue_snapshots WHERE service_id = ? AND snap_date = ?',
-                      (sid, snap_date)).fetchall() if snap_date else []
-    issues = [{'key': r['issue_key'], 'summary': r['summary'] or '', 'status': r['status'] or '',
-               'category': r['category'], 'remaining': r['remaining'], 'spent': r['spent'], 'estimate': r['estimate'],
-               'container': bool(r['container']), 'problems': [p for p in (r['problems'] or '').split(',') if p]}
-              for r in rows]
+    dates = _snapshot_dates(db, sid)
+    snap_date = parse_date(request.args.get('date'), 'Дата среза', required=False) or (dates[-1] if dates else None)
+    prev_date = max((d for d in dates if snap_date and d < snap_date), default=None)
+    prev = _snapshot_issues(db, sid, prev_date) if prev_date else {}
+    issues = []
+    for key, i in _snapshot_issues(db, sid, snap_date).items():
+        p = prev.get(key)
+        i['prev'] = {m: p[m] for m in ('remaining', 'spent', 'estimate', 'category')} if p else None
+        issues.append(i)
     issues.sort(key=lambda i: jira.issue_sort_key(i['key']))
-    conn = db.execute('SELECT base_url FROM jira_connections WHERE project_id = ?', (svc['project_id'],)).fetchone()
-    return jsonify({'date': snap_date, 'baseUrl': conn['base_url'] if conn else '', 'issues': issues,
-                    'problemLabels': jira.PROBLEMS})
+    return jsonify({'date': snap_date, 'prevDate': prev_date, 'baseUrl': _jira_base_url(db, svc['project_id']),
+                    'issues': issues, 'problemLabels': jira.PROBLEMS})
+
+
+def _jira_base_url(db, pid):
+    conn = db.execute('SELECT base_url FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()
+    return conn['base_url'] if conn else ''
+
+
+def _snapshot_dates(db, sid):
+    return [r[0] for r in db.execute('SELECT DISTINCT snap_date FROM jira_issue_snapshots WHERE service_id = ? '
+                                     'ORDER BY snap_date', (sid,))]
+
+
+def _snapshot_issues(db, sid, snap_date):
+    """Задачи эпика на дату среза → {ключ: задача}."""
+    if not snap_date:
+        return {}
+    rows = db.execute('SELECT * FROM jira_issue_snapshots WHERE service_id = ? AND snap_date = ?', (sid, snap_date))
+    return {r['issue_key']: {'key': r['issue_key'], 'summary': r['summary'] or '', 'status': r['status'] or '',
+                             'category': r['category'], 'remaining': r['remaining'], 'spent': r['spent'],
+                             'estimate': r['estimate'], 'container': bool(r['container']),
+                             'problems': [p for p in (r['problems'] or '').split(',') if p]} for r in rows}
+
+
+def scope_changes(before, after):
+    """Разложение изменения объёма эпика между двумя срезами: новые, убранные, переоценённые задачи,
+    а также закрытые и переоткрытые за период. Объём «до» + новые − убранные ± переоценка = объём «после»."""
+    vol = jira.issue_volume
+
+    def brief(i, **extra):
+        return dict({'key': i['key'], 'summary': i['summary'], 'status': i['status'], 'category': i['category'],
+                     'volume': round(vol(i), 2)}, **extra)
+
+    def group(items, value):
+        items = sorted(items, key=lambda i: -abs(value(i)))
+        return {'count': len(items), 'volume': round(sum(value(i) for i in items), 2), 'issues': items}
+
+    added = [brief(i) for k, i in after.items() if k not in before]
+    removed = [brief(i) for k, i in before.items() if k not in after]
+    reestimated, closed, reopened = [], [], []
+    for key in before.keys() & after.keys():
+        a, b = before[key], after[key]
+        delta = round(vol(b) - vol(a), 2)
+        if delta:
+            reestimated.append(brief(b, before=round(vol(a), 2), delta=delta))
+        if b['category'] == 'done' and a['category'] != 'done':
+            closed.append(brief(b))
+        elif a['category'] == 'done' and b['category'] != 'done':
+            reopened.append(brief(b))
+    return {
+        'scopeFrom': round(sum(vol(i) for i in before.values()), 2),
+        'scopeTo': round(sum(vol(i) for i in after.values()), 2),
+        'doneFrom': round(sum(vol(i) for i in before.values() if i['category'] == 'done'), 2),
+        'doneTo': round(sum(vol(i) for i in after.values() if i['category'] == 'done'), 2),
+        'added': group(added, lambda i: i['volume']),
+        'removed': group(removed, lambda i: -i['volume']),
+        'reestimated': group(reestimated, lambda i: i['delta']),
+        'closed': group(closed, lambda i: i['volume']),
+        'reopened': group(reopened, lambda i: i['volume']),
+    }
+
+
+@app.route('/api/services/<int:sid>/jira/changes')
+@login_required
+def api_jira_service_changes(sid):
+    """Что изменилось в задачах эпика между двумя срезами (по умолчанию — предпоследний и последний)."""
+    db = get_db()
+    svc = db.execute('SELECT * FROM services WHERE id = ?', (sid,)).fetchone()
+    if not svc:
+        return jsonify({'error': 'Эпик не найден'}), 404
+    if not can_view_project(session['user_id'], svc['project_id']):
+        return jsonify({'error': 'Нет доступа'}), 403
+    dates = _snapshot_dates(db, sid)
+    to_date = parse_date(request.args.get('to'), 'Дата «по»', required=False) or (dates[-1] if dates else None)
+    from_date = parse_date(request.args.get('from'), 'Дата «с»', required=False) or \
+        max((d for d in dates if to_date and d < to_date), default=None)
+    out = {'dates': dates, 'from': from_date, 'to': to_date, 'baseUrl': _jira_base_url(db, svc['project_id'])}
+    if not from_date or not to_date:
+        return jsonify(out)
+    if from_date not in dates or to_date not in dates:
+        raise ValidationError('На выбранную дату нет среза задач')
+    if from_date >= to_date:
+        raise ValidationError('Дата «с» должна быть раньше даты «по»')
+    out.update(scope_changes(_snapshot_issues(db, sid, from_date), _snapshot_issues(db, sid, to_date)))
+    return jsonify(out)
 
 
 def _snapshot_has_values(items):
@@ -1351,6 +1437,177 @@ def api_run_jira_schedule(bid):
     _finish_autofill(db, row, status, message, None)
     button = _jira_button_json(db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone())
     return jsonify({'status': status, 'message': message, 'button': button}), (200 if status == 'ok' else 502)
+
+
+# ─── Восстановление истории по журналу изменений Jira ────────────
+
+HISTORY_MAX_DATES = 370
+HISTORY_STALE = timedelta(minutes=15)  # задача без обновлений дольше — считается прерванной
+
+
+def _history_job_json(job):
+    if not job:
+        return None
+    status = job['status']
+    if status == 'running' and job['updated_at'] and \
+            datetime.now(timezone.utc) - datetime.strptime(job['updated_at'], '%Y-%m-%d %H:%M:%S').replace(
+                tzinfo=timezone.utc) > HISTORY_STALE:
+        status = 'stale'
+    return {'id': job['id'], 'buttonId': job['button_id'], 'status': status, 'progress': job['progress'],
+            'total': job['total'], 'message': job['message'] or '', 'params': json.loads(job['params'] or '{}'),
+            'createdBy': job['created_by'], 'createdAt': job['created_at'], 'finishedAt': job['finished_at']}
+
+
+def history_dates(date_from, date_to, step_days):
+    """Даты восстановления: от date_from с шагом, последняя — всегда date_to."""
+    start = datetime.strptime(date_from, '%Y-%m-%d').date()
+    end = datetime.strptime(date_to, '%Y-%m-%d').date()
+    out, day = [], start
+    while day <= end:
+        out.append(day.isoformat())
+        day += timedelta(days=step_days)
+    if out and out[-1] != end.isoformat():
+        out.append(end.isoformat())
+    return out
+
+
+@app.route('/api/jira/buttons/<int:bid>/history', methods=['POST'])
+@login_required
+def api_start_jira_history(bid):
+    """Восстановить замеры и состав задач на прошлые даты по журналу изменений Jira (в фоне)."""
+    db = get_db()
+    row, err = _jira_button_or_404(db, bid)
+    if err:
+        return err
+    data = request.get_json() or {}
+    date_from = parse_date(data.get('from'), 'Дата «с»')
+    date_to = parse_date(data.get('to'), 'Дата «по»')
+    step = data.get('step') or 'week'
+    if step not in ('day', 'week'):
+        raise ValidationError('Шаг — день или неделя')
+    tz_name = text_value(data.get('timezone')) or 'Europe/Moscow'
+    tz = _zone(tz_name)
+    if date_from > date_to:
+        raise ValidationError('Дата «с» должна быть не позже даты «по»')
+    if date_to > datetime.now(timezone.utc).astimezone(tz).date().isoformat():
+        raise ValidationError('Восстановить можно только прошедшие даты')
+    dates = history_dates(date_from, date_to, 1 if step == 'day' else 7)
+    if len(dates) > HISTORY_MAX_DATES:
+        raise ValidationError(f'Слишком много дат ({len(dates)}): не больше {HISTORY_MAX_DATES} — увеличьте шаг или сократите период')
+    if not row['last_success_at']:
+        raise ValidationError('Сначала выполните срез по кнопке вручную хотя бы один раз')
+    running = _history_job_json(db.execute("SELECT * FROM jira_history_jobs WHERE button_id = ? AND status = 'running' "
+                                           'ORDER BY id DESC LIMIT 1', (bid,)).fetchone())
+    if running and running['status'] == 'running':
+        return jsonify({'error': 'Восстановление по этой кнопке уже выполняется', 'job': running}), 409
+    params = {'from': date_from, 'to': date_to, 'step': step, 'timezone': tz_name, 'dates': len(dates),
+              'keepExisting': bool(data.get('keepExisting', True))}
+    now = _utc_now_iso()
+    user = get_current_user()
+    jid = db.execute('INSERT INTO jira_history_jobs (button_id, status, message, params, created_by, created_at, '
+                     "updated_at) VALUES (?, 'running', ?, ?, ?, ?, ?)",
+                     (bid, 'Подготовка…', json.dumps(params), user['username'], now, now)).lastrowid
+    db.commit()
+    if app.config.get('HISTORY_SYNC'):  # тесты: выполнить сразу, без потока
+        run_history_job(jid)
+    else:
+        threading.Thread(target=_history_thread, args=(jid,), name=f'jira-history-{jid}', daemon=True).start()
+    job = db.execute('SELECT * FROM jira_history_jobs WHERE id = ?', (jid,)).fetchone()
+    return jsonify(_history_job_json(job)), 202
+
+
+@app.route('/api/jira/history-jobs/<int:jid>')
+@login_required
+def api_jira_history_job(jid):
+    db = get_db()
+    job = db.execute('SELECT * FROM jira_history_jobs WHERE id = ?', (jid,)).fetchone()
+    if not job:
+        return jsonify({'error': 'Задача не найдена'}), 404
+    _row, err = _jira_button_or_404(db, job['button_id'])
+    if err:
+        return err
+    return jsonify(_history_job_json(job))
+
+
+def _history_thread(jid):
+    with app.app_context():
+        run_history_job(jid)
+
+
+def _history_update(db, jid, **fields):
+    fields['updated_at'] = _utc_now_iso()
+    db.execute('UPDATE jira_history_jobs SET ' + ', '.join(f'{k} = ?' for k in fields) + ' WHERE id = ?',
+               list(fields.values()) + [jid])
+    db.commit()
+
+
+def run_history_job(jid):
+    """Восстановление: текущий состав задач кнопки + журнал изменений → замеры и состав на прошлые даты.
+
+    Существующие срезы состава не перезаписываются; замеры на даты, где они уже есть, — только при keepExisting=False.
+    Показатели без значения из Jira не затирают внесённые вручную.
+    """
+    db = get_db()
+    job = db.execute('SELECT * FROM jira_history_jobs WHERE id = ?', (jid,)).fetchone()
+    button_row = db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (job['button_id'],)).fetchone()
+    params = json.loads(job['params'])
+    pid, actor = button_row['project_id'], job['created_by']
+    try:
+        tz = ZoneInfo(params['timezone'])
+        moments = {d: datetime.strptime(d, '%Y-%m-%d').replace(hour=23, minute=59, second=59, tzinfo=tz)
+                   for d in history_dates(params['from'], params['to'], 1 if params['step'] == 'day' else 7)}
+        button = _jira_button_json(db, button_row)
+
+        def progress(done, total):
+            _history_update(db, jid, progress=done, total=total, message=f'Журнал изменений: {done} из {total} задач')
+
+        results, warnings = jira.compute_history(_jira_client(db, pid), button_row['structure_id'], button['mappings'],
+                                                 button['fieldMap'], moments, progress)
+        _history_update(db, jid, message='Сохранение замеров…')
+        services = {s['id']: s for s in db.execute('SELECT * FROM services WHERE project_id = ?', (pid,)).fetchall()}
+        saved = skipped = 0
+        days_saved = set()
+        for day, items in sorted(results.items()):
+            existing = {r[0] for r in db.execute('SELECT DISTINCT service_id FROM jira_issue_snapshots WHERE snap_date = ?',
+                                                 (day,))}
+            for it in items:
+                if it['serviceId'] in existing:
+                    it['issues'] = []  # настоящий срез за этот день ценнее восстановленного
+            store_issue_snapshots(db, pid, items, day)
+            parsed = []
+            for it in items:
+                if it['serviceId'] not in services or all(it[m] is None for m in jira.METRICS):
+                    continue
+                vals = {m: it[m] for m in jira.METRICS}
+                entry = db.execute('SELECT * FROM entries WHERE service_id = ? AND date = ?',
+                                   (it['serviceId'], day)).fetchone()
+                if entry:
+                    vals = {m: entry[m] if v is None else v for m, v in vals.items()}
+                parsed.append((it['serviceId'], vals))
+            done, skip = save_measurements(db, pid, day, parsed, services, actor=actor,
+                                           overwrite=not params['keepExisting'])
+            saved += len(done)
+            skipped += skip
+            if done:
+                days_saved.add(day)
+            db.commit()
+        message = f'Восстановлено замеров: {saved} на {len(days_saved)} дат(ы)'
+        if skipped:
+            message += f'; пропущено (замер уже был): {skipped}'
+        if warnings:
+            message += '. ' + '; '.join(warnings)
+        audit_log('jira', 'restore', 'jira_button', button_row['id'], pid,
+                  [{'field': 'result', 'old': None,
+                    'new': f"{_fmt_date(params['from'])} — {_fmt_date(params['to'])}: {message}"}],
+                  entity_name=button_row['name'], commit=False, actor=actor)
+        _history_update(db, jid, status='done', message=message, finished_at=_utc_now_iso())
+    except jira.JiraError as e:
+        db.rollback()
+        _history_update(db, jid, status='error', message=str(e), finished_at=_utc_now_iso())
+    except Exception as e:  # noqa: BLE001 — ошибка фоновой задачи показывается пользователю
+        db.rollback()
+        logger.exception('history job %s failed', jid)
+        _history_update(db, jid, status='error', message=f'Внутренняя ошибка: {e}', finished_at=_utc_now_iso())
 
 
 def run_due_schedules(now_utc=None):
