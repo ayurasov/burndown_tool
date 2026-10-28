@@ -44,6 +44,8 @@
       <a href="#" class="nav-item" data-view="data">Данные по датам</a>
       <a href="#" class="nav-item" data-view="services">Эпики (блоки задач)</a>
       <a href="#" class="nav-item" data-view="settings" id="navSettings">Настройки проекта</a>
+      <a href="#" class="nav-item" data-view="jira" id="navJira">Связь с Jira</a>
+      <a href="#" class="nav-item" data-view="autofill" id="navAutofill">Автозаполнение</a>
     </nav>
 
     <nav class="nav-group" id="adminNav" style="display:none;">
@@ -219,6 +221,7 @@
             <select id="dataServiceSelect" class="filter-input select-wide"></select>
             <button type="button" class="btn btn-ghost btn-sm" id="btnAddRow">+ Новая дата</button>
             <button type="button" class="btn btn-primary btn-sm" id="btnBulkMeasure" title="Ввести замер на одну дату сразу по всем эпикам">Замер по всем эпикам</button>
+            <span class="jira-snapshot-buttons" id="jiraSnapshotButtons"></span>
           </div>
         </div>
         <div class="table-scroll"><table class="data-table compact-table entries-table" id="entriesTable"></table></div>
@@ -261,6 +264,63 @@
           <li><b>Целевая линия</b> — прямая от последнего заполненного остатка к нулю на целевую дату.</li>
           <li><b>Статус</b>: прогноз достигает нуля к цели — «успеваем», в пределах буфера — «риск», позже — «не успеваем».</li>
         </ul>
+      </div>
+    </section>
+
+    <!-- JIRA -->
+    <section class="view" id="view-jira">
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Подключение к Jira</div>
+            <div class="section-note">Учётная запись, от имени которой приложение читает задачи и структуры. Токен хранится на сервере в зашифрованном виде и в интерфейс не возвращается.</div>
+          </div>
+        </div>
+        <form class="jira-form" id="jiraForm" novalidate autocomplete="off">
+          <div class="form-grid">
+            <div class="setting-item"><label class="small" for="jiraUrl">Jira URL</label><input type="url" id="jiraUrl" placeholder="https://jira.yourcompany.com"></div>
+            <div class="setting-item"><label class="small" for="jiraType">Тип подключения</label>
+              <select id="jiraType">
+                <option value="server">Jira Server/DC — Bearer / PAT (≥ 8.14)</option>
+                <option value="server_basic">Jira Server — логин + пароль (Basic, &lt; 8.14)</option>
+                <option value="cloud">Jira Cloud — email + API-токен</option>
+              </select>
+            </div>
+            <div class="setting-item"><label class="small" for="jiraLogin" id="jiraLoginLabel">Логин</label><input type="text" id="jiraLogin" autocomplete="off"></div>
+            <div class="setting-item"><label class="small" for="jiraToken" id="jiraTokenLabel">Токен</label><input type="password" id="jiraToken" autocomplete="new-password"></div>
+          </div>
+          <p class="jira-hint" id="jiraHint"></p>
+          <label class="quick-filter-item"><input type="checkbox" id="jiraInsecure"> Не проверять TLS-сертификат сервера (для самоподписанных/корпоративных)</label>
+          <div class="jira-status" id="jiraStatus" role="status"></div>
+          <div class="form-actions">
+            <button type="button" class="btn btn-danger btn-sm" id="jiraDisconnect" hidden>Отключить</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="jiraTest">Проверить подключение</button>
+            <button type="submit" class="btn btn-primary btn-sm" id="jiraSave">Сохранить</button>
+          </div>
+        </form>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Кнопки среза из Structure</div>
+            <div class="section-note">Кнопка связывает структуру Jira и задачи с эпиками проекта. По нажатию в разделе «Данные по датам» приложение собирает остаток, затраченное время и оценку и предлагает сохранить их как замер.</div>
+          </div>
+          <button type="button" class="btn btn-primary btn-sm" id="jiraAddButton">+ Новая кнопка</button>
+        </div>
+        <div class="table-scroll"><table class="data-table" id="jiraButtonsTable"></table></div>
+      </div>
+    </section>
+
+    <!-- АВТОЗАПОЛНЕНИЕ -->
+    <section class="view" id="view-autofill">
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Автозаполнение замеров по расписанию</div>
+            <div class="section-note">В заданные дни и время сервер сам забирает срез по кнопке и сохраняет замер на текущую дату — без участия пользователя. Расписание включается для кнопки после её первого успешного среза.</div>
+          </div>
+        </div>
+        <div id="autofillList" class="autofill-list"></div>
       </div>
     </section>
 

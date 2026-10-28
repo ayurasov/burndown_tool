@@ -14,6 +14,63 @@ from werkzeug.security import generate_password_hash
 DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'burndown.db'))
 
 
+def create_jira_tables(conn):
+    """Таблицы связки с Jira; создаются идемпотентно (новая база и миграция старой)."""
+    conn.executescript('''
+        -- Подключение проекта к Jira (токен хранится зашифрованным)
+        CREATE TABLE IF NOT EXISTS jira_connections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL UNIQUE,
+            base_url TEXT NOT NULL,
+            instance_type TEXT NOT NULL,
+            login TEXT,
+            token_encrypted TEXT,
+            accept_invalid_certs INTEGER DEFAULT 0,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        -- Кнопки «Срез из Jira»: структура (необязательно) и ассоциации эпиков с задачами
+        CREATE TABLE IF NOT EXISTS jira_snapshot_buttons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            structure_id INTEGER,
+            structure_name TEXT,
+            sort_order INTEGER DEFAULT 0,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS jira_snapshot_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            button_id INTEGER NOT NULL,
+            service_id INTEGER NOT NULL,
+            issue_keys TEXT NOT NULL,
+            include_subtree INTEGER DEFAULT 1,
+            FOREIGN KEY (button_id) REFERENCES jira_snapshot_buttons(id) ON DELETE CASCADE,
+            FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+            UNIQUE(button_id, service_id)
+        );
+        -- Автозаполнение по расписанию: одно расписание на кнопку
+        CREATE TABLE IF NOT EXISTS jira_schedules (
+            button_id INTEGER PRIMARY KEY,
+            enabled INTEGER DEFAULT 0,
+            days TEXT DEFAULT '1,2,3,4,5',
+            run_time TEXT DEFAULT '09:00',
+            timezone TEXT DEFAULT 'Europe/Moscow',
+            overwrite INTEGER DEFAULT 1,
+            last_run_date TEXT,
+            last_run_at TEXT,
+            last_status TEXT,
+            last_message TEXT,
+            FOREIGN KEY (button_id) REFERENCES jira_snapshot_buttons(id) ON DELETE CASCADE
+        );
+    ''')
+    # колонки, добавленные после первого выпуска таблицы кнопок
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(jira_snapshot_buttons)')}
+    if 'field_map' not in cols:
+        conn.execute('ALTER TABLE jira_snapshot_buttons ADD COLUMN field_map TEXT')
+    if 'last_success_at' not in cols:
+        conn.execute('ALTER TABLE jira_snapshot_buttons ADD COLUMN last_success_at TEXT')
+
+
 def create_indexes(conn):
     """Индексы для частых выборок; создаются идемпотентно и не меняют данные."""
     conn.execute('CREATE INDEX IF NOT EXISTS idx_entries_service_date ON entries(service_id, date)')
@@ -227,6 +284,7 @@ def init_db():
         VALUES (2)
     ''')
 
+    create_jira_tables(conn)
     create_indexes(conn)
 
     conn.commit()

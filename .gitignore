@@ -1,4 +1,4 @@
 __pycache__/
 .secret_key
 *.db
-docs/user-guide/img/
+docs/manuals/*.build.html

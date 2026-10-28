@@ -1,0 +1,84 @@
+/* Оформление руководств Burndown для HTML → PDF (tools/docs/build_manuals.py). */
+@page { size: A4; margin: 20mm 17mm 20mm 17mm; }
+@page :first { margin: 0; }
+:root {
+  --blue: #01696f; --blue-dark: #0c4e54; --ink: #1d2433; --muted: #6b7385; --line: #e3e7f0;
+  --soft: #f5f7fc; --green: #1f7a4d; --amber: #9a5b00;
+}
+* { box-sizing: border-box; }
+html { font-size: 10.5pt; }
+body { margin: 0; font-family: Inter, "Segoe UI", Arial, sans-serif; color: var(--ink); line-height: 1.55; font-feature-settings: "cv11", "ss01"; }
+
+/* ---- обложка */
+.cover { height: 297mm; width: 210mm; position: relative; overflow: hidden; page-break-after: always;
+  background: linear-gradient(155deg, #eef6f5 0%, #ffffff 45%, #eef5f4 100%); }
+.cover::before { content: ""; position: absolute; right: -60mm; top: -50mm; width: 170mm; height: 170mm; border-radius: 50%;
+  background: radial-gradient(circle at 30% 30%, rgba(1,105,111,.18), rgba(1,105,111,0) 70%); }
+.cover::after { content: ""; position: absolute; left: -40mm; bottom: -60mm; width: 150mm; height: 150mm; border-radius: 50%;
+  background: radial-gradient(circle, rgba(218,113,1,.10), rgba(218,113,1,0) 70%); }
+.cover-inner { position: absolute; left: 24mm; right: 24mm; top: 62mm; }
+.cover-brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 20pt; color: var(--ink); }
+.cover-brand svg { width: 40px; height: 40px; }
+.cover-tag { color: var(--muted); font-size: 10pt; letter-spacing: .08em; text-transform: uppercase; margin: 6px 0 46mm 52px; }
+.cover-title { font-size: 30pt; line-height: 1.15; font-weight: 800; margin: 0 0 6mm; letter-spacing: -.01em; }
+.cover-sub { font-size: 14pt; color: var(--blue-dark); font-weight: 600; }
+.cover-meta { position: absolute; left: 24mm; right: 24mm; bottom: 22mm; display: flex; justify-content: space-between;
+  font-size: 9.5pt; color: var(--muted); border-top: 1px solid var(--line); padding-top: 5mm; }
+.cover-bar { position: absolute; left: 24mm; top: 52mm; width: 26mm; height: 2.2mm; border-radius: 2mm; background: var(--blue); }
+
+/* ---- содержание */
+nav.toc { page-break-after: always; }
+nav.toc h1 { font-size: 20pt; margin: 0 0 6mm; border: 0; }
+nav.toc ul { list-style: none; padding-left: 0; margin: 0; }
+nav.toc > ul > li { margin-top: 2.2mm; font-weight: 600; }
+nav.toc ul ul { padding-left: 7mm; font-weight: 400; }
+nav.toc ul ul li { margin-top: .8mm; font-size: 9.8pt; }
+nav.toc a { color: var(--ink); text-decoration: none; display: flex; align-items: baseline; gap: 2mm; }
+nav.toc a::after { content: ""; flex: 1; border-bottom: 1px dotted #b9c1d3; order: 2; transform: translateY(-1mm); }
+nav.toc a .toc-page { order: 3; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 8mm; text-align: right; }
+nav.toc .toc-section-number { color: var(--blue-dark); min-width: 9mm; display: inline-block; }
+
+/* ---- текст */
+h1, h2, h3, h4 { line-height: 1.25; color: var(--ink); break-after: avoid; }
+main h1 { font-size: 19pt; margin: 0 0 6mm; padding-bottom: 3mm; border-bottom: 2px solid var(--blue); page-break-before: always; }
+main > h1:first-child, main > section:first-child > h1 { page-break-before: auto; }
+main h2 { font-size: 13.5pt; margin: 8mm 0 3mm; color: var(--blue-dark); }
+main h3 { font-size: 11.5pt; margin: 6mm 0 2mm; }
+h1 .header-section-number, h2 .header-section-number, h3 .header-section-number { color: var(--blue); margin-right: 3mm; }
+p { margin: 0 0 3mm; orphans: 3; widows: 3; }
+ul, ol { margin: 0 0 3mm; padding-left: 6mm; }
+li { margin: .8mm 0; }
+li::marker { color: var(--blue); }
+strong { font-weight: 650; }
+a { color: var(--blue-dark); }
+code { font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace; font-size: 8.8pt; background: #edf2f1; border-radius: 3px; padding: .3mm 1.2mm; }
+pre { background: #1c2126; color: #e6ecea; border-radius: 3mm; padding: 4mm 5mm; font-size: 8.5pt; line-height: 1.5; overflow: hidden; white-space: pre-wrap; word-break: break-word; break-inside: avoid; }
+pre code { background: none; color: inherit; padding: 0; font-size: inherit; }
+
+/* ---- таблицы */
+table { width: 100%; border-collapse: separate; border-spacing: 0; margin: 2mm 0 5mm; font-size: 9.3pt; border: 1px solid var(--line); border-radius: 2.5mm; overflow: hidden; break-inside: auto; }
+thead th { background: var(--soft); color: var(--muted); text-align: left; font-weight: 650; font-size: 8.4pt; text-transform: uppercase; letter-spacing: .03em; padding: 2.4mm 3mm; border-bottom: 1px solid var(--line); }
+td { padding: 2.2mm 3mm; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+tr { break-inside: avoid; }
+tbody tr:nth-child(even) td { background: #fbfcfe; }
+
+/* ---- рисунки */
+figure { margin: 4mm 0 6mm; break-inside: avoid; text-align: center; }
+figure img { max-width: 100%; max-height: 150mm; border-radius: 2.5mm; border: 1px solid var(--line); box-shadow: 0 2mm 6mm rgba(20, 60, 60, .10); }
+figcaption { font-size: 8.8pt; color: var(--muted); margin-top: 2.2mm; }
+figcaption::before { content: "Рис. " counter(figure) ". "; counter-increment: figure; font-weight: 600; color: var(--ink); }
+body { counter-reset: figure; }
+p > img { max-width: 48%; border-radius: 2.5mm; border: 1px solid var(--line); margin: 0 1%; vertical-align: top; }
+img[style*="width"] { height: auto; }
+
+/* ---- выноски */
+blockquote { margin: 3mm 0 5mm; padding: 3mm 4mm 3mm 5mm; border-left: 1.2mm solid var(--blue); background: #eef6f5; border-radius: 0 2.5mm 2.5mm 0; break-inside: avoid; }
+blockquote p:last-child { margin-bottom: 0; }
+
+/* ---- сценарии */
+main h2 + p strong:first-child { color: var(--blue-dark); }
+
+/* ---- нумерованные шаги и мелкие снимки рядом */
+ol > li::marker { font-weight: 650; }
+figure.small img, p > img.small { max-width: 60%; }

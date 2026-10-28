@@ -14,8 +14,12 @@ import math
 import secrets
 import sqlite3
 import json
+import logging
+import threading
+import time
 from functools import wraps
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import quote
 
 from flask import (
@@ -24,7 +28,8 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from init_db import create_indexes
+from init_db import create_indexes, create_jira_tables
+import jira_integration as jira
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'burndown.db'))
@@ -75,6 +80,7 @@ def migrate_db():
             conn.execute('ALTER TABLE services ADD COLUMN is_done INTEGER DEFAULT 0')
         if 'stage_group' not in cols:
             conn.execute('ALTER TABLE services ADD COLUMN stage_group TEXT')
+        create_jira_tables(conn)
         create_indexes(conn)
         conn.commit()
     finally:
@@ -152,6 +158,11 @@ def parse_date(value, field, required=True):
 @app.errorhandler(ValidationError)
 def handle_validation_error(err):
     return jsonify({'error': str(err)}), 400
+
+
+@app.errorhandler(jira.JiraError)
+def handle_jira_error(err):
+    return jsonify({'error': str(err)}), 502
 
 
 def text_value(value):
@@ -249,11 +260,15 @@ def can_edit_project(user_id, project_id):
     return role in ('admin', 'manager')
 
 
-def audit_log(page, action, entity_type=None, entity_id=None, project_id=None, changes=None, entity_name=None, commit=True):
-    """Log a change to audit_log table. changes is a list of {field, old, new} dicts."""
+def audit_log(page, action, entity_type=None, entity_id=None, project_id=None, changes=None, entity_name=None,
+              commit=True, actor=None):
+    """Log a change to audit_log table. changes is a list of {field, old, new} dicts.
+
+    actor — имя автора для фоновых операций без сессии пользователя (например, автозаполнение).
+    """
     db = get_db()
-    uid = session.get('user_id')
-    username = 'system'
+    uid = None if actor else session.get('user_id')
+    username = actor or 'system'
     if uid:
         u = db.execute('SELECT username FROM users WHERE id = ?', (uid,)).fetchone()
         if u:
@@ -649,10 +664,30 @@ def api_bulk_measurements(pid):
         parsed.append((sid, vals))
     if not parsed:
         return jsonify({'error': 'Заполните хотя бы одно значение'}), 400
+    result, _skipped = save_measurements(db, pid, date, parsed, services)
+    db.commit()
+    return jsonify({'entries': result})
 
-    result = []
+
+def _num_text(v):
+    """Число для реестра изменений: 420.0 → «420»."""
+    if v is None:
+        return None
+    return str(int(v)) if float(v).is_integer() else str(v)
+
+
+def save_measurements(db, pid, date, parsed, services, actor=None, overwrite=True):
+    """Записать замеры на дату: [(serviceId, {remaining, spent, estimate})] → (сохранённые, число пропущенных).
+
+    Существующий замер на дату обновляется; при overwrite=False — остаётся как есть (пропуск).
+    Коммит — на стороне вызывающего.
+    """
+    result, skipped = [], 0
     for sid, vals in parsed:
         existing = db.execute('SELECT * FROM entries WHERE service_id = ? AND date = ?', (sid, date)).fetchone()
+        if existing and not overwrite:
+            skipped += 1
+            continue
         if existing:
             db.execute('UPDATE entries SET remaining = ?, spent = ?, estimate = ? WHERE id = ?',
                        (vals['remaining'], vals['spent'], vals['estimate'], existing['id']))
@@ -662,13 +697,12 @@ def api_bulk_measurements(pid):
                              (sid, date, vals['remaining'], vals['spent'], vals['estimate'])).lastrowid
             action = 'create'
         result.append(dict(id=eid, service_id=sid, date=date, **vals))
-        changes = [{'field': f, 'old': None if not existing or existing[f] is None else str(existing[f]),
-                    'new': None if vals[f] is None else str(vals[f])}
+        changes = [{'field': f, 'old': _num_text(existing[f]) if existing else None, 'new': _num_text(vals[f])}
                    for f in HOUR_FIELDS if not existing or existing[f] != vals[f]]
         if changes:
-            audit_log('data', action, 'entry', eid, pid, changes, entity_name=services[sid]['name'], commit=False)
-    db.commit()
-    return jsonify({'entries': result})
+            audit_log('data', action, 'entry', eid, pid, changes, entity_name=services[sid]['name'], commit=False,
+                      actor=actor)
+    return result, skipped
 
 
 @app.route('/api/entries/<int:eid>', methods=['DELETE'])
@@ -772,6 +806,505 @@ def api_update_settings(pid):
     if changes:
         audit_log('settings', 'update', 'settings', None, pid, changes)
     return jsonify({'success': True})
+
+
+# ─── API: Связь с Jira (срез данных из Structure) ────────────────
+
+def _button_field_map(row):
+    try:
+        return jira.normalize_field_map(json.loads(row['field_map'])) if row['field_map'] else jira.DEFAULT_FIELD_MAP
+    except (ValueError, TypeError):
+        return jira.DEFAULT_FIELD_MAP
+
+
+def _jira_button_json(db, row):
+    mappings = db.execute('SELECT service_id, issue_keys, include_subtree FROM jira_snapshot_mappings '
+                          'WHERE button_id = ? ORDER BY id', (row['id'],)).fetchall()
+    sched = db.execute('SELECT * FROM jira_schedules WHERE button_id = ?', (row['id'],)).fetchone()
+    return {'id': row['id'], 'name': row['name'], 'structureId': row['structure_id'],
+            'structureName': row['structure_name'] or '',
+            'fieldMap': _button_field_map(row),
+            'lastSuccessAt': row['last_success_at'],
+            'schedule': _schedule_json(sched),
+            'mappings': [{'serviceId': m['service_id'], 'issueKeys': m['issue_keys'],
+                          'includeSubtree': bool(m['include_subtree'])} for m in mappings]}
+
+
+def _jira_client(db, pid, override=None):
+    """Клиент Jira по сохранённому подключению проекта; override — данные формы (для проверки до сохранения)."""
+    saved = db.execute('SELECT * FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()
+    conf = dict(override or {})
+    if not override and not saved:
+        raise jira.JiraError('Подключение к Jira для проекта не настроено')
+    base_url = text_value(conf.get('baseUrl')) if override else saved['base_url']
+    instance_type = conf.get('instanceType') if override else saved['instance_type']
+    login = text_value(conf.get('login')) if override else (saved['login'] or '')
+    insecure = bool(conf.get('acceptInvalidCerts')) if override else bool(saved['accept_invalid_certs'])
+    token = conf.get('token') or ''
+    if not token:
+        # сохранённый токен уходит только на тот же адрес Jira, для которого он был введён
+        if not saved or not saved['token_encrypted'] or base_url.rstrip('/') != saved['base_url']:
+            raise jira.JiraError('Укажите токен или пароль')
+        token = jira.decrypt_token(app.secret_key, saved['token_encrypted'])
+    if instance_type != 'server' and not login:
+        raise jira.JiraError('Укажите email или логин')
+    return jira.JiraClient(base_url, instance_type, login, token, accept_invalid_certs=insecure)
+
+
+def _jira_error(e):
+    return jsonify({'error': str(e)}), 502
+
+
+def _parse_jira_button(db, pid, data):
+    name = text_value(data.get('name'))
+    if not name:
+        raise ValidationError('Укажите название кнопки')
+    structure_id = data.get('structureId')
+    if structure_id in (None, ''):
+        structure_id = None
+    elif isinstance(structure_id, bool) or not str(structure_id).isdigit():
+        raise ValidationError('ID структуры — целое число')
+    else:
+        structure_id = int(structure_id)
+    project_services = {r['id'] for r in db.execute('SELECT id FROM services WHERE project_id = ?', (pid,))}
+    mappings, bad_keys = [], []
+    for m in data.get('mappings') or []:
+        if not isinstance(m, dict) or m.get('serviceId') not in project_services:
+            raise ValidationError('Эпик не найден в проекте')
+        keys, invalid = jira.parse_issue_keys(text_value(m.get('issueKeys')))
+        bad_keys += invalid
+        if keys:
+            mappings.append((m['serviceId'], ', '.join(keys), 1 if m.get('includeSubtree', True) else 0))
+    if bad_keys:
+        raise ValidationError('Некорректные ключи задач: ' + ', '.join(bad_keys))
+    if not mappings:
+        raise ValidationError('Укажите задачи Jira хотя бы для одного эпика')
+    try:
+        field_map = jira.normalize_field_map(data.get('fieldMap'))
+    except ValueError as e:
+        raise ValidationError(str(e))
+    return name, structure_id, text_value(data.get('structureName')) or None, mappings, field_map
+
+
+def _save_jira_mappings(db, button_id, mappings):
+    db.execute('DELETE FROM jira_snapshot_mappings WHERE button_id = ?', (button_id,))
+    db.executemany('INSERT INTO jira_snapshot_mappings (button_id, service_id, issue_keys, include_subtree) '
+                   'VALUES (?, ?, ?, ?)', [(button_id, *m) for m in mappings])
+
+
+def _jira_button_or_404(db, bid):
+    row = db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone()
+    if not row:
+        return None, (jsonify({'error': 'Кнопка не найдена'}), 404)
+    if not can_edit_project(session['user_id'], row['project_id']):
+        return None, (jsonify({'error': 'Нет прав на редактирование'}), 403)
+    return row, None
+
+
+@app.route('/api/projects/<int:pid>/jira')
+@login_required
+def api_get_jira(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    db = get_db()
+    conn_row = db.execute('SELECT * FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()
+    buttons = db.execute('SELECT * FROM jira_snapshot_buttons WHERE project_id = ? ORDER BY sort_order, id',
+                         (pid,)).fetchall()
+    return jsonify({'connection': jira.connection_json(conn_row),
+                    'buttons': [_jira_button_json(db, b) for b in buttons]})
+
+
+@app.route('/api/projects/<int:pid>/jira/connection', methods=['PUT'])
+@login_required
+def api_save_jira_connection(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    data = request.get_json() or {}
+    base_url = text_value(data.get('baseUrl')).rstrip('/')
+    instance_type = data.get('instanceType')
+    login = text_value(data.get('login'))
+    token = data.get('token') or ''
+    if not re.match(r'^https?://\S+$', base_url):
+        raise ValidationError('Адрес Jira должен начинаться с http:// или https://')
+    if instance_type not in jira.INSTANCE_TYPES:
+        raise ValidationError('Недопустимый тип подключения')
+    if instance_type != 'server' and not login:
+        raise ValidationError('Укажите email или логин')
+    if not isinstance(token, str):
+        raise ValidationError('Токен — строка')
+    db = get_db()
+    existing = db.execute('SELECT * FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()
+    if not token and not (existing and existing['token_encrypted']):
+        raise ValidationError('Укажите токен или пароль')
+    if not token and existing['base_url'] != base_url:
+        raise ValidationError('Адрес Jira изменён — введите токен или пароль заново')
+    encrypted = jira.encrypt_token(app.secret_key, token) if token else existing['token_encrypted']
+    insecure = 1 if data.get('acceptInvalidCerts') else 0
+    if existing:
+        db.execute('UPDATE jira_connections SET base_url = ?, instance_type = ?, login = ?, token_encrypted = ?, '
+                   'accept_invalid_certs = ? WHERE project_id = ?',
+                   (base_url, instance_type, login, encrypted, insecure, pid))
+    else:
+        db.execute('INSERT INTO jira_connections (project_id, base_url, instance_type, login, token_encrypted, '
+                   'accept_invalid_certs) VALUES (?, ?, ?, ?, ?, ?)',
+                   (pid, base_url, instance_type, login, encrypted, insecure))
+    db.commit()
+    changes = [text_change(existing['base_url'] if existing else None, base_url, 'jiraUrl'),
+               text_change(existing['instance_type'] if existing else None, instance_type, 'jiraAuth'),
+               text_change(existing['login'] if existing else None, login, 'jiraLogin')]
+    changes = [c for c in changes if c['old'] != c['new']]
+    if token:
+        changes.append({'field': 'jiraToken', 'old': None, 'new': 'изменён'})
+    if changes:
+        audit_log('jira', 'update' if existing else 'create', 'jira_connection', None, pid, changes)
+    return jsonify(jira.connection_json(
+        db.execute('SELECT * FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()))
+
+
+@app.route('/api/projects/<int:pid>/jira/connection', methods=['DELETE'])
+@login_required
+def api_delete_jira_connection(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    db = get_db()
+    if db.execute('DELETE FROM jira_connections WHERE project_id = ?', (pid,)).rowcount:
+        db.commit()
+        audit_log('jira', 'delete', 'jira_connection', None, pid)
+    return jsonify({'success': True})
+
+
+@app.route('/api/projects/<int:pid>/jira/connection/test', methods=['POST'])
+@login_required
+def api_test_jira_connection(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    data = request.get_json(silent=True) or None
+    try:
+        user = _jira_client(get_db(), pid, override=data).myself()
+    except jira.JiraError as e:
+        return _jira_error(e)
+    return jsonify({'success': True, 'user': user})
+
+
+@app.route('/api/projects/<int:pid>/jira/structures')
+@login_required
+def api_jira_structures(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    try:
+        return jsonify(_jira_client(get_db(), pid).list_structures())
+    except jira.JiraError as e:
+        return _jira_error(e)
+
+
+@app.route('/api/projects/<int:pid>/jira/buttons', methods=['POST'])
+@login_required
+def api_create_jira_button(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    db = get_db()
+    name, structure_id, structure_name, mappings, field_map = _parse_jira_button(db, pid, request.get_json() or {})
+    order = db.execute('SELECT COALESCE(MAX(sort_order), 0) FROM jira_snapshot_buttons WHERE project_id = ?',
+                       (pid,)).fetchone()[0]
+    bid = db.execute('INSERT INTO jira_snapshot_buttons (project_id, name, structure_id, structure_name, sort_order, '
+                     'field_map) VALUES (?, ?, ?, ?, ?, ?)',
+                     (pid, name, structure_id, structure_name, order + 1, json.dumps(field_map))).lastrowid
+    _save_jira_mappings(db, bid, mappings)
+    db.commit()
+    audit_log('jira', 'create', 'jira_button', bid, pid, [{'field': 'name', 'old': None, 'new': name}], entity_name=name)
+    return jsonify(_jira_button_json(db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone()))
+
+
+@app.route('/api/jira/buttons/<int:bid>', methods=['PUT'])
+@login_required
+def api_update_jira_button(bid):
+    db = get_db()
+    row, err = _jira_button_or_404(db, bid)
+    if err:
+        return err
+    name, structure_id, structure_name, mappings, field_map = _parse_jira_button(
+        db, row['project_id'], request.get_json() or {})
+    db.execute('UPDATE jira_snapshot_buttons SET name = ?, structure_id = ?, structure_name = ?, field_map = ? '
+               'WHERE id = ?', (name, structure_id, structure_name, json.dumps(field_map), bid))
+    _save_jira_mappings(db, bid, mappings)
+    db.commit()
+    audit_log('jira', 'update', 'jira_button', bid, row['project_id'],
+              [text_change(row['name'], name, 'name')] if row['name'] != name else None, entity_name=name)
+    return jsonify(_jira_button_json(db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone()))
+
+
+@app.route('/api/jira/buttons/<int:bid>', methods=['DELETE'])
+@login_required
+def api_delete_jira_button(bid):
+    db = get_db()
+    row, err = _jira_button_or_404(db, bid)
+    if err:
+        return err
+    db.execute('DELETE FROM jira_snapshot_buttons WHERE id = ?', (bid,))
+    db.commit()
+    audit_log('jira', 'delete', 'jira_button', bid, row['project_id'],
+              [{'field': 'name', 'old': row['name'], 'new': None}], entity_name=row['name'])
+    return jsonify({'success': True})
+
+
+@app.route('/api/jira/buttons/<int:bid>/snapshot', methods=['POST'])
+@login_required
+def api_jira_snapshot(bid):
+    """Срез из Jira по кнопке: значения для эпиков (в БД не сохраняется — сохраняет пользователь после проверки)."""
+    db = get_db()
+    row, err = _jira_button_or_404(db, bid)
+    if err:
+        return err
+    button = _jira_button_json(db, row)
+    try:
+        items = jira.compute_snapshot(_jira_client(db, row['project_id']), row['structure_id'], button['mappings'],
+                                      button['fieldMap'])
+    except jira.JiraError as e:
+        return _jira_error(e)
+    if _snapshot_has_values(items):
+        _mark_snapshot_success(db, bid)
+        button = _jira_button_json(db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone())
+    return jsonify({'button': button, 'items': items})
+
+
+def _snapshot_has_values(items):
+    return any(it[m] is not None for it in items for m in jira.METRICS)
+
+
+def _mark_snapshot_success(db, bid):
+    """Успешный срез открывает автозаполнение по расписанию для кнопки."""
+    db.execute('UPDATE jira_snapshot_buttons SET last_success_at = ? WHERE id = ?', (_utc_now_iso(), bid))
+    db.commit()
+
+
+@app.route('/api/projects/<int:pid>/jira/fields')
+@login_required
+def api_jira_fields(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    try:
+        return jsonify(_jira_client(get_db(), pid).list_fields())
+    except jira.JiraError as e:
+        return _jira_error(e)
+
+
+# ─── Автозаполнение по расписанию ────────────────────────────────
+
+AUTOFILL_ACTOR = 'Автозаполнение'
+SCHEDULER_INTERVAL = 30  # секунд между проверками расписаний
+logger = logging.getLogger('burndown.autofill')
+
+
+def _utc_now_iso():
+    """UTC в формате CURRENT_TIMESTAMP SQLite — интерфейс показывает его в локальном времени."""
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _zone(name):
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ValidationError(f'Неизвестный часовой пояс: {name}')
+
+
+def _schedule_days(text):
+    return [int(d) for d in (text or '').split(',') if d.strip().isdigit()]
+
+
+def _next_run(sched, now_utc=None):
+    """Ближайший запуск по расписанию в его часовом поясе (ISO без смещения) или None."""
+    if not sched or not sched['enabled']:
+        return None
+    days = set(_schedule_days(sched['days']))
+    if not days:
+        return None
+    try:
+        tz = ZoneInfo(sched['timezone'])
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    local = (now_utc or datetime.now(timezone.utc)).astimezone(tz)
+    hh, mm = (int(x) for x in sched['run_time'].split(':'))
+    for shift in range(0, 8):
+        day = local.date() + timedelta(days=shift)
+        if day.isoweekday() not in days:
+            continue
+        if shift == 0 and (local.strftime('%H:%M') >= sched['run_time'] or sched['last_run_date'] == day.isoformat()):
+            continue
+        return datetime(day.year, day.month, day.day, hh, mm).isoformat(timespec='minutes')
+    return None
+
+
+def _schedule_json(sched):
+    if not sched:
+        return {'enabled': False, 'days': [1, 2, 3, 4, 5], 'time': '09:00', 'timezone': 'Europe/Moscow',
+                'overwrite': True, 'lastRunAt': None, 'lastStatus': None, 'lastMessage': None, 'nextRunAt': None}
+    return {'enabled': bool(sched['enabled']), 'days': _schedule_days(sched['days']), 'time': sched['run_time'],
+            'timezone': sched['timezone'], 'overwrite': bool(sched['overwrite']), 'lastRunAt': sched['last_run_at'],
+            'lastStatus': sched['last_status'], 'lastMessage': sched['last_message'], 'nextRunAt': _next_run(sched)}
+
+
+@app.route('/api/jira/buttons/<int:bid>/schedule', methods=['PUT'])
+@login_required
+def api_save_jira_schedule(bid):
+    db = get_db()
+    row, err = _jira_button_or_404(db, bid)
+    if err:
+        return err
+    data = request.get_json() or {}
+    enabled = bool(data.get('enabled'))
+    days = data.get('days') or []
+    if not isinstance(days, list) or not all(isinstance(d, int) and 1 <= d <= 7 for d in days):
+        raise ValidationError('Дни недели — числа от 1 (пн) до 7 (вс)')
+    days = sorted(set(days))
+    run_time = text_value(data.get('time'))
+    if not re.fullmatch(r'([01]\d|2[0-3]):[0-5]\d', run_time):
+        raise ValidationError('Время запуска — в формате ЧЧ:ММ')
+    tz_name = text_value(data.get('timezone')) or 'Europe/Moscow'
+    tz = _zone(tz_name)
+    if enabled and not days:
+        raise ValidationError('Выберите хотя бы один день недели')
+    if enabled and not row['last_success_at']:
+        raise ValidationError('Автозаполнение доступно после первого успешного среза по этой кнопке')
+    existing = db.execute('SELECT * FROM jira_schedules WHERE button_id = ?', (bid,)).fetchone()
+    # если сегодняшнее время запуска уже прошло, первый автоматический запуск — в следующий день по расписанию
+    local = datetime.now(timezone.utc).astimezone(tz)
+    last_run_date = existing['last_run_date'] if existing else None
+    if enabled and local.strftime('%H:%M') >= run_time and not (existing and existing['enabled']):
+        last_run_date = local.date().isoformat()
+    values = (1 if enabled else 0, ','.join(str(d) for d in days), run_time, tz_name,
+              1 if data.get('overwrite', True) else 0, last_run_date)
+    if existing:
+        db.execute('UPDATE jira_schedules SET enabled = ?, days = ?, run_time = ?, timezone = ?, overwrite = ?, '
+                   'last_run_date = ? WHERE button_id = ?', values + (bid,))
+    else:
+        db.execute('INSERT INTO jira_schedules (enabled, days, run_time, timezone, overwrite, last_run_date, button_id) '
+                   'VALUES (?, ?, ?, ?, ?, ?, ?)', values + (bid,))
+    db.commit()
+    audit_log('jira', 'update', 'jira_schedule', bid, row['project_id'],
+              [{'field': 'autofill', 'old': None,
+                'new': (f"{','.join(str(d) for d in days)} в {run_time} ({tz_name})" if enabled else 'выключено')}],
+              entity_name=row['name'])
+    return jsonify(_jira_button_json(db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone()))
+
+
+def run_autofill(db, button_row, local_date, actor, overwrite=True):
+    """Срез по кнопке и запись замеров на local_date → (статус, сообщение). Ошибки Jira не выбрасываются."""
+    pid = button_row['project_id']
+    try:
+        button = _jira_button_json(db, button_row)
+        items = jira.compute_snapshot(_jira_client(db, pid), button_row['structure_id'], button['mappings'],
+                                      button['fieldMap'])
+    except jira.JiraError as e:
+        return 'error', str(e)
+    services = {s['id']: s for s in db.execute('SELECT * FROM services WHERE project_id = ?', (pid,)).fetchall()}
+    parsed = []
+    for it in items:
+        if it['serviceId'] not in services or all(it[m] is None for m in jira.METRICS):
+            continue
+        vals = {m: it[m] for m in jira.METRICS}
+        # показатели без значения из Jira («не заполнять», пустое поле) не затирают уже внесённые вручную
+        existing = db.execute('SELECT * FROM entries WHERE service_id = ? AND date = ?',
+                              (it['serviceId'], local_date)).fetchone()
+        if existing:
+            vals = {m: existing[m] if v is None else v for m, v in vals.items()}
+        parsed.append((it['serviceId'], vals))
+    if not parsed:
+        return 'error', 'Jira не вернула значений ни по одному эпику'
+    saved, skipped = save_measurements(db, pid, local_date, parsed, services, actor=actor, overwrite=overwrite)
+    db.execute('UPDATE jira_snapshot_buttons SET last_success_at = ? WHERE id = ?', (_utc_now_iso(), button_row['id']))
+    warnings = sum(len(it['warnings']) for it in items)
+    message = f'Сохранено замеров за {datetime.strptime(local_date, "%Y-%m-%d"):%d.%m.%Y}: {len(saved)}'
+    if skipped:
+        message += f'; пропущено (замер уже был): {skipped}'
+    if warnings:
+        message += f'; предупреждений: {warnings}'
+    return 'ok', message
+
+
+def _finish_autofill(db, button_row, status, message, actor):
+    db.execute('UPDATE jira_schedules SET last_run_at = ?, last_status = ?, last_message = ? WHERE button_id = ?',
+               (_utc_now_iso(), status, message, button_row['id']))
+    audit_log('jira', 'autofill', 'jira_button', button_row['id'], button_row['project_id'],
+              [{'field': 'result', 'old': None, 'new': message}], entity_name=button_row['name'], commit=False,
+              actor=actor)
+    db.commit()
+
+
+@app.route('/api/jira/buttons/<int:bid>/schedule/run', methods=['POST'])
+@login_required
+def api_run_jira_schedule(bid):
+    """«Запустить сейчас»: то же, что автоматический запуск, — срез и запись замеров на сегодня."""
+    db = get_db()
+    row, err = _jira_button_or_404(db, bid)
+    if err:
+        return err
+    if not row['last_success_at']:
+        raise ValidationError('Сначала выполните срез вручную хотя бы один раз')
+    sched = db.execute('SELECT * FROM jira_schedules WHERE button_id = ?', (bid,)).fetchone()
+    tz = _zone(sched['timezone'] if sched else 'Europe/Moscow')
+    if not sched:
+        db.execute('INSERT INTO jira_schedules (button_id) VALUES (?)', (bid,))
+        sched = db.execute('SELECT * FROM jira_schedules WHERE button_id = ?', (bid,)).fetchone()
+    local_date = datetime.now(timezone.utc).astimezone(tz).date().isoformat()
+    status, message = run_autofill(db, row, local_date, None, overwrite=bool(sched['overwrite']))
+    _finish_autofill(db, row, status, message, None)
+    button = _jira_button_json(db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone())
+    return jsonify({'status': status, 'message': message, 'button': button}), (200 if status == 'ok' else 502)
+
+
+def run_due_schedules(now_utc=None):
+    """Выполнить наступившие запуски. Один запуск в день на кнопку: день «захватывается» атомарно в БД,
+    поэтому при нескольких воркерах/процессах срез выполнит только один из них.
+    Если сервер был недоступен во время запуска, срез выполнится позже в тот же день."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    db = get_db()
+    rows = db.execute('SELECT s.*, b.project_id FROM jira_schedules s JOIN jira_snapshot_buttons b ON b.id = s.button_id '
+                      'WHERE s.enabled = 1').fetchall()
+    done = 0
+    for sched in rows:
+        try:
+            local = now_utc.astimezone(ZoneInfo(sched['timezone']))
+        except (ZoneInfoNotFoundError, ValueError):
+            continue
+        today = local.date().isoformat()
+        if (local.isoweekday() not in _schedule_days(sched['days']) or local.strftime('%H:%M') < sched['run_time']
+                or sched['last_run_date'] == today):
+            continue
+        claimed = db.execute('UPDATE jira_schedules SET last_run_date = ? WHERE button_id = ? AND enabled = 1 '
+                             'AND (last_run_date IS NULL OR last_run_date != ?)',
+                             (today, sched['button_id'], today)).rowcount
+        db.commit()
+        if not claimed:
+            continue
+        button = db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (sched['button_id'],)).fetchone()
+        try:
+            status, message = run_autofill(db, button, today, AUTOFILL_ACTOR, overwrite=bool(sched['overwrite']))
+        except Exception as e:  # noqa: BLE001 — сбой одного запуска не должен останавливать планировщик
+            db.rollback()
+            logger.exception('autofill failed for button %s', sched['button_id'])
+            status, message = 'error', f'Внутренняя ошибка: {e}'
+        _finish_autofill(db, button, status, message, AUTOFILL_ACTOR)
+        done += 1
+    return done
+
+
+def _scheduler_loop():
+    while True:
+        time.sleep(SCHEDULER_INTERVAL)
+        try:
+            with app.app_context():
+                run_due_schedules()
+        except Exception:  # noqa: BLE001
+            logger.exception('scheduler tick failed')
+
+
+def start_scheduler():
+    """Фоновый планировщик автозаполнения (отключается BURNDOWN_SCHEDULER=0, например в тестах)."""
+    if os.environ.get('BURNDOWN_SCHEDULER', '1') == '0':
+        return None
+    thread = threading.Thread(target=_scheduler_loop, name='burndown-autofill', daemon=True)
+    thread.start()
+    return thread
 
 
 # ─── API: Users (admin only) ─────────────────────────────────────
@@ -1317,6 +1850,9 @@ def _pdf_table(pdf, headers, rows, widths=None, total_row=False):
             numeric = ci > 0 and (text == '—' or re.fullmatch(r'-?\d+(\.\d+)?', text) is not None)
             pdf.cell(w, row_h, _pdf_fit(pdf, text, w - 2), border=1, fill=True, align='R' if numeric else 'L')
         pdf.ln(row_h)
+
+
+start_scheduler()
 
 
 if __name__ == '__main__':
