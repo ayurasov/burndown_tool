@@ -9,6 +9,7 @@ PDF собирается в два прохода: после первого н�
 и вписываются в него во втором.
 """
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,8 @@ from pypdf import PdfReader, PdfWriter
 ROOT = Path(__file__).resolve().parents[2]
 MANUALS = ROOT / 'docs' / 'manuals'
 TOOLS = Path(__file__).resolve().parent
-VERSION = '1.5.0'
+# номер версии — из истории версий (docs/versions.md), как в приложении
+VERSION = re.search(r'^## Версия\s+(\S+)', (ROOT / 'docs' / 'versions.md').read_text(encoding='utf-8'), re.M).group(1)
 DOCS = {
     'user-guide': 'Руководство пользователя',
     'admin-guide': 'Руководство администратора',

@@ -25,7 +25,7 @@ from urllib.parse import quote
 
 from flask import (
     Flask, request, jsonify, session, render_template,
-    redirect, g, Response
+    redirect, g, Response, send_file
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -119,11 +119,35 @@ def migrate_db():
         create_auth_tables(conn)
         create_indexes(conn)
         conn.commit()
+        adopt_project_jira_connection(conn)
         rekey_secrets(conn)
     finally:
         conn.close()
         if lock:
             lock.close()
+
+
+def adopt_project_jira_connection(conn):
+    """До 1.6.0 подключение к Jira задавалось в каждом проекте. Теперь оно общее (настраивает администратор): при
+    обновлении общим становится подключение проекта, где больше всего кнопок среза. Прежние записи не удаляются."""
+    if conn.execute("SELECT 1 FROM app_settings WHERE key = 'jira_central'").fetchone():
+        return
+    row = conn.execute('SELECT c.*, (SELECT COUNT(*) FROM jira_snapshot_buttons b WHERE b.project_id = c.project_id) n '
+                       'FROM jira_connections c ORDER BY n DESC, c.project_id LIMIT 1').fetchone()
+    if row and not conn.execute("SELECT 1 FROM app_settings WHERE key = 'jira_base_url'").fetchone():
+        cols = [d[0] for d in conn.execute('SELECT * FROM jira_connections LIMIT 0').description] + ['n']
+        legacy = dict(zip(cols, row))
+        values = {'jira_base_url': legacy['base_url'], 'jira_instance_type': legacy['instance_type'],
+                  'jira_login': legacy['login'] or None, 'jira_token': legacy['token_encrypted'],
+                  'jira_insecure': '1' if legacy['accept_invalid_certs'] else None}
+        conn.executemany('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)',
+                         [(k, v) for k, v in values.items() if v is not None])
+        urls = {r[0] for r in conn.execute('SELECT DISTINCT base_url FROM jira_connections')}
+        if len(urls) > 1:
+            log.warning('В проектах были разные подключения к Jira (%s); общим стало %s — проверьте раздел «Интеграции»',
+                        ', '.join(sorted(urls)), legacy['base_url'])
+    conn.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('jira_central', '1')")
+    conn.commit()
 
 
 def rekey_secrets(conn):
@@ -135,7 +159,8 @@ def rekey_secrets(conn):
     rows = [('jira_connections', 'project_id', r[0], 'token_encrypted', r[1])
             for r in conn.execute('SELECT project_id, token_encrypted FROM jira_connections WHERE token_encrypted IS NOT NULL')]
     rows += [('app_settings', 'key', r[0], 'value', r[1]) for r in conn.execute(
-        "SELECT key, value FROM app_settings WHERE key IN ('smtp_password', 'telegram_token') AND value IS NOT NULL")]
+        "SELECT key, value FROM app_settings WHERE key IN ('smtp_password', 'telegram_token', 'jira_token') "
+        'AND value IS NOT NULL')]
     for table, id_col, ident, col, encrypted in rows:
         try:
             jira.decrypt_token(app.secret_key, encrypted)
@@ -455,12 +480,93 @@ def index():
     if not get_current_user():
         session.clear()
         return redirect('/login')
-    return render_template('index.html')
+    return render_template('index.html', app_version=APP_VERSION)
 
 
 @app.route('/login')
 def login_page():
     return render_template('login.html')
+
+
+# ─── О программе: версия, история версий, руководства ───────────
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+MANUALS_DIR = os.path.join(APP_DIR, 'docs', 'manuals')
+MANUALS = {'user-guide': ('Руководство пользователя', False), 'admin-guide': ('Руководство администратора', True)}
+MANUAL_TYPES = {'pdf': 'application/pdf',
+                'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'}
+
+
+def parse_versions(text):
+    """docs/versions.md → [{version, date, title, sections: [{title, paragraphs, items}]}], новые версии первыми.
+
+    Формат как в todo-planner: «## Версия 1.6.0 (Октябрь 2026 г.)», строка-описание, разделы «### …» со списками «- …».
+    """
+    releases, release, section = [], None, None
+    for raw in text.splitlines():
+        line = raw.strip()
+        head = re.match(r'^## Версия\s+(\S+)(?:\s+\((.+)\))?$', line)
+        if head:
+            release = {'version': head.group(1), 'date': head.group(2) or '', 'title': '', 'sections': []}
+            releases.append(release)
+            section = None
+        elif not release or not line or line.startswith('# '):
+            continue
+        elif line.startswith('### '):
+            section = {'title': line[4:].strip(), 'paragraphs': [], 'items': []}
+            release['sections'].append(section)
+        elif section is None:
+            release['title'] = release['title'] or line
+        elif line.startswith('- '):
+            section['items'].append(line[2:].strip())
+        else:
+            section['paragraphs'].append(line)
+    return releases
+
+
+def _load_releases():
+    try:
+        with open(os.path.join(APP_DIR, 'docs', 'versions.md'), encoding='utf-8') as f:
+            return parse_versions(f.read())
+    except OSError:
+        return []
+
+
+RELEASES = _load_releases()
+APP_VERSION = RELEASES[0]['version'] if RELEASES else 'dev'  # единственный источник номера версии — docs/versions.md
+
+
+@app.route('/api/about')
+@login_required
+def api_about():
+    is_admin = get_current_user()['role'] == 'admin'
+    manuals = []
+    for key, (title, admin_only) in MANUALS.items():
+        formats = [ext for ext in MANUAL_TYPES if os.path.isfile(os.path.join(MANUALS_DIR, f'{key}.{ext}'))]
+        if formats and (is_admin or not admin_only):
+            manuals.append({'id': key, 'title': title, 'formats': formats})
+    return jsonify({'name': 'Burndown', 'version': APP_VERSION, 'date': RELEASES[0]['date'] if RELEASES else '',
+                    'releases': RELEASES, 'manuals': manuals})
+
+
+@app.route('/manuals/<name>.<ext>')
+def manual_file(name, ext):
+    """Руководство: PDF открывается в браузере (?download=1 — скачать), DOCX скачивается.
+    Руководство администратора — только администратору."""
+    user = get_current_user()
+    if not user:
+        session.clear()
+        return redirect('/login')
+    if name not in MANUALS or ext not in MANUAL_TYPES:
+        return Response('Руководство не найдено', status=404, mimetype='text/plain')
+    title, admin_only = MANUALS[name]
+    if admin_only and user['role'] != 'admin':
+        return Response('Руководство администратора доступно только администратору', status=403, mimetype='text/plain')
+    path = os.path.join(MANUALS_DIR, f'{name}.{ext}')
+    if not os.path.isfile(path):
+        return Response('Файл руководства не найден на сервере', status=404, mimetype='text/plain')
+    return send_file(path, mimetype=MANUAL_TYPES[ext], as_attachment=ext != 'pdf' or request.args.get('download') == '1',
+                     download_name=f'Burndown — {title.lower()} {APP_VERSION}.{ext}', max_age=0)
 
 
 # ─── API: Auth ───────────────────────────────────────────────────
@@ -1022,12 +1128,29 @@ def _jira_button_json(db, row):
                           'includeSubtree': bool(m['include_subtree'])} for m in mappings]}
 
 
-def _jira_client(db, pid, override=None):
-    """Клиент Jira по сохранённому подключению проекта; override — данные формы (для проверки до сохранения)."""
-    saved = db.execute('SELECT * FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()
+def jira_connection(db):
+    """Общее для всех проектов подключение к Jira (настраивает администратор в «Интеграциях»)
+    → {base_url, instance_type, login, token_encrypted, accept_invalid_certs} или None."""
+    cfg = {r['key']: r['value'] for r in db.execute(
+        'SELECT key, value FROM app_settings WHERE key IN (' + ','.join('?' * len(JIRA_KEYS)) + ')', JIRA_KEYS)}
+    if not cfg.get('jira_base_url'):
+        return None
+    return {'base_url': cfg['jira_base_url'], 'instance_type': cfg.get('jira_instance_type') or 'server_basic',
+            'login': cfg.get('jira_login') or '', 'token_encrypted': cfg.get('jira_token'),
+            'accept_invalid_certs': cfg.get('jira_insecure') == '1'}
+
+
+JIRA_KEYS = ('jira_base_url', 'jira_instance_type', 'jira_login', 'jira_token', 'jira_insecure')
+JIRA_NOT_CONFIGURED = 'Подключение к Jira не настроено — обратитесь к администратору (раздел «Интеграции»)'
+
+
+def _jira_client(db, override=None, detailed=None):
+    """Клиент Jira по общему подключению; override — данные формы администратора (проверка до сохранения).
+    detailed — подробные ошибки (по умолчанию только для формы администратора)."""
+    saved = jira_connection(db)
     conf = dict(override or {})
     if not override and not saved:
-        raise jira.JiraError('Подключение к Jira для проекта не настроено')
+        raise jira.JiraError(JIRA_NOT_CONFIGURED)
     base_url = text_value(conf.get('baseUrl')) if override else saved['base_url']
     instance_type = conf.get('instanceType') if override else saved['instance_type']
     login = text_value(conf.get('login')) if override else (saved['login'] or '')
@@ -1042,7 +1165,9 @@ def _jira_client(db, pid, override=None):
         token = jira.decrypt_token(app.secret_key, saved['token_encrypted'])
     if instance_type != 'server' and not login:
         raise jira.JiraError('Укажите email или логин')
-    return jira.JiraClient(base_url, instance_type, login, token, accept_invalid_certs=insecure)
+    # подробные ошибки (адрес Jira, причина) — только при проверке формы администратором в «Интеграциях»
+    return jira.JiraClient(base_url, instance_type, login, token, accept_invalid_certs=insecure,
+                           detailed=override is not None if detailed is None else detailed)
 
 
 def _jira_error(e):
@@ -1101,22 +1226,28 @@ def api_get_jira(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     db = get_db()
-    conn_row = db.execute('SELECT * FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()
     buttons = db.execute('SELECT * FROM jira_snapshot_buttons WHERE project_id = ? ORDER BY sort_order, id',
                          (pid,)).fetchall()
-    return jsonify({'connection': jira.connection_json(conn_row),
+    # руководителю проекта — только факт подключения; адрес, способ входа и учётная запись — в «Интеграциях»
+    return jsonify({'connected': jira_connection(db) is not None,
                     'buttons': [_jira_button_json(db, b) for b in buttons]})
 
 
-@app.route('/api/projects/<int:pid>/jira/connection', methods=['PUT'])
-@login_required
-def api_save_jira_connection(pid):
-    if not can_edit_project(session['user_id'], pid):
-        return jsonify({'error': 'Нет прав на редактирование'}), 403
+# ─── Общее подключение к Jira: только администратор (раздел «Интеграции») ───
+
+@app.route('/api/admin/jira-connection')
+@admin_required
+def api_get_jira_connection():
+    return jsonify(jira.connection_json(jira_connection(get_db())))
+
+
+@app.route('/api/admin/jira-connection', methods=['PUT'])
+@admin_required
+def api_save_jira_connection():
     data = json_body()
     base_url = text_value(data.get('baseUrl')).rstrip('/')
     instance_type = data.get('instanceType')
-    login = text_value(data.get('login'))
+    login = text_value(data.get('login'), 300)
     token = data.get('token') or ''
     try:
         base_url = jira.check_base_url(base_url)
@@ -1129,21 +1260,16 @@ def api_save_jira_connection(pid):
     if not isinstance(token, str):
         raise ValidationError('Токен — строка')
     db = get_db()
-    existing = db.execute('SELECT * FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()
+    existing = jira_connection(db)
     if not token and not (existing and existing['token_encrypted']):
         raise ValidationError('Укажите токен или пароль')
     if not token and existing['base_url'] != base_url:
+        # сохранённый пароль уходит только на тот адрес Jira, для которого он был введён
         raise ValidationError('Адрес Jira изменён — введите токен или пароль заново')
     encrypted = jira.encrypt_token(app.secret_key, token) if token else existing['token_encrypted']
-    insecure = 1 if data.get('acceptInvalidCerts') else 0
-    if existing:
-        db.execute('UPDATE jira_connections SET base_url = ?, instance_type = ?, login = ?, token_encrypted = ?, '
-                   'accept_invalid_certs = ? WHERE project_id = ?',
-                   (base_url, instance_type, login, encrypted, insecure, pid))
-    else:
-        db.execute('INSERT INTO jira_connections (project_id, base_url, instance_type, login, token_encrypted, '
-                   'accept_invalid_certs) VALUES (?, ?, ?, ?, ?, ?)',
-                   (pid, base_url, instance_type, login, encrypted, insecure))
+    for key, value in (('jira_base_url', base_url), ('jira_instance_type', instance_type), ('jira_login', login or None),
+                       ('jira_token', encrypted), ('jira_insecure', '1' if data.get('acceptInvalidCerts') else None)):
+        _set_setting(db, key, value)
     db.commit()
     changes = [text_change(existing['base_url'] if existing else None, base_url, 'jiraUrl'),
                text_change(existing['instance_type'] if existing else None, instance_type, 'jiraAuth'),
@@ -1152,31 +1278,29 @@ def api_save_jira_connection(pid):
     if token:
         changes.append({'field': 'jiraToken', 'old': None, 'new': 'изменён'})
     if changes:
-        audit_log('jira', 'update' if existing else 'create', 'jira_connection', None, pid, changes)
-    return jsonify(jira.connection_json(
-        db.execute('SELECT * FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()))
+        audit_log('integrations', 'update' if existing else 'create', 'jira_connection', None, None, changes,
+                  entity_name='Jira')
+    return jsonify(jira.connection_json(jira_connection(db)))
 
 
-@app.route('/api/projects/<int:pid>/jira/connection', methods=['DELETE'])
-@login_required
-def api_delete_jira_connection(pid):
-    if not can_edit_project(session['user_id'], pid):
-        return jsonify({'error': 'Нет прав на редактирование'}), 403
+@app.route('/api/admin/jira-connection', methods=['DELETE'])
+@admin_required
+def api_delete_jira_connection():
     db = get_db()
-    if db.execute('DELETE FROM jira_connections WHERE project_id = ?', (pid,)).rowcount:
+    if jira_connection(db):
+        for key in JIRA_KEYS:
+            _set_setting(db, key, None)
         db.commit()
-        audit_log('jira', 'delete', 'jira_connection', None, pid)
+        audit_log('integrations', 'delete', 'jira_connection', None, None, entity_name='Jira')
     return jsonify({'success': True})
 
 
-@app.route('/api/projects/<int:pid>/jira/connection/test', methods=['POST'])
-@login_required
-def api_test_jira_connection(pid):
-    if not can_edit_project(session['user_id'], pid):
-        return jsonify({'error': 'Нет прав на редактирование'}), 403
+@app.route('/api/admin/jira-connection/test', methods=['POST'])
+@admin_required
+def api_test_jira_connection():
     data = json_body() or None
     try:
-        user = _jira_client(get_db(), pid, override=data).myself()
+        user = _jira_client(get_db(), override=data, detailed=True).myself()
     except jira.JiraError as e:
         return _jira_error(e)
     return jsonify({'success': True, 'user': user})
@@ -1188,7 +1312,7 @@ def api_jira_structures(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     try:
-        return jsonify(_jira_client(get_db(), pid).list_structures())
+        return jsonify(_jira_client(get_db()).list_structures())
     except jira.JiraError as e:
         return _jira_error(e)
 
@@ -1256,7 +1380,7 @@ def api_jira_snapshot(bid):
         or datetime.now().date().isoformat()
     button = _jira_button_json(db, row)
     try:
-        items = jira.compute_snapshot(_jira_client(db, row['project_id']), row['structure_id'], button['mappings'],
+        items = jira.compute_snapshot(_jira_client(db), row['structure_id'], button['mappings'],
                                       button['fieldMap'])
     except jira.JiraError as e:
         return _jira_error(e)
@@ -1298,8 +1422,7 @@ def api_jira_composition(pid):
         return jsonify({'error': 'Нет доступа'}), 403
     db = get_db()
     history, latest = jira_composition(db, pid)
-    conn = db.execute('SELECT base_url FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()
-    return jsonify({'baseUrl': conn['base_url'] if conn else '', 'latest': latest, 'history': history,
+    return jsonify({'baseUrl': _jira_base_url(db, pid), 'latest': latest, 'history': history,
                     'problemLabels': jira.PROBLEMS})
 
 
@@ -1448,8 +1571,9 @@ def api_jira_service_issues(sid):
                     'issues': issues, 'problemLabels': jira.PROBLEMS})
 
 
-def _jira_base_url(db, pid):
-    conn = db.execute('SELECT base_url FROM jira_connections WHERE project_id = ?', (pid,)).fetchone()
+def _jira_base_url(db, pid=None):
+    """Адрес Jira для ссылок на задачи (подключение общее для всех проектов)."""
+    conn = jira_connection(db)
     return conn['base_url'] if conn else ''
 
 
@@ -1548,7 +1672,7 @@ def api_jira_fields(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     try:
-        return jsonify(_jira_client(get_db(), pid).list_fields())
+        return jsonify(_jira_client(get_db()).list_fields())
     except jira.JiraError as e:
         return _jira_error(e)
 
@@ -1657,7 +1781,7 @@ def run_autofill(db, button_row, local_date, actor, overwrite=True):
     pid = button_row['project_id']
     try:
         button = _jira_button_json(db, button_row)
-        items = jira.compute_snapshot(_jira_client(db, pid), button_row['structure_id'], button['mappings'],
+        items = jira.compute_snapshot(_jira_client(db), button_row['structure_id'], button['mappings'],
                                       button['fieldMap'])
     except jira.JiraError as e:
         return 'error', str(e)
@@ -1848,7 +1972,7 @@ def run_history_job(jid):
         def progress(done, total):
             _history_update(db, jid, progress=done, total=total, message=f'Журнал изменений: {done} из {total} задач')
 
-        results, warnings = jira.compute_history(_jira_client(db, pid), button_row['structure_id'], button['mappings'],
+        results, warnings = jira.compute_history(_jira_client(db), button_row['structure_id'], button['mappings'],
                                                  button['fieldMap'], moments, progress)
         _history_update(db, jid, message='Сохранение замеров…')
         services = {s['id']: s for s in db.execute('SELECT * FROM services WHERE project_id = ?', (pid,)).fetchall()}
@@ -2046,7 +2170,7 @@ def api_save_notify_settings():
         changes.append({'field': 'telegramToken', 'old': None, 'new': 'изменён'})
     db.commit()
     if changes:
-        audit_log('notify', 'update', 'notify_settings', None, None, changes, entity_name='Рассылки')
+        audit_log('integrations', 'update', 'notify_settings', None, None, changes, entity_name='Почта и Telegram')
     return jsonify(_notify_settings_json(notify_settings(db)))
 
 
@@ -2176,7 +2300,7 @@ def _subscription_json(db, user, sub):
                    'chanceThreshold': sub['chance_threshold'] if sub else 50,
                    'scopeThreshold': sub['scope_threshold'] if sub else 10},
         'channels': {'email': user['email'] or '', 'emailReady': bool(cfg.get('smtp_host') and cfg.get('smtp_from')),
-                     'telegramReady': bool(cfg.get('telegram_token')), 'botName': cfg.get('telegram_bot_name') or '',
+                     'telegramReady': bool(cfg.get('telegram_token')),
                      'telegramLinked': bool(user['telegram_chat_id'])},
     }
 

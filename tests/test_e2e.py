@@ -133,7 +133,7 @@ def test_all_views_render_without_errors(admin_ui, theme):
 def test_mobile_has_no_horizontal_scroll(browser, live_server):
     ctx = browser.new_context(viewport={'width': 390, 'height': 844})
     app = App(ctx.new_page(), live_server).login(*ADMIN)
-    for view in VIEWS + ['jira', 'autofill', 'notify', 'notifyAdmin']:  # длинные подписи флажков переносятся
+    for view in VIEWS + ['jira', 'autofill', 'notify', 'integrations']:  # длинные подписи флажков переносятся
         app.page.click('#sidebarToggle')
         app.go(view)
         overflow = app.page.evaluate('document.documentElement.scrollWidth - document.documentElement.clientWidth')
@@ -225,6 +225,32 @@ def test_empty_charts_explain_why(admin_ui):
     page.click('text=Все')
     page.wait_for_selector('#chartRemaining:not([hidden])', state='attached')
     assert page.locator('.chart-wrap .chart-empty').count() == 0
+
+
+def test_about_version_history_and_manual(admin_ui):
+    import app as app_module
+    page = admin_ui.page
+    version = app_module.APP_VERSION
+    assert admin_ui.text('#btnVersions') == f'Burndown — версия {version}'
+    page.click('#btnVersions')
+    page.wait_for_selector('#confirmModal.show .versions-list')
+    assert admin_ui.text('#confirmTitle') == 'История версий'
+    latest = page.locator('.versions-list details').first
+    assert latest.get_attribute('open') is not None and f'Версия {version}' in latest.text_content()
+    assert page.locator('.versions-list details[open]').count() == 1  # остальные свёрнуты
+    page.click('.versions-list details >> nth=1 >> summary')
+    assert page.locator('.versions-list details[open]').count() == 2
+    page.keyboard.press('Escape')
+    page.click('#btnAbout')
+    page.wait_for_selector('#confirmModal.show .about')
+    assert version in admin_ui.text('.about-facts')
+    links = page.eval_on_selector_all('.about-manual a', 'els => els.map(e => e.getAttribute("href"))')
+    assert '/manuals/user-guide.pdf' in links and '/manuals/user-guide.docx' in links and '/manuals/admin-guide.pdf' in links
+    r = page.request.get(admin_ui.base + '/manuals/user-guide.pdf')
+    assert r.ok and r.headers['content-type'] == 'application/pdf'
+    page.click('#aboutVersions')
+    page.wait_for_selector('#confirmModal.show .versions-list')
+    assert page.get_attribute('#lnkManual', 'href') == '/manuals/user-guide.pdf'
 
 
 # ─── Дашборд ─────────────────────────────────────────────────────
@@ -759,19 +785,26 @@ def fake_jira():
 
 
 def setup_jira_connection(ui, fake_jira):
+    """Администратор настраивает общее подключение в «Интеграциях» и переходит к кнопкам среза проекта."""
     page = ui.page
-    ui.go('jira')
+    ui.go('integrations')
     page.fill('#jiraUrl', fake_jira.url)
     page.select_option('#jiraType', 'server')
     page.fill('#jiraToken', 'secret-pat')
     page.click('#jiraSave')
     ui.expect_toast('Подключение к Jira сохранено')
+    ui.go('jira')
+    page.wait_for_selector('#jiraProjectStatus.ok')
 
 
 def test_jira_connection_form(admin_ui, fake_jira):
     page = admin_ui.page
-    admin_ui.go('jira')
-    assert admin_ui.text('#jiraStatus') == 'Подключение не настроено'
+    admin_ui.go('jira')  # в проекте — только состояние общего подключения
+    assert 'не настроено' in admin_ui.text('#jiraProjectStatus') and not page.is_visible('#jiraUrl')
+    page.click('#jiraOpenIntegrations')
+    page.wait_for_selector('#view-integrations.active')
+    page.wait_for_selector('#jiraStatus:has-text("Подключение не настроено")')
+    assert page.input_value('#jiraType') == 'server_basic'  # по умолчанию — Server/DC, логин и пароль
     page.fill('#jiraUrl', 'https://corp.atlassian.net')
     page.dispatch_event('#jiraUrl', 'change')
     assert page.input_value('#jiraType') == 'cloud' and admin_ui.text('#jiraLoginLabel') == 'Email'
@@ -793,6 +826,23 @@ def test_jira_connection_form(admin_ui, fake_jira):
     assert page.input_value('#jiraToken') == ''
     assert 'Сохранён' in page.get_attribute('#jiraToken', 'placeholder')
     assert page.is_visible('#jiraDisconnect')
+    admin_ui.go('jira')
+    page.wait_for_selector('#jiraProjectStatus.ok')
+    assert admin_ui.text('#jiraProjectStatus') == '✓ Подключение к Jira настроено'
+
+
+def test_manager_sees_connection_but_cannot_change_it(ui, make_user, admin, fake_jira):
+    admin.put('/api/admin/jira-connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server_basic',
+                                                  'login': 'svc', 'token': 'pw'})
+    make_user('mgr', project_id=1, project_role='manager')
+    ui.login('mgr', 'pw-12345')
+    page = ui.page
+    assert not page.is_visible('#navIntegrations')
+    ui.go('jira')
+    assert ui.text('#jiraProjectStatus') == '✓ Подключение к Jira настроено'  # только факт, без адреса и учётной записи
+    assert fake_jira.url not in page.content() and 'svc' not in ui.text('#view-jira')
+    assert not page.is_visible('#jiraOpenIntegrations') and not page.is_visible('#jiraUrl')
+    assert page.is_enabled('#jiraAddButton')  # кнопки среза руководитель настраивает сам
 
 
 def test_jira_snapshot_button_flow(admin_ui, fake_jira, admin):
@@ -874,7 +924,7 @@ def test_jira_snapshot_error_is_shown(admin_ui, fake_jira):
 
 
 def test_jira_hidden_for_viewer(ui, make_user, admin, fake_jira):
-    admin.put('/api/projects/1/jira/connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
+    admin.put('/api/admin/jira-connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
     admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'mappings': [{'serviceId': 1, 'issueKeys': 'ABC-1'}]})
     make_user('viewer', project_id=1)
     ui.login('viewer', 'pw-12345')
@@ -953,7 +1003,7 @@ def test_autofill_page_unlocks_after_snapshot(admin_ui, fake_jira, admin):
 def test_jira_composition_on_dashboard(admin_ui, fake_jira, admin):
     page = admin_ui.page
     assert page.is_hidden('#jiraCompPanel') and page.is_hidden('#jiraBurnupPanel')  # срезов ещё не было
-    admin.put('/api/projects/1/jira/connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
+    admin.put('/api/admin/jira-connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
     bid = admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'structureId': 7, 'mappings': [
         {'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]}).get_json()['id']
     for date in ('2026-11-02', '2026-11-03'):
@@ -994,7 +1044,7 @@ def test_jira_composition_on_dashboard(admin_ui, fake_jira, admin):
 
 
 def test_jira_composition_visible_for_viewer(ui, make_user, admin, fake_jira):
-    admin.put('/api/projects/1/jira/connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
+    admin.put('/api/admin/jira-connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
     bid = admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'mappings': [
         {'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]}).get_json()['id']
     admin.post(f'/api/jira/buttons/{bid}/snapshot', json={'date': '2026-11-02'})
@@ -1028,7 +1078,7 @@ def test_forecast_probability_and_range(admin_ui):
 def test_jira_changes_between_snapshots(admin_ui, fake_jira, admin):
     import fake_jira as fj
     page = admin_ui.page
-    admin.put('/api/projects/1/jira/connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
+    admin.put('/api/admin/jira-connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
     bid = admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'structureId': 7, 'mappings': [
         {'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]}).get_json()['id']
     admin.post(f'/api/jira/buttons/{bid}/snapshot', json={'date': '2026-11-02'})
@@ -1061,7 +1111,7 @@ def test_jira_changes_between_snapshots(admin_ui, fake_jira, admin):
 
 def test_jira_history_restore_ui(admin_ui, fake_jira, admin):
     page = admin_ui.page
-    admin.put('/api/projects/1/jira/connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
+    admin.put('/api/admin/jira-connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
     bid = admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'structureId': 7, 'mappings': [
         {'serviceId': 3, 'issueKeys': 'ABC-1', 'includeSubtree': True}]}).get_json()['id']
     page.reload()
@@ -1108,7 +1158,7 @@ def test_burnup_forecast_and_stage_level(admin_ui, fake_jira, admin):
     import datetime
     import fake_jira as fj
     page = admin_ui.page
-    admin.put('/api/projects/1/jira/connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
+    admin.put('/api/admin/jira-connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
     bid = admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'structureId': 7, 'mappings': [
         {'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True},
         {'serviceId': 2, 'issueKeys': 'ABC-4', 'includeSubtree': False}]}).get_json()['id']
@@ -1172,7 +1222,7 @@ def fake_tg(flask_app, monkeypatch):
 
 def test_notify_admin_settings_ui(admin_ui, fake_mail, fake_tg):
     page = admin_ui.page
-    admin_ui.go('notifyAdmin')
+    admin_ui.go('integrations')
     page.wait_for_selector('#notifyLogTable thead')
     page.fill('#naHost', 'smtp.example.ru')
     page.fill('#naPort', '465')
@@ -1250,7 +1300,7 @@ def test_notify_project_view_ui(admin_ui, admin, fake_mail, fake_tg):
 def test_notify_view_for_read_only_user(ui, make_user):
     make_user('viewer', project_id=1)
     ui.login('viewer', 'pw-12345')
-    assert ui.page.is_visible('#navNotify') and not ui.page.is_visible('#navNotifyAdmin')
+    assert ui.page.is_visible('#navNotify') and not ui.page.is_visible('#navIntegrations')
     ui.go('notify')
     ui.page.wait_for_selector('#nfDays [data-day]')
     assert 'не настроил' in ui.text('#nfEmailState')

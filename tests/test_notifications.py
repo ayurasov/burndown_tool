@@ -65,7 +65,7 @@ def test_notify_settings_roundtrip_hides_secrets(admin, flask_app):
     assert admin.get('/api/admin/notify-settings').get_json()['smtp']['hasPassword']
     admin.put('/api/admin/notify-settings', json={'smtp': dict(SMTP, password='', clearPassword=True)})
     assert not admin.get('/api/admin/notify-settings').get_json()['smtp']['hasPassword']
-    audit = admin.get('/api/audit?page=notify').get_json()['entries']
+    audit = admin.get('/api/audit?page=integrations').get_json()['entries']
     assert audit and all('smtp-pass' not in (a['newValue'] or '') for a in audit)
 
 

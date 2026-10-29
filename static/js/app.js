@@ -1746,7 +1746,7 @@ function updateRoleUI(){
   var admin = isGlobalAdmin();
   document.getElementById('readonlyBanner').style.display = (!canEdit() && currentProjectId) ? '' : 'none';
   document.getElementById('adminNav').style.display = admin ? '' : 'none';
-  ['navUsers','navProjects','navAudit','navNotifyAdmin','btnExport'].forEach(function(id){ document.getElementById(id).style.display = admin ? '' : 'none'; });
+  ['navUsers','navProjects','navAudit','navIntegrations','btnExport'].forEach(function(id){ document.getElementById(id).style.display = admin ? '' : 'none'; });
   document.getElementById('navSettings').style.display = canEdit() ? '' : 'none';
   document.getElementById('navJira').style.display = canEdit() ? '' : 'none';
   document.getElementById('navAutofill').style.display = canEdit() ? '' : 'none';
@@ -1764,7 +1764,7 @@ function updateRoleUI(){
 var navItems = document.querySelectorAll('.nav-item');
 var pageTitle = document.getElementById('pageTitle');
 var pageSub = document.getElementById('pageSub');
-var ADMIN_VIEWS = ['users', 'projects', 'audit', 'notifyAdmin'];
+var ADMIN_VIEWS = ['users', 'projects', 'audit', 'integrations'];
 var PDF_VIEWS = ['dashboard', 'stages', 'data'];
 var titles = {
   dashboard: ['Дашборд сгорания', 'Свод по эпикам и этапам'],
@@ -1772,10 +1772,10 @@ var titles = {
   data: ['Данные по датам', 'Внесение и редактирование замеров'],
   services: ['Эпики (блоки задач)', 'Список эпиков проекта и целевых дат'],
   settings: ['Настройки проекта', 'Параметры прогноза и расчёта burn rate'],
-  jira: ['Связь с Jira', 'Подключение и кнопки среза данных из Structure'],
+  jira: ['Связь с Jira', 'Кнопки среза: задачи Jira по эпикам проекта'],
   autofill: ['Автозаполнение', 'Срез из Jira по расписанию'],
   notify: ['Уведомления', 'Дайджест и оповещения по проекту'],
-  notifyAdmin: ['Рассылки', 'Почта, Telegram-бот и журнал отправок'],
+  integrations: ['Интеграции', 'Jira, почта, Telegram-бот и журнал отправок'],
   users: ['Управление пользователями', 'Пользователи, роли и доступ к проектам'],
   projects: ['Управление проектами', 'Создание, редактирование и удаление проектов'],
   audit: ['Реестр изменений', 'Журнал всех изменений с фильтрами']
@@ -1801,7 +1801,7 @@ function navigate(view){
   }
   var renderers = {dashboard:renderDashboard, stages:renderStagesView, data:renderDataView, services:renderServicesView,
     settings:renderSettingsView, jira:renderJiraView, autofill:renderAutofillView, notify:renderNotifyView,
-    notifyAdmin:renderNotifyAdminView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); }};
+    integrations:renderIntegrationsView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); }};
   if(renderers[view] && (currentProjectId || ADMIN_VIEWS.indexOf(view) !== -1)) renderers[view]();
   var reportView = PDF_VIEWS.indexOf(view) !== -1 && currentProjectId;
   document.getElementById('btnPdf').style.display = reportView ? '' : 'none';
@@ -2057,7 +2057,7 @@ function loadJiraConfig(){
 /* Кнопки среза в разделе «Данные по датам» */
 function renderJiraSnapshotButtons(){
   var box = document.getElementById('jiraSnapshotButtons');
-  var buttons = (canEdit() && STATE.jira && STATE.jira.connection) ? STATE.jira.buttons : [];
+  var buttons = (canEdit() && STATE.jira && STATE.jira.connected) ? STATE.jira.buttons : [];
   box.innerHTML = buttons.map(function(b){
     return '<button type="button" class="btn btn-ghost btn-sm" data-jira-snapshot="'+b.id+'" title="Забрать срез из Jira'+(b.structureName ? ' (структура «'+escapeAttr(b.structureName)+'»)' : '')+'">⇣ '+escapeHtml(b.name)+'</button>';
   }).join('');
@@ -2105,19 +2105,36 @@ function replaceJiraButton(saved){
   if(currentView === 'autofill') renderAutofillView();
 }
 
+/* «Связь с Jira» проекта: подключение общее (его настраивает администратор), здесь — только факт подключения и кнопки среза */
 function renderJiraView(){
   var cfg = STATE.jira;
+  var connected = !!(cfg && cfg.connected);
+  var st = document.getElementById('jiraProjectStatus');
+  st.className = 'jira-status' + (connected ? ' ok' : ' error');
+  st.textContent = connected ? '✓ Подключение к Jira настроено'
+    : 'Подключение к Jira не настроено' + (isGlobalAdmin() ? ' — настройте его в разделе «Интеграции».' : ' — обратитесь к администратору.');
+  document.getElementById('jiraOpenIntegrations').hidden = !isGlobalAdmin();
   if(!cfg){ document.getElementById('jiraButtonsTable').innerHTML = ''; return; }
-  var c = cfg.connection;
+  renderJiraButtonsTable();
+}
+document.getElementById('jiraOpenIntegrations').addEventListener('click', function(){ navigate('integrations'); });
+
+/* «Интеграции» (администратор): общее подключение к Jira, почта и Telegram-бот */
+var adminJira = null;
+function renderIntegrationsView(){
+  api('/api/admin/jira-connection').then(function(c){ adminJira = c; fillJiraForm(); }).catch(function(){});
+  renderNotifyAdminView();
+}
+function fillJiraForm(){
+  var c = adminJira;
   document.getElementById('jiraUrl').value = c ? c.baseUrl : '';
-  document.getElementById('jiraType').value = c ? c.instanceType : 'server';
+  document.getElementById('jiraType').value = c ? c.instanceType : 'server_basic';
   document.getElementById('jiraLogin').value = c ? c.login : '';
   document.getElementById('jiraToken').value = '';
   document.getElementById('jiraInsecure').checked = !!(c && c.acceptInvalidCerts);
   document.getElementById('jiraDisconnect').hidden = !c;
-  setJiraStatus(c ? 'Подключение сохранено' + (c.hasToken ? '' : ' (без токена)') : 'Подключение не настроено', c ? 'ok' : '');
+  setJiraStatus(c ? 'Подключение сохранено' + (c.hasToken ? '' : ' (без пароля или токена)') : 'Подключение не настроено', c ? 'ok' : '');
   updateJiraFormLabels();
-  renderJiraButtonsTable();
 }
 
 function setJiraStatus(text, kind){
@@ -2128,7 +2145,7 @@ function setJiraStatus(text, kind){
 
 function updateJiraFormLabels(){
   var t = JIRA_TYPE_TEXTS[document.getElementById('jiraType').value];
-  var c = STATE.jira && STATE.jira.connection;
+  var c = adminJira;
   document.getElementById('jiraLoginLabel').textContent = t.login;
   document.getElementById('jiraTokenLabel').textContent = t.token;
   document.getElementById('jiraLogin').placeholder = t.loginPh;
@@ -2155,25 +2172,25 @@ document.getElementById('jiraTest').addEventListener('click', function(){
   var btn = this;
   btn.disabled = true;
   setJiraStatus('Проверка подключения…');
-  apiPost('/api/projects/'+currentProjectId+'/jira/connection/test', jiraFormData()).then(function(data){
+  apiPost('/api/admin/jira-connection/test', jiraFormData()).then(function(data){
     setJiraStatus('✓ Соединение установлено' + (data.user ? ': ' + data.user : ''), 'ok');
   }).catch(function(e){ setJiraStatus(e.message, 'error'); }).then(function(){ btn.disabled = false; });
 });
 document.getElementById('jiraForm').addEventListener('submit', function(e){
   e.preventDefault();
-  apiPut('/api/projects/'+currentProjectId+'/jira/connection', jiraFormData()).then(function(conn){
-    STATE.jira.connection = conn;
-    renderJiraView();
-    renderJiraSnapshotButtons();
+  apiPut('/api/admin/jira-connection', jiraFormData()).then(function(conn){
+    adminJira = conn;
+    fillJiraForm();
+    loadJiraConfig();  /* кнопки среза текущего проекта становятся доступны */
     toast('Подключение к Jira сохранено');
   }).catch(function(err){ setJiraStatus(err.message, 'error'); });
 });
 document.getElementById('jiraDisconnect').addEventListener('click', function(){
-  askConfirm('Отключить Jira?', 'Подключение и сохранённый токен будут удалены. Настроенные кнопки среза сохранятся, но не будут работать до нового подключения.', function(){
-    apiDelete('/api/projects/'+currentProjectId+'/jira/connection').then(function(){
-      STATE.jira.connection = null;
-      renderJiraView();
-      renderJiraSnapshotButtons();
+  askConfirm('Отключить Jira?', 'Подключение и сохранённый пароль или токен будут удалены. Кнопки среза во всех проектах сохранятся, но срезы и автозаполнение не будут работать до нового подключения.', function(){
+    apiDelete('/api/admin/jira-connection').then(function(){
+      adminJira = null;
+      fillJiraForm();
+      loadJiraConfig();
       toast('Jira отключена');
     });
   }, 'Отключить');
@@ -2182,10 +2199,10 @@ document.getElementById('jiraDisconnect').addEventListener('click', function(){
 function renderJiraButtonsTable(){
   var table = document.getElementById('jiraButtonsTable');
   var buttons = STATE.jira ? STATE.jira.buttons : [];
-  var connected = !!(STATE.jira && STATE.jira.connection);
+  var connected = !!(STATE.jira && STATE.jira.connected);
   document.getElementById('jiraAddButton').disabled = !STATE.services.length;
   if(!buttons.length){
-    emptyTable(table, 'Кнопок пока нет', connected ? 'Создайте кнопку: выберите структуру и укажите задачи Jira для эпиков.' : 'Сначала настройте подключение к Jira выше, затем создайте кнопку.');
+    emptyTable(table, 'Кнопок пока нет', connected ? 'Создайте кнопку: выберите структуру и укажите задачи Jira для эпиков.' : 'Кнопки заработают, когда администратор настроит подключение к Jira.');
     return;
   }
   var serviceName = function(id){ var s = serviceById(id); return s ? s.name : '—'; };
@@ -2975,7 +2992,7 @@ function fillNotifyForm(d){
     (ch.email ? escapeHtml(ch.email) : '<span class="prob-low">В профиле не указан email — обратитесь к администратору</span>');
   document.getElementById('nfTelegramState').innerHTML = !ch.telegramReady ?
     '<span class="muted-cell">Администратор ещё не подключил Telegram-бота</span>' :
-    (ch.telegramLinked ? '<span class="prob-high">✓ Привязан</span>' + (ch.botName ? ' <span class="muted-cell">бот @' + escapeHtml(ch.botName) + '</span>' : '') :
+    (ch.telegramLinked ? '<span class="prob-high">✓ Привязан</span>' :
       '<span class="muted-cell">Не привязан</span>');
   document.getElementById('nfTelegramLink').hidden = !ch.telegramReady || ch.telegramLinked;
   document.getElementById('nfTelegramUnlink').hidden = !ch.telegramLinked;
@@ -3182,9 +3199,9 @@ function renderAutofillView(){
   var box = document.getElementById('autofillList');
   var cfg = STATE.jira;
   if(!cfg){ box.innerHTML = ''; return; }
-  if(!cfg.connection || !cfg.buttons.length){
-    box.innerHTML = '<div class="empty-cell autofill-empty">'+(!cfg.connection ?
-      'Сначала настройте подключение к Jira в разделе «Связь с Jira».' :
+  if(!cfg.connected || !cfg.buttons.length){
+    box.innerHTML = '<div class="empty-cell autofill-empty">'+(!cfg.connected ?
+      (isGlobalAdmin() ? 'Сначала настройте подключение к Jira в разделе «Интеграции».' : 'Подключение к Jira не настроено — обратитесь к администратору.') :
       'Нет кнопок среза. Создайте кнопку в разделе «Связь с Jira», выполните по ней срез — после этого здесь можно включить расписание.')+'</div>';
     return;
   }
@@ -3315,6 +3332,60 @@ function readPhoto(file, cb){
 }
 
 /* Профиль — открывается по клику на блок пользователя */
+/* ════════════════════════════════════════════════════════════════
+   О программе, история версий и руководства (как в todo-planner: версия внизу меню открывает историю)
+════════════════════════════════════════════════════════════════ */
+var aboutInfo = null;
+function loadAbout(){
+  return aboutInfo ? Promise.resolve(aboutInfo) : api('/api/about').then(function(d){ aboutInfo = d; return d; });
+}
+function manualRowHtml(m){
+  var has = function(ext){ return m.formats.indexOf(ext) !== -1; };
+  return '<div class="about-manual"><span class="about-manual-title">'+escapeHtml(m.title)+'</span><span class="about-manual-links">'+
+    (has('pdf') ? '<a href="/manuals/'+m.id+'.pdf" target="_blank" rel="noopener">Открыть</a>'+
+                  '<a href="/manuals/'+m.id+'.pdf?download=1" download>Скачать PDF</a>' : '')+
+    (has('docx') ? '<a href="/manuals/'+m.id+'.docx" download>Скачать Word</a>' : '')+'</span></div>';
+}
+function openAbout(){
+  loadAbout().then(function(d){
+    openModal({
+      title: 'О программе', okLabel: 'Закрыть', noCancel: true, wide: true,
+      html: '<div class="about">'+
+        '<div class="about-brand">'+document.querySelector('.brand svg').outerHTML+
+          '<div><div class="about-name">'+escapeHtml(d.name)+'</div><div class="about-tagline">Трекер сгорания работ по эпикам</div></div></div>'+
+        '<dl class="about-facts"><dt>Версия</dt><dd>'+escapeHtml(d.version)+(d.date ? ' · ' + escapeHtml(d.date) : '')+'</dd>'+
+          '<dt>Автор</dt><dd>© Александр Юрасов, 2026</dd></dl>'+
+        '<p class="about-text">Burndown показывает, успевают ли эпики и этапы к целевым датам: остаток работ по замерам, прогноз завершения и шанс успеть, '+
+          'состав задач из Jira, дайджест и оповещения на почту и в Telegram.</p>'+
+        (d.manuals.length ? '<div class="about-section-title">Руководства</div>' + d.manuals.map(manualRowHtml).join('') : '')+
+        '<button type="button" class="btn btn-ghost btn-sm about-versions" id="aboutVersions">История версий</button>'+
+      '</div>'
+    });
+    document.getElementById('aboutVersions').addEventListener('click', openVersions);
+  }).catch(function(){});
+}
+function openVersions(){
+  loadAbout().then(function(d){
+    openModal({
+      title: 'История версий', okLabel: 'Закрыть', noCancel: true, wide: true,
+      html: '<p class="versions-intro">Что нового в Burndown — изменения по версиям, новые сверху.</p><div class="versions-list">'+
+        d.releases.map(function(r, i){
+          return '<details class="release'+(i === 0 ? ' latest' : '')+'"'+(i === 0 ? ' open' : '')+'>'+
+            '<summary><span class="release-mark">'+(i === 0 ? 'NEW' : 'v')+'</span><span class="release-head">'+
+              '<strong>Версия '+escapeHtml(r.version)+'</strong>'+(r.date ? ' <span class="release-date">'+escapeHtml(r.date)+'</span>' : '')+
+              (r.title ? '<small>'+escapeHtml(r.title)+'</small>' : '')+'</span></summary>'+
+            '<div class="release-body">'+r.sections.map(function(sec){
+              return '<h4>'+escapeHtml(sec.title)+'</h4>'+
+                sec.paragraphs.map(function(p){ return '<p>'+escapeHtml(p)+'</p>'; }).join('')+
+                (sec.items.length ? '<ul>'+sec.items.map(function(it){ return '<li>'+escapeHtml(it)+'</li>'; }).join('')+'</ul>' : '');
+            }).join('')+'</div></details>';
+        }).join('')+'</div>'
+    });
+  }).catch(function(){});
+}
+document.getElementById('btnVersions').addEventListener('click', openVersions);
+document.getElementById('btnAbout').addEventListener('click', openAbout);
+
 document.getElementById('defaultPwWarning').addEventListener('click', function(){
   openProfile();
   var pw = document.getElementById('profilePassword');
@@ -3522,12 +3593,12 @@ function init(){
 var auditPageLabels = {
   dashboard: 'Дашборд', stages: 'Свод по этапам', data: 'Данные по датам',
   services: 'Эпики', settings: 'Настройки', users: 'Пользователи',
-  projects: 'Проекты', profile: 'Профиль', jira: 'Связь с Jira', notify: 'Рассылки'
+  projects: 'Проекты', profile: 'Профиль', jira: 'Связь с Jira', notify: 'Рассылки', integrations: 'Интеграции'
 };
 var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление', autofill: 'Автозаполнение', restore: 'Восстановление истории' };
 var auditEntityLabels = { project: 'Проект', service: 'Эпик', entry: 'Замер', user: 'Пользователь', stage_target: 'Цель этапа', settings: 'Настройки',
   jira_connection: 'Подключение к Jira', jira_button: 'Кнопка среза', jira_schedule: 'Расписание автозаполнения',
-  notify_settings: 'Настройки рассылок' };
+  notify_settings: 'Почта и Telegram' };
 var auditFieldLabels = {
   name: 'Название', description: 'Описание', etap: 'Этап', targetDate: 'Целевая дата', isDone: 'Сдано', stageGroup: 'Группа в своде',
   date: 'Дата', remaining: 'Остаток', spent: 'Затрачено', estimate: 'Оценка',
