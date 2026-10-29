@@ -48,6 +48,7 @@ import init_db  # noqa: E402
 
 H = 3600
 ADMIN_PASSWORD = 'Demo-Admin-2026'
+JIRA_LOGIN, JIRA_PASSWORD = 'svc-burndown', 'Demo-Jira-2026'
 
 
 HISTORY = ['2026-07-17', '2026-07-24', '2026-07-28', '2026-07-29']  # срезы состава задач для burn-up
@@ -104,8 +105,8 @@ def demo_jira(step=3):
 
 def jira_history(api, base, jira_url):
     """История состава задач: срезы на даты HISTORY через временную кнопку (состав хранится по эпикам)."""
-    api.put(base + '/api/projects/1/jira/connection', json={'baseUrl': jira_url, 'instanceType': 'server',
-                                                             'login': '', 'token': 'demo-pat'})
+    api.put(base + '/api/admin/jira-connection', json={'baseUrl': jira_url, 'instanceType': 'server_basic',
+                                                       'login': JIRA_LOGIN, 'token': JIRA_PASSWORD})
     bid = api.post(base + '/api/projects/1/jira/buttons', json={
         'name': 'история', 'structureId': 7, 'structureName': 'АИСУЗ — релиз 4.0',
         'mappings': [{'serviceId': sid, 'issueKeys': f'AISUZ-{sid}00', 'includeSubtree': True}
@@ -114,7 +115,7 @@ def jira_history(api, base, jira_url):
         demo_jira(step)
         api.post(f'{base}/api/jira/buttons/{bid}/snapshot', json={'date': date}).raise_for_status()
     api.delete(f'{base}/api/jira/buttons/{bid}')
-    api.delete(base + '/api/projects/1/jira/connection')
+    api.delete(base + '/api/admin/jira-connection')
     demo_jira()
 
 
@@ -149,7 +150,7 @@ def prepare(base, jira_url):
 
 def main():
     demo_jira()
-    jira = fake_jira.FakeJira(token='demo-pat')
+    jira = fake_jira.FakeJira(mode='server_basic', login=JIRA_LOGIN, token=JIRA_PASSWORD)  # Server/DC, логин и пароль
     # почта и Telegram — учебные: письма складываются в память, бот отвечает локально
     notify.smtplib.SMTP = notify.smtplib.SMTP_SSL = FakeSMTP
     telegram = FakeTelegram(username='burndown_vector_bot')
@@ -264,7 +265,7 @@ def main():
         shot(pg.locator('#stageBurnupPanel'), 'user/44-project-burnup.png')
 
         # ── Рассылки (администратор) и уведомления по проекту
-        go('notifyAdmin', '#notifyLogTable thead')
+        go('integrations', '#notifyLogTable thead')
         pg.fill('#naHost', 'smtp.example.ru')
         pg.fill('#naPort', '587')
         pg.fill('#naSender', 'burndown@example.ru')
@@ -298,9 +299,10 @@ def main():
         pg.wait_for_timeout(500)
         shot(pg.locator('#confirmModal .modal'), 'user/46-digest-preview.png')
         pg.keyboard.press('Escape')
-        go('notifyAdmin', '#notifyLogTable tbody tr')
+        go('integrations', '#notifyLogTable tbody tr')
         pg.fill('#naTestTo', 'ivanov@example.ru')
-        shot(pg.locator('#view-notifyAdmin'), 'admin/10-notify-admin.png')
+        shot(pg.locator('#notifyAdminForm'), 'admin/10-notify-admin.png')
+        shot(pg.locator('#view-integrations > .panel').last, 'admin/12-notify-log.png')
         # ── Данные по датам
         go('data', '#entriesTable tbody tr')
         shot(pg.locator('#view-data .panel'), 'user/14-data.png')
@@ -333,24 +335,42 @@ def main():
         pg.click('#themeToggle')
         pg.wait_for_timeout(300)
 
-        # ── Связь с Jira: подключение
-        go('jira')
+        # ── О программе и история версий (внизу бокового меню)
+        pg.click('#btnAbout')
+        pg.wait_for_selector('#confirmModal.show .about')
+        modal('user/48-about.png')
+        pg.click('#aboutVersions')
+        pg.wait_for_selector('#confirmModal.show .versions-list')
+        modal('user/49-versions.png')
+        pg.keyboard.press('Escape')
+
+        # ── Интеграции (администратор): общее подключение к Jira — Server/DC, логин и пароль (Basic)
+        go('integrations', '#notifyLogTable thead')
+        pg.wait_for_function("document.getElementById('jiraStatus').textContent !== ''")
         pg.fill('#jiraUrl', 'https://jira.example.ru')
-        pg.select_option('#jiraType', 'server')
-        pg.fill('#jiraToken', 'demo-pat')
+        pg.select_option('#jiraType', 'server_basic')
+        pg.fill('#jiraLogin', JIRA_LOGIN)
+        pg.fill('#jiraToken', JIRA_PASSWORD)
         pg.evaluate('document.activeElement.blur()')
-        shot(pg.locator('#view-jira .panel').first, 'user/24-jira-connection.png')
-        shot(pg.locator('#view-jira .panel').first, 'admin/06-jira-connection.png')
+        shot(pg.locator('#view-integrations .panel').first, 'admin/06-jira-connection.png')
         # для работы — адрес учебной Jira
         pg.fill('#jiraUrl', jira.url)
         pg.click('#jiraTest')
         pg.wait_for_function("document.getElementById('jiraStatus').classList.contains('ok')")
         pg.fill('#jiraUrl', 'https://jira.example.ru')
-        shot(pg.locator('#view-jira .panel').first, 'user/25-jira-test.png')
+        shot(pg.locator('#view-integrations .panel').first, 'admin/11-jira-test.png')
         pg.fill('#jiraUrl', jira.url)
         pg.click('#jiraSave')
         pg.wait_for_timeout(600)
         hide_toast()
+
+        # ── Связь с Jira в проекте: состояние общего подключения (так его видит руководитель проекта) и кнопки
+        go('jira')
+        pg.wait_for_selector('#jiraProjectStatus.ok')
+        pg.evaluate("""() => { const el = document.getElementById('jiraProjectStatus');
+            el.textContent = el.textContent.replace(/http:\\/\\/127\\.0\\.0\\.1:\\d+/, 'https://jira.example.ru');
+            document.getElementById('jiraOpenIntegrations').hidden = true; }""")
+        shot(pg.locator('#view-jira .panel').first, 'user/24-jira-connection.png')
 
         # ── Редактор кнопки
         pg.click('#jiraAddButton')
