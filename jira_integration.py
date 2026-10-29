@@ -215,7 +215,8 @@ class JiraClient:
         if instance_type == 'server':
             self.session.headers['Authorization'] = 'Bearer ' + token
         else:
-            self.session.auth = (login, token)
+            # Basic: логин и пароль в UTF-8 (requests по умолчанию кодирует latin-1 и падает на кириллице)
+            self.session.auth = (login.encode('utf-8'), token.encode('utf-8'))
         self.session.verify = not accept_invalid_certs
         if accept_invalid_certs:
             import urllib3
@@ -283,8 +284,13 @@ class JiraClient:
     def check(resp, url, not_found=None):
         if resp.status_code == 200:
             return
+        denied = resp.headers.get('X-Authentication-Denied-Reason') or ''
+        if resp.status_code in (401, 403) and 'CAPTCHA' in denied.upper():
+            raise JiraError('Jira требует ввести CAPTCHA для этой учётной записи (было несколько неудачных входов): '
+                            'войдите в Jira через браузер под этой учётной записью, пройдите проверку и повторите')
         if resp.status_code == 401:
-            raise JiraError('Jira отклонила логин/токен (401). Проверьте тип подключения, логин и токен')
+            raise JiraError('Jira отклонила логин/токен (401). Проверьте тип подключения, логин и пароль или токен; '
+                            'если в Jira отключён вход по паролю (Basic), используйте Personal Access Token')
         if resp.status_code == 403:
             raise JiraError('Недостаточно прав в Jira (403)' + (f': {_error_text(resp)}' if _error_text(resp) else ''))
         if resp.status_code == 404 and not_found:

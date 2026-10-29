@@ -118,7 +118,7 @@ def test_login_throttling(client, make_user):
 def test_post_requires_json_and_security_headers(admin):
     r = admin.post('/api/projects/1/services', data={'name': 'x'})
     assert r.status_code == 415
-    r = admin.post('/api/projects/1/jira/connection/test', data='{}', content_type='text/plain')
+    r = admin.post('/api/admin/jira-connection/test', data='{}', content_type='text/plain')
     assert r.status_code == 415
     r = admin.get('/api/projects')
     assert r.headers['X-Frame-Options'] == 'DENY' and r.headers['X-Content-Type-Options'] == 'nosniff'
@@ -216,9 +216,9 @@ def test_migration_normalizes_dates_and_merges_duplicates(db_path):
 @pytest.mark.parametrize('url', ['http://127.0.0.1:9/secret?x=', 'http://user:pw@jira.example.ru', 'jira.example.ru',
                                  'https://jira.example.ru/#frag', 'https://jira.example.ru:99999'])
 def test_jira_url_must_be_plain(admin, url):
-    r = admin.put('/api/projects/1/jira/connection', json={'baseUrl': url, 'instanceType': 'server', 'token': 't'})
+    r = admin.put('/api/admin/jira-connection', json={'baseUrl': url, 'instanceType': 'server', 'token': 't'})
     assert r.status_code == 400
-    r = admin.post('/api/projects/1/jira/connection/test', json={'baseUrl': url, 'instanceType': 'server', 'token': 't'})
+    r = admin.post('/api/admin/jira-connection/test', json={'baseUrl': url, 'instanceType': 'server', 'token': 't'})
     assert r.status_code == 502
 
 
@@ -232,14 +232,14 @@ def test_jira_allowed_hosts(admin, monkeypatch, fake):
 
 def test_jira_error_body_is_not_echoed(admin, not_jira):
     url = not_jira(500, b'INTERNAL-ONLY: db_password=hunter2')
-    r = admin.post('/api/projects/1/jira/connection/test', json={'baseUrl': url, 'instanceType': 'server', 'token': 't'})
+    r = admin.post('/api/admin/jira-connection/test', json={'baseUrl': url, 'instanceType': 'server', 'token': 't'})
     assert r.status_code == 502 and 'hunter2' not in r.get_json()['error']
 
 
 def test_jira_redirect_is_not_followed(admin, not_jira):
     target = not_jira(200, b'{"displayName": "attacker"}', 'application/json')
     url = not_jira(302, b'', Location=target + '/rest/api/2/myself')
-    r = admin.post('/api/projects/1/jira/connection/test', json={'baseUrl': url, 'instanceType': 'server', 'token': 't'})
+    r = admin.post('/api/admin/jira-connection/test', json={'baseUrl': url, 'instanceType': 'server', 'token': 't'})
     assert r.status_code == 502 and 'перенаправляет' in r.get_json()['error']
 
 
@@ -248,7 +248,7 @@ def test_jira_sso_page_gives_clear_error_and_run_now_records_it(admin, flask_app
     sso = not_jira(200, b'<html>SSO login</html>')
     with flask_app.app_context():
         db = app_module.get_db()
-        db.execute('UPDATE jira_connections SET base_url = ? WHERE project_id = 1', (sso,))
+        db.execute("UPDATE app_settings SET value = ? WHERE key = 'jira_base_url'", (sso,))
         db.commit()
     r = admin.post(f'/api/jira/buttons/{bid}/snapshot', json={})
     assert r.status_code == 502 and 'страница входа' in r.get_json()['error']

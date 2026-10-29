@@ -17,7 +17,7 @@ def connect(admin, fake, pid=1, **over):
     body = {'baseUrl': fake.url, 'instanceType': 'server', 'login': '', 'token': 'secret-pat',
             'acceptInvalidCerts': False}
     body.update(over)
-    return admin.put(f'/api/projects/{pid}/jira/connection', json=body)
+    return admin.put('/api/admin/jira-connection', json=body)  # подключение общее (pid — для совместимости вызовов)
 
 
 def create_button(admin, pid=1, **over):
@@ -70,14 +70,14 @@ def test_connection_save_hides_token(admin, fake):
     assert data == {'baseUrl': fake.url, 'instanceType': 'server', 'login': '', 'acceptInvalidCerts': False,
                     'hasToken': True}
     # токен не попадает ни в ответы, ни в реестр изменений
-    log = admin.get('/api/audit?page=jira').get_json()['entries']
+    log = admin.get('/api/audit?page=integrations').get_json()['entries']
     assert log and all('secret-pat' not in str(e) for e in log)
 
 
 def test_connection_stored_encrypted(admin, fake, db_path):
     import sqlite3
     connect(admin, fake)
-    stored = sqlite3.connect(db_path).execute('SELECT token_encrypted FROM jira_connections').fetchone()[0]
+    stored = sqlite3.connect(db_path).execute("SELECT value FROM app_settings WHERE key = 'jira_token'").fetchone()[0]
     assert stored and 'secret-pat' not in stored
 
 
@@ -101,10 +101,10 @@ def test_connection_update_keeps_token_but_url_change_requires_it(admin, fake):
 
 def test_test_connection_server_pat(admin, fake):
     connect(admin, fake)
-    r = admin.post('/api/projects/1/jira/connection/test')
+    r = admin.post('/api/admin/jira-connection/test')
     assert r.status_code == 200 and r.get_json() == {'success': True, 'user': 'Тестовый Пользователь'}
     # проверка данных формы до сохранения: неверный токен
-    r = admin.post('/api/projects/1/jira/connection/test',
+    r = admin.post('/api/admin/jira-connection/test',
                    json={'baseUrl': fake.url, 'instanceType': 'server', 'token': 'wrong'})
     assert r.status_code == 502 and '401' in r.get_json()['error']
 
@@ -113,7 +113,7 @@ def test_stored_token_not_sent_to_other_url(admin, fake):
     connect(admin, fake)
     other = FakeJira()
     try:
-        r = admin.post('/api/projects/1/jira/connection/test',
+        r = admin.post('/api/admin/jira-connection/test',
                        json={'baseUrl': other.url, 'instanceType': 'server', 'token': ''})
         assert r.status_code == 502 and 'токен' in r.get_json()['error']
         assert other.state['requests'] == []
@@ -127,16 +127,16 @@ def test_basic_auth_modes(admin, fake, mode):
     if mode == 'server_basic':
         fake.configure(mode='server_basic')
     connect(admin, fake, instanceType=mode, login='user@corp.ru', token='api-token')
-    assert admin.post('/api/projects/1/jira/connection/test').status_code == 200
+    assert admin.post('/api/admin/jira-connection/test').status_code == 200
     expected_api = '/rest/api/3/myself' if mode == 'cloud' else '/rest/api/2/myself'
     assert ('GET', expected_api) in fake.state['requests']
 
 
 def test_unreachable_jira(admin):
-    r = admin.put('/api/projects/1/jira/connection', json={'baseUrl': 'http://127.0.0.1:9', 'instanceType': 'server',
+    r = admin.put('/api/admin/jira-connection', json={'baseUrl': 'http://127.0.0.1:9', 'instanceType': 'server',
                                                             'token': 't'})
     assert r.status_code == 200
-    r = admin.post('/api/projects/1/jira/connection/test')
+    r = admin.post('/api/admin/jira-connection/test')
     assert r.status_code == 502 and 'Не удалось подключиться' in r.get_json()['error']
 
 
@@ -151,9 +151,9 @@ def test_list_structures(admin, fake):
 
 def test_disconnect(admin, fake):
     connect(admin, fake)
-    assert admin.delete('/api/projects/1/jira/connection').status_code == 200
+    assert admin.delete('/api/admin/jira-connection').status_code == 200
     assert admin.get('/api/projects/1/jira').get_json()['connection'] is None
-    r = admin.post('/api/projects/1/jira/connection/test')
+    r = admin.post('/api/admin/jira-connection/test')
     assert r.status_code == 502 and 'не настроено' in r.get_json()['error']
 
 
@@ -200,7 +200,7 @@ def test_viewer_has_no_access(admin, make_user, fake):
     viewer = make_user('viewer', project_id=1)
     assert viewer.get('/api/projects/1/jira').status_code == 403
     assert viewer.post(f'/api/jira/buttons/{bid}/snapshot').status_code == 403
-    assert viewer.put('/api/projects/1/jira/connection', json={}).status_code == 403
+    assert viewer.put('/api/admin/jira-connection', json={}).status_code == 403
     manager = make_user('mgr', project_id=1, project_role='manager')
     assert manager.post(f'/api/jira/buttons/{bid}/snapshot').status_code == 200
 
@@ -213,7 +213,7 @@ def test_deleting_epic_and_project_cascade(admin, fake, db_path):
     assert [m['serviceId'] for m in admin.get('/api/projects/1/jira').get_json()['buttons'][0]['mappings']] == [2]
     admin.delete('/api/projects/1')
     conn = sqlite3.connect(db_path)
-    for table in ('jira_connections', 'jira_snapshot_buttons', 'jira_snapshot_mappings'):
+    for table in ('jira_snapshot_buttons', 'jira_snapshot_mappings'):
         assert conn.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] == 0
 
 
@@ -311,5 +311,70 @@ def test_without_jira_libraries_app_works(admin, fake, monkeypatch):
     assert admin.get('/api/projects/1/jira').status_code == 200
     r = connect(admin, fake)
     assert r.status_code == 502 and 'pip install -r requirements.txt' in r.get_json()['error']
-    r = admin.post('/api/projects/1/jira/connection/test', json={'baseUrl': fake.url, 'instanceType': 'server', 'token': 'x'})
+    r = admin.post('/api/admin/jira-connection/test', json={'baseUrl': fake.url, 'instanceType': 'server', 'token': 'x'})
     assert r.status_code == 502 and 'pip install' in r.get_json()['error']
+
+
+# ─── Общее подключение: настраивает только администратор ─────────
+
+def test_connection_is_admin_only_and_shared(admin, make_user, fake):
+    manager = make_user('mgr', project_id=1, project_role='manager')
+    body = {'baseUrl': fake.url, 'instanceType': 'server', 'token': 'secret-pat'}
+    assert manager.put('/api/admin/jira-connection', json=body).status_code == 403
+    assert manager.post('/api/admin/jira-connection/test', json=body).status_code == 403
+    assert manager.delete('/api/admin/jira-connection').status_code == 403
+    assert manager.get('/api/admin/jira-connection').status_code == 403
+    assert manager.put('/api/projects/1/jira/connection', json=body).status_code in (404, 405)  # прежнего пути нет
+    r = manager.post('/api/projects/1/jira/buttons', json={'name': 'x', 'mappings': [{'serviceId': 1, 'issueKeys': 'ABC-1'}]})
+    assert r.status_code == 200
+    assert manager.post(f"/api/jira/buttons/{r.get_json()['id']}/snapshot", json={}).status_code == 502  # ещё не подключено
+    connect(admin, fake)
+    # одно подключение — во всех проектах; руководитель видит его без пароля и токена
+    for pid in (1, 2):
+        assert admin.get(f'/api/projects/{pid}/jira').get_json()['connection']['baseUrl'] == fake.url
+    assert manager.get('/api/projects/1/jira').get_json()['connection']['hasToken'] is True
+    assert manager.post(f"/api/jira/buttons/{r.get_json()['id']}/snapshot", json={}).status_code == 200
+
+
+def test_legacy_project_connection_becomes_shared(db_path, fake):
+    """До 1.6.0 подключение задавалось в проекте: при обновлении общим становится подключение проекта,
+    где больше кнопок среза; повторно (после отключения администратором) оно не подхватывается."""
+    import sqlite3
+    import app as app_module
+    conn = sqlite3.connect(db_path)
+    conn.execute("DELETE FROM app_settings WHERE key = 'jira_central'")
+    token = jira.encrypt_token(app_module.app.secret_key, 'secret-pat')
+    conn.execute("INSERT INTO jira_connections (project_id, base_url, instance_type, login, token_encrypted) "
+                 "VALUES (1, 'https://old.example.ru', 'server', '', ?)", (token,))
+    conn.execute("INSERT INTO jira_connections (project_id, base_url, instance_type, login, token_encrypted, "
+                 "accept_invalid_certs) VALUES (2, ?, 'server_basic', 'svc', ?, 1)", (fake.url, token))
+    conn.executemany("INSERT INTO jira_snapshot_buttons (project_id, name) VALUES (2, ?)", [('a',), ('b',)])
+    conn.commit()
+    app_module.adopt_project_jira_connection(conn)
+    settings = dict(conn.execute("SELECT key, value FROM app_settings WHERE key LIKE 'jira%'").fetchall())
+    assert settings['jira_base_url'] == fake.url and settings['jira_instance_type'] == 'server_basic'
+    assert settings['jira_login'] == 'svc' and settings['jira_insecure'] == '1'
+    assert jira.decrypt_token(app_module.app.secret_key, settings['jira_token']) == 'secret-pat'
+    assert conn.execute('SELECT COUNT(*) FROM jira_connections').fetchone()[0] == 2  # прежние записи сохранены
+    conn.executemany('DELETE FROM app_settings WHERE key = ?', [(k,) for k in app_module.JIRA_KEYS])  # «Отключить»
+    conn.commit()
+    app_module.adopt_project_jira_connection(conn)
+    assert conn.execute("SELECT COUNT(*) FROM app_settings WHERE key = 'jira_base_url'").fetchone()[0] == 0
+    conn.close()
+
+
+def test_basic_auth_with_cyrillic_password(admin):
+    server = FakeJira(mode='server_basic', login='иванов', token='пароль-2026')
+    try:
+        r = admin.post('/api/admin/jira-connection/test',
+                       json={'baseUrl': server.url, 'instanceType': 'server_basic', 'login': 'иванов', 'token': 'пароль-2026'})
+        assert r.status_code == 200, r.get_json()
+    finally:
+        server.stop()
+
+
+def test_basic_auth_captcha_is_explained(admin, fake):
+    fake.configure(mode='server_basic', login='svc', token='pw', captcha=True)
+    r = admin.post('/api/admin/jira-connection/test',
+                   json={'baseUrl': fake.url, 'instanceType': 'server_basic', 'login': 'svc', 'token': 'pw'})
+    assert r.status_code == 502 and 'CAPTCHA' in r.get_json()['error'] and 'браузер' in r.get_json()['error']

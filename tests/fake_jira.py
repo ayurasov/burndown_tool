@@ -108,6 +108,9 @@ def create_app(state):
         else:
             expected = base64.b64encode(f"{state['login']}:{state['token']}".encode()).decode()
             ok = auth == 'Basic ' + expected
+        if state.get('captcha'):  # Jira Server/DC после нескольких неудачных входов по паролю
+            return jsonify({'errorMessages': ['Forbidden']}), 403, {
+                'X-Authentication-Denied-Reason': 'CAPTCHA_CHALLENGE; login-url=/login.jsp'}
         if not ok:
             return jsonify({'errorMessages': ['Unauthorized']}), 401
         api = '/rest/api/3/' if state['mode'] == 'cloud' else '/rest/api/2/'
