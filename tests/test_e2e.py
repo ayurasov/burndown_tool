@@ -828,7 +828,7 @@ def test_jira_connection_form(admin_ui, fake_jira):
     assert page.is_visible('#jiraDisconnect')
     admin_ui.go('jira')
     page.wait_for_selector('#jiraProjectStatus.ok')
-    assert fake_jira.url in admin_ui.text('#jiraProjectStatus')
+    assert admin_ui.text('#jiraProjectStatus') == '✓ Подключение к Jira настроено'
 
 
 def test_manager_sees_connection_but_cannot_change_it(ui, make_user, admin, fake_jira):
@@ -839,8 +839,8 @@ def test_manager_sees_connection_but_cannot_change_it(ui, make_user, admin, fake
     page = ui.page
     assert not page.is_visible('#navIntegrations')
     ui.go('jira')
-    status = ui.text('#jiraProjectStatus')
-    assert fake_jira.url in status and 'логин и пароль' in status and 'svc' in status
+    assert ui.text('#jiraProjectStatus') == '✓ Подключение к Jira настроено'  # только факт, без адреса и учётной записи
+    assert fake_jira.url not in page.content() and 'svc' not in ui.text('#view-jira')
     assert not page.is_visible('#jiraOpenIntegrations') and not page.is_visible('#jiraUrl')
     assert page.is_enabled('#jiraAddButton')  # кнопки среза руководитель настраивает сам
 

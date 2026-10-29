@@ -1144,8 +1144,9 @@ JIRA_KEYS = ('jira_base_url', 'jira_instance_type', 'jira_login', 'jira_token', 
 JIRA_NOT_CONFIGURED = 'Подключение к Jira не настроено — обратитесь к администратору (раздел «Интеграции»)'
 
 
-def _jira_client(db, override=None):
-    """Клиент Jira по общему подключению; override — данные формы администратора (проверка до сохранения)."""
+def _jira_client(db, override=None, detailed=None):
+    """Клиент Jira по общему подключению; override — данные формы администратора (проверка до сохранения).
+    detailed — подробные ошибки (по умолчанию только для формы администратора)."""
     saved = jira_connection(db)
     conf = dict(override or {})
     if not override and not saved:
@@ -1164,7 +1165,9 @@ def _jira_client(db, override=None):
         token = jira.decrypt_token(app.secret_key, saved['token_encrypted'])
     if instance_type != 'server' and not login:
         raise jira.JiraError('Укажите email или логин')
-    return jira.JiraClient(base_url, instance_type, login, token, accept_invalid_certs=insecure)
+    # подробные ошибки (адрес Jira, причина) — только при проверке формы администратором в «Интеграциях»
+    return jira.JiraClient(base_url, instance_type, login, token, accept_invalid_certs=insecure,
+                           detailed=override is not None if detailed is None else detailed)
 
 
 def _jira_error(e):
@@ -1225,7 +1228,8 @@ def api_get_jira(pid):
     db = get_db()
     buttons = db.execute('SELECT * FROM jira_snapshot_buttons WHERE project_id = ? ORDER BY sort_order, id',
                          (pid,)).fetchall()
-    return jsonify({'connection': jira.connection_json(jira_connection(db)),
+    # руководителю проекта — только факт подключения; адрес, способ входа и учётная запись — в «Интеграциях»
+    return jsonify({'connected': jira_connection(db) is not None,
                     'buttons': [_jira_button_json(db, b) for b in buttons]})
 
 
@@ -1296,7 +1300,7 @@ def api_delete_jira_connection():
 def api_test_jira_connection():
     data = json_body() or None
     try:
-        user = _jira_client(get_db(), override=data).myself()
+        user = _jira_client(get_db(), override=data, detailed=True).myself()
     except jira.JiraError as e:
         return _jira_error(e)
     return jsonify({'success': True, 'user': user})
@@ -2296,7 +2300,7 @@ def _subscription_json(db, user, sub):
                    'chanceThreshold': sub['chance_threshold'] if sub else 50,
                    'scopeThreshold': sub['scope_threshold'] if sub else 10},
         'channels': {'email': user['email'] or '', 'emailReady': bool(cfg.get('smtp_host') and cfg.get('smtp_from')),
-                     'telegramReady': bool(cfg.get('telegram_token')), 'botName': cfg.get('telegram_bot_name') or '',
+                     'telegramReady': bool(cfg.get('telegram_token')),
                      'telegramLinked': bool(user['telegram_chat_id'])},
     }
 

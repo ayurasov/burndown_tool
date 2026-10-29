@@ -203,7 +203,11 @@ def normalize_field_map(raw):
 # ─── HTTP-клиент Jira ────────────────────────────────────────────
 
 class JiraClient:
-    def __init__(self, base_url, instance_type, login, token, accept_invalid_certs=False, timeout=(15, 60)):
+    def __init__(self, base_url, instance_type, login, token, accept_invalid_certs=False, timeout=(15, 60),
+                 detailed=True):
+        """detailed=False — для пользователей без доступа к настройкам подключения (руководитель проекта): в ошибках
+        нет адреса Jira и технических подробностей, только что случилось и что сообщить администратору."""
+        self.detailed = detailed
         if instance_type not in INSTANCE_TYPES:
             raise JiraError('Неизвестный тип подключения к Jira')
         self.base_url = check_base_url(base_url)
@@ -239,19 +243,22 @@ class JiraClient:
                 # без перенаправлений: запросы с токеном идут только на адрес, указанный в подключении
                 resp = self.session.request(method, url, timeout=self.timeout, allow_redirects=False, **kwargs)
             except requests.exceptions.SSLError as e:
-                raise JiraError('Ошибка TLS/сертификата. Если Jira использует самоподписанный или корпоративный '
-                                f'сертификат, включите «Не проверять TLS-сертификат». ({e})')
+                self.fail('Ошибка TLS/сертификата. Если Jira использует самоподписанный или корпоративный '
+                          f'сертификат, включите «Не проверять TLS-сертификат». ({e})',
+                          'Ошибка TLS-сертификата Jira')
             except requests.exceptions.ConnectTimeout:
-                raise JiraError(f'Превышено время ожидания подключения к {self.base_url}')
+                self.fail(f'Превышено время ожидания подключения к {self.base_url}', 'Jira не отвечает')
             except requests.exceptions.ReadTimeout:
                 raise JiraError('Jira не ответила вовремя — попробуйте ещё раз')
             except requests.exceptions.ConnectionError as e:
-                raise JiraError(f'Не удалось подключиться к {self.base_url}: проверьте адрес и доступность сети ({e})')
+                self.fail(f'Не удалось подключиться к {self.base_url}: проверьте адрес и доступность сети ({e})',
+                          'Не удалось подключиться к Jira')
             if resp.is_redirect:
                 target = urlsplit(resp.headers.get('Location') or '')
                 where = f' на {target.scheme}://{target.netloc}{target.path}' if target.netloc else ''
-                raise JiraError(f'Jira перенаправляет запрос ({resp.status_code}){where} — укажите в подключении '
-                                'итоговый адрес Jira (например, с https:// или с путём /jira)')
+                self.fail(f'Jira перенаправляет запрос ({resp.status_code}){where} — укажите в подключении '
+                          'итоговый адрес Jira (например, с https:// или с путём /jira)',
+                          'Jira перенаправляет запросы на другой адрес — подключение нужно обновить')
             if resp.status_code in (429, 503) and attempt < MAX_ATTEMPTS:
                 try:
                     delay = min(float(resp.headers.get('Retry-After', attempt)), 10.0)
@@ -267,8 +274,17 @@ class JiraClient:
         self.check(resp, url, not_found)
         return self.parse(resp, url, kind)
 
-    @staticmethod
-    def parse(resp, url, kind=dict):
+    def fail(self, detailed, short):
+        """Ошибка подключения: подробно — администратору, кратко и без адреса Jira — остальным."""
+        if self.detailed:
+            raise JiraError(detailed)
+        raise JiraError(short + ' — сообщите администратору (подключение настраивается в разделе «Интеграции»)')
+
+    def where(self, url):
+        """Адрес запроса в сообщении об ошибке: полностью — администратору, остальным — только путь API."""
+        return url if self.detailed else urlsplit(url).path
+
+    def parse(self, resp, url, kind=dict):
         """Тело ответа Jira: JSON ожидаемого вида (объект или список), иначе понятная ошибка — например,
         когда вместо Jira отвечает страница входа SSO или прокси."""
         try:
@@ -276,26 +292,28 @@ class JiraClient:
         except ValueError:
             data = None
         if not isinstance(data, kind):
-            raise JiraError(f'Jira вернула неожиданный ответ ({url}) — проверьте адрес Jira; '
-                            'возможно, отвечает страница входа или прокси')
+            self.fail(f'Jira вернула неожиданный ответ ({url}) — проверьте адрес Jira; '
+                      'возможно, отвечает страница входа или прокси',
+                      f'Jira вернула неожиданный ответ ({self.where(url)}): возможно, отвечает страница входа или прокси')
         return data
 
-    @staticmethod
-    def check(resp, url, not_found=None):
+    def check(self, resp, url, not_found=None):
         if resp.status_code == 200:
             return
         denied = resp.headers.get('X-Authentication-Denied-Reason') or ''
         if resp.status_code in (401, 403) and 'CAPTCHA' in denied.upper():
-            raise JiraError('Jira требует ввести CAPTCHA для этой учётной записи (было несколько неудачных входов): '
-                            'войдите в Jira через браузер под этой учётной записью, пройдите проверку и повторите')
+            self.fail('Jira требует ввести CAPTCHA для этой учётной записи (было несколько неудачных входов): '
+                      'войдите в Jira через браузер под этой учётной записью, пройдите проверку и повторите',
+                      'Jira требует ввести CAPTCHA для учётной записи подключения')
         if resp.status_code == 401:
-            raise JiraError('Jira отклонила логин/токен (401). Проверьте тип подключения, логин и пароль или токен; '
-                            'если в Jira отключён вход по паролю (Basic), используйте Personal Access Token')
+            self.fail('Jira отклонила логин/токен (401). Проверьте тип подключения, логин и пароль или токен; '
+                      'если в Jira отключён вход по паролю (Basic), используйте Personal Access Token',
+                      'Jira отклонила логин или пароль подключения (401)')
         if resp.status_code == 403:
             raise JiraError('Недостаточно прав в Jira (403)' + (f': {_error_text(resp)}' if _error_text(resp) else ''))
         if resp.status_code == 404 and not_found:
             raise JiraError(not_found)
-        raise JiraError(f'Jira вернула ошибку {resp.status_code}: {_error_text(resp) or url}')
+        raise JiraError(f'Jira вернула ошибку {resp.status_code}: {_error_text(resp) or self.where(url)}')
 
     # ── операции ──
     def myself(self):

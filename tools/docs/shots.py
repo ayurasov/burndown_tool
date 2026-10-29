@@ -367,9 +367,7 @@ def main():
         # ── Связь с Jira в проекте: состояние общего подключения (так его видит руководитель проекта) и кнопки
         go('jira')
         pg.wait_for_selector('#jiraProjectStatus.ok')
-        pg.evaluate("""() => { const el = document.getElementById('jiraProjectStatus');
-            el.textContent = el.textContent.replace(/http:\\/\\/127\\.0\\.0\\.1:\\d+/, 'https://jira.example.ru');
-            document.getElementById('jiraOpenIntegrations').hidden = true; }""")
+        pg.evaluate("document.getElementById('jiraOpenIntegrations').hidden = true")  # кнопка видна только администратору
         shot(pg.locator('#view-jira .panel').first, 'user/24-jira-connection.png')
 
         # ── Редактор кнопки

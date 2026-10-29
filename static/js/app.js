@@ -2057,7 +2057,7 @@ function loadJiraConfig(){
 /* Кнопки среза в разделе «Данные по датам» */
 function renderJiraSnapshotButtons(){
   var box = document.getElementById('jiraSnapshotButtons');
-  var buttons = (canEdit() && STATE.jira && STATE.jira.connection) ? STATE.jira.buttons : [];
+  var buttons = (canEdit() && STATE.jira && STATE.jira.connected) ? STATE.jira.buttons : [];
   box.innerHTML = buttons.map(function(b){
     return '<button type="button" class="btn btn-ghost btn-sm" data-jira-snapshot="'+b.id+'" title="Забрать срез из Jira'+(b.structureName ? ' (структура «'+escapeAttr(b.structureName)+'»)' : '')+'">⇣ '+escapeHtml(b.name)+'</button>';
   }).join('');
@@ -2105,17 +2105,13 @@ function replaceJiraButton(saved){
   if(currentView === 'autofill') renderAutofillView();
 }
 
-var JIRA_TYPE_NAMES = {server_basic: 'Server/DC, логин и пароль', server: 'Server/DC, Personal Access Token',
-  cloud: 'Cloud, email и API-токен'};
-
-/* «Связь с Jira» проекта: подключение общее (его настраивает администратор), здесь — только его состояние и кнопки среза */
+/* «Связь с Jira» проекта: подключение общее (его настраивает администратор), здесь — только факт подключения и кнопки среза */
 function renderJiraView(){
   var cfg = STATE.jira;
-  var c = cfg && cfg.connection;
+  var connected = !!(cfg && cfg.connected);
   var st = document.getElementById('jiraProjectStatus');
-  st.className = 'jira-status' + (c ? ' ok' : ' error');
-  st.textContent = c ? '✓ Подключено: ' + c.baseUrl + ' · ' + (JIRA_TYPE_NAMES[c.instanceType] || c.instanceType) +
-      (c.login ? ' · учётная запись ' + c.login : '')
+  st.className = 'jira-status' + (connected ? ' ok' : ' error');
+  st.textContent = connected ? '✓ Подключение к Jira настроено'
     : 'Подключение к Jira не настроено' + (isGlobalAdmin() ? ' — настройте его в разделе «Интеграции».' : ' — обратитесь к администратору.');
   document.getElementById('jiraOpenIntegrations').hidden = !isGlobalAdmin();
   if(!cfg){ document.getElementById('jiraButtonsTable').innerHTML = ''; return; }
@@ -2203,7 +2199,7 @@ document.getElementById('jiraDisconnect').addEventListener('click', function(){
 function renderJiraButtonsTable(){
   var table = document.getElementById('jiraButtonsTable');
   var buttons = STATE.jira ? STATE.jira.buttons : [];
-  var connected = !!(STATE.jira && STATE.jira.connection);
+  var connected = !!(STATE.jira && STATE.jira.connected);
   document.getElementById('jiraAddButton').disabled = !STATE.services.length;
   if(!buttons.length){
     emptyTable(table, 'Кнопок пока нет', connected ? 'Создайте кнопку: выберите структуру и укажите задачи Jira для эпиков.' : 'Кнопки заработают, когда администратор настроит подключение к Jira.');
@@ -2996,7 +2992,7 @@ function fillNotifyForm(d){
     (ch.email ? escapeHtml(ch.email) : '<span class="prob-low">В профиле не указан email — обратитесь к администратору</span>');
   document.getElementById('nfTelegramState').innerHTML = !ch.telegramReady ?
     '<span class="muted-cell">Администратор ещё не подключил Telegram-бота</span>' :
-    (ch.telegramLinked ? '<span class="prob-high">✓ Привязан</span>' + (ch.botName ? ' <span class="muted-cell">бот @' + escapeHtml(ch.botName) + '</span>' : '') :
+    (ch.telegramLinked ? '<span class="prob-high">✓ Привязан</span>' :
       '<span class="muted-cell">Не привязан</span>');
   document.getElementById('nfTelegramLink').hidden = !ch.telegramReady || ch.telegramLinked;
   document.getElementById('nfTelegramUnlink').hidden = !ch.telegramLinked;
@@ -3203,8 +3199,8 @@ function renderAutofillView(){
   var box = document.getElementById('autofillList');
   var cfg = STATE.jira;
   if(!cfg){ box.innerHTML = ''; return; }
-  if(!cfg.connection || !cfg.buttons.length){
-    box.innerHTML = '<div class="empty-cell autofill-empty">'+(!cfg.connection ?
+  if(!cfg.connected || !cfg.buttons.length){
+    box.innerHTML = '<div class="empty-cell autofill-empty">'+(!cfg.connected ?
       (isGlobalAdmin() ? 'Сначала настройте подключение к Jira в разделе «Интеграции».' : 'Подключение к Jira не настроено — обратитесь к администратору.') :
       'Нет кнопок среза. Создайте кнопку в разделе «Связь с Jira», выполните по ней срез — после этого здесь можно включить расписание.')+'</div>';
     return;

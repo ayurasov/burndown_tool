@@ -63,10 +63,11 @@ def test_seconds_to_hours():
 # ─── Подключение ─────────────────────────────────────────────────
 
 def test_connection_save_hides_token(admin, fake):
-    assert admin.get('/api/projects/1/jira').get_json() == {'connection': None, 'buttons': []}
+    assert admin.get('/api/projects/1/jira').get_json() == {'connected': False, 'buttons': []}
     r = connect(admin, fake)
     assert r.status_code == 200
-    data = admin.get('/api/projects/1/jira').get_json()['connection']
+    assert admin.get('/api/projects/1/jira').get_json()['connected'] is True
+    data = admin.get('/api/admin/jira-connection').get_json()
     assert data == {'baseUrl': fake.url, 'instanceType': 'server', 'login': '', 'acceptInvalidCerts': False,
                     'hasToken': True}
     # токен не попадает ни в ответы, ни в реестр изменений
@@ -152,7 +153,7 @@ def test_list_structures(admin, fake):
 def test_disconnect(admin, fake):
     connect(admin, fake)
     assert admin.delete('/api/admin/jira-connection').status_code == 200
-    assert admin.get('/api/projects/1/jira').get_json()['connection'] is None
+    assert admin.get('/api/projects/1/jira').get_json()['connected'] is False
     r = admin.post('/api/admin/jira-connection/test')
     assert r.status_code == 502 and 'не настроено' in r.get_json()['error']
 
@@ -329,10 +330,11 @@ def test_connection_is_admin_only_and_shared(admin, make_user, fake):
     assert r.status_code == 200
     assert manager.post(f"/api/jira/buttons/{r.get_json()['id']}/snapshot", json={}).status_code == 502  # ещё не подключено
     connect(admin, fake)
-    # одно подключение — во всех проектах; руководитель видит его без пароля и токена
+    # одно подключение — во всех проектах; в проекте виден только факт подключения, без адреса и учётной записи
     for pid in (1, 2):
-        assert admin.get(f'/api/projects/{pid}/jira').get_json()['connection']['baseUrl'] == fake.url
-    assert manager.get('/api/projects/1/jira').get_json()['connection']['hasToken'] is True
+        assert admin.get(f'/api/projects/{pid}/jira').get_json()['connected'] is True
+    data = manager.get('/api/projects/1/jira').get_json()
+    assert set(data) == {'connected', 'buttons'} and data['connected'] is True and fake.url not in str(data)
     assert manager.post(f"/api/jira/buttons/{r.get_json()['id']}/snapshot", json={}).status_code == 200
 
 
@@ -378,3 +380,18 @@ def test_basic_auth_captcha_is_explained(admin, fake):
     r = admin.post('/api/admin/jira-connection/test',
                    json={'baseUrl': fake.url, 'instanceType': 'server_basic', 'login': 'svc', 'token': 'pw'})
     assert r.status_code == 502 and 'CAPTCHA' in r.get_json()['error'] and 'браузер' in r.get_json()['error']
+
+
+def test_manager_errors_do_not_reveal_connection(admin, make_user):
+    """Ошибки среза у руководителя — без адреса Jira и подробностей; администратор видит их при проверке формы."""
+    body = {'baseUrl': 'http://127.0.0.1:9', 'instanceType': 'server_basic', 'login': 'svc', 'token': 'pw'}
+    assert admin.put('/api/admin/jira-connection', json=body).status_code == 200
+    manager = make_user('mgr', project_id=1, project_role='manager')
+    bid = manager.post('/api/projects/1/jira/buttons', json={
+        'name': 'x', 'mappings': [{'serviceId': 1, 'issueKeys': 'ABC-1'}]}).get_json()['id']
+    for r in (manager.post(f'/api/jira/buttons/{bid}/snapshot', json={}), manager.get('/api/projects/1/jira/structures')):
+        error = r.get_json()['error']
+        assert r.status_code == 502 and '127.0.0.1' not in error and 'svc' not in error
+        assert 'Не удалось подключиться к Jira' in error and 'администратор' in error
+    error = admin.post('/api/admin/jira-connection/test', json=body).get_json()['error']
+    assert 'http://127.0.0.1:9' in error  # администратору — с адресом и причиной
