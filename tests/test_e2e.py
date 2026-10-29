@@ -133,7 +133,7 @@ def test_all_views_render_without_errors(admin_ui, theme):
 def test_mobile_has_no_horizontal_scroll(browser, live_server):
     ctx = browser.new_context(viewport={'width': 390, 'height': 844})
     app = App(ctx.new_page(), live_server).login(*ADMIN)
-    for view in VIEWS:
+    for view in VIEWS + ['jira', 'autofill', 'notify', 'notifyAdmin']:  # длинные подписи флажков переносятся
         app.page.click('#sidebarToggle')
         app.go(view)
         overflow = app.page.evaluate('document.documentElement.scrollWidth - document.documentElement.clientWidth')
@@ -157,6 +157,74 @@ def test_modal_closes_by_escape_and_cancel(admin_ui):
     page.click('#confirmOk')
     admin_ui.expect_toast('Введите название проекта')
     assert page.is_visible('#confirmModal.show')
+
+
+def test_modal_keyboard_focus_and_enter(admin_ui):
+    """Окно: страница под ним недоступна, Tab не уходит из окна, Enter в поле — «Создать», фокус возвращается."""
+    page = admin_ui.page
+    admin_ui.go('projects')
+    assert not page.evaluate("getComputedStyle(document.getElementById('confirmModal')).visibility === 'visible'")
+    page.focus('#btnAddProject')
+    page.keyboard.press('Enter')
+    page.wait_for_selector('#confirmModal.show')
+    assert page.evaluate("document.getElementById('appRoot').inert")
+    for _ in range(6):
+        page.keyboard.press('Tab')
+        assert page.evaluate("document.getElementById('confirmModal').contains(document.activeElement)")
+    page.fill('#projectName', 'Проект по Enter')
+    page.press('#projectName', 'Enter')
+    page.wait_for_selector('#confirmModal:not(.show)', state='attached')
+    page.wait_for_selector('#projectsMgmtTable:has-text("Проект по Enter")')
+    assert not page.evaluate("document.getElementById('appRoot').inert")
+    assert page.evaluate('document.activeElement.id') == 'btnAddProject'
+
+
+def test_delete_confirmation_focuses_cancel(admin_ui):
+    page = admin_ui.page
+    admin_ui.go('data')
+    page.click('#entriesTable [data-action="delete"] >> nth=0')
+    page.wait_for_selector('#confirmModal.show')
+    assert page.evaluate('document.activeElement.id') == 'confirmCancel'
+    page.keyboard.press('Enter')  # Enter на «Отмена» не удаляет
+    page.wait_for_selector('#confirmModal:not(.show)', state='attached')
+    assert page.locator('#entriesTable tbody tr').count() == 4
+
+
+def test_mobile_menu_keyboard(browser, live_server):
+    ctx = browser.new_context(viewport={'width': 390, 'height': 844})
+    app = App(ctx.new_page(), live_server).login(*ADMIN)
+    page = app.page
+    assert page.evaluate("document.querySelector('.sidebar').inert")  # закрытое меню не в обходе Tab
+    page.click('#sidebarToggle')
+    assert not page.evaluate("document.querySelector('.sidebar').inert")
+    assert page.evaluate("document.activeElement.classList.contains('nav-item')")
+    page.keyboard.press('Escape')
+    assert page.evaluate("document.querySelector('.sidebar').inert")
+    assert page.evaluate('document.activeElement.id') == 'sidebarToggle'
+    assert app.errors == []
+    ctx.close()
+
+
+def test_default_password_warning(admin_ui):
+    page = admin_ui.page
+    assert page.is_visible('#defaultPwWarning')
+    page.click('#defaultPwWarning')
+    page.wait_for_selector('#confirmModal.show')
+    assert page.evaluate('document.activeElement.id') == 'profilePassword'
+    page.fill('#profilePassword', 'Strong-pass-2026')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Профиль обновлён')
+    assert not page.is_visible('#defaultPwWarning')
+
+
+def test_empty_charts_explain_why(admin_ui):
+    page = admin_ui.page
+    page.click('text=Снять все')
+    page.wait_for_selector('#chartRemaining[hidden]', state='attached')
+    assert 'Не выбран ни один эпик' in admin_ui.text('#chartRemaining + .chart-empty')
+    page.click('text=Все')
+    page.wait_for_selector('#chartRemaining:not([hidden])', state='attached')
+    assert page.locator('.chart-wrap .chart-empty').count() == 0
 
 
 # ─── Дашборд ─────────────────────────────────────────────────────
@@ -323,9 +391,11 @@ def test_viewer_readonly_mode(ui, make_user):
     assert not page.is_visible('#btnAddRow')
     assert page.is_enabled('#dataServiceSelect')
     assert page.get_attribute('#entriesTable input[data-field="remaining"] >> nth=0', 'readonly') is not None
+    assert not page.is_visible('#view-data .edit-only')  # «Изменения сохраняются автоматически» — не для просмотра
     ui.go('services')
     assert not page.is_visible('#btnAddService')
     assert page.is_disabled('#servicesTable input[type=checkbox] >> nth=0')
+    assert not page.is_visible('#view-services .edit-only')
 
 
 def test_readonly_is_lifted_after_switching_project(ui, make_user, admin):
@@ -1079,3 +1149,109 @@ def test_burnup_forecast_and_stage_level(admin_ui, fake_jira, admin):
     page.click('#stageJiraTable tbody tr[data-stage="Этап 4"]')
     assert page.input_value('#stageBurnupSelect') == 'Этап 4'
     assert not admin_ui.errors
+
+
+@pytest.fixture
+def fake_mail(monkeypatch):
+    import notify
+    from fake_notify import FakeSMTP
+    FakeSMTP.reset()
+    monkeypatch.setattr(notify.smtplib, 'SMTP', FakeSMTP)
+    monkeypatch.setattr(notify.smtplib, 'SMTP_SSL', FakeSMTP)
+    return FakeSMTP
+
+
+@pytest.fixture
+def fake_tg(flask_app, monkeypatch):
+    from fake_notify import FakeTelegram
+    server = FakeTelegram()
+    monkeypatch.setitem(flask_app.config, 'TELEGRAM_API', server.url)
+    yield server
+    server.stop()
+
+
+def test_notify_admin_settings_ui(admin_ui, fake_mail, fake_tg):
+    page = admin_ui.page
+    admin_ui.go('notifyAdmin')
+    page.wait_for_selector('#notifyLogTable thead')
+    page.fill('#naHost', 'smtp.example.ru')
+    page.fill('#naPort', '465')
+    page.select_option('#naSecurity', 'ssl')
+    page.fill('#naSender', 'burndown@example.ru')
+    page.fill('#naLogin', 'burndown')
+    page.fill('#naPassword', 'secret')
+    page.fill('#naToken', '123:ABC')
+    page.fill('#naUrl', 'https://burndown.example.ru')
+    page.click('#naSave')
+    admin_ui.expect_toast('Настройки рассылок сохранены')
+    assert admin_ui.text('#naBotStatus') == '✓ Бот @burndown_test_bot'
+    assert page.input_value('#naPassword') == '' and 'Сохранён' in page.get_attribute('#naPassword', 'placeholder')
+    page.fill('#naTestTo', 'ops@example.ru')
+    page.click('#naTestEmail')
+    admin_ui.expect_toast('Тестовое письмо отправлено на ops@example.ru')
+    conn = fake_mail.connections[-1]
+    assert (conn.port, conn.user) == (465, 'burndown') and fake_mail.sent[-1]['To'] == 'ops@example.ru'
+    page.wait_for_selector('#notifyLogTable tbody tr')
+    assert 'Проверка' in admin_ui.text('#notifyLogTable tbody tr') and '✓' in admin_ui.text('#notifyLogTable tbody tr')
+    assert not admin_ui.errors
+
+
+def test_notify_project_view_ui(admin_ui, admin, fake_mail, fake_tg):
+    page = admin_ui.page
+    admin.put('/api/admin/notify-settings', json={'smtp': {'host': 'smtp.example.ru', 'port': 587, 'security': 'starttls',
+                                                           'sender': 'burndown@example.ru'},
+                                                  'telegram': {'token': '123:ABC'}, 'publicUrl': 'https://burndown.example.ru'})
+    admin.put('/api/profile', json={'displayName': 'Администратор', 'email': 'admin@example.ru', 'position': 'Админ'})
+    page.reload()
+    page.wait_for_selector('#summaryTable tbody tr')
+    ui_chance = admin_ui.cells('#summaryTable tbody tr:has-text("Работа с жалобами") td')[7]
+    admin_ui.go('notify')
+    page.wait_for_selector('#nfDays [data-day]')
+    assert admin_ui.text('#nfEmailState') == 'admin@example.ru' and admin_ui.text('#nfTelegramState') == 'Не привязан'
+    # привязка Telegram
+    page.click('#nfTelegramLink')
+    page.wait_for_selector('.telegram-steps a')
+    code = page.get_attribute('.telegram-steps a', 'href').split('start=')[1]
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Бот ещё не получил команду Start — откройте ссылку и нажмите «Запустить»')
+    fake_tg.user_starts(code, chat_id=99)
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Telegram привязан')
+    page.wait_for_function("document.getElementById('nfTelegramState').textContent.includes('Привязан')")
+    # дайджест по понедельникам и средам + оповещения, оба канала
+    page.check('#nfViaTelegram')
+    page.check('#nfDigestOn')
+    page.click('#nfDays label:has-text("Ср")')
+    page.fill('#nfTime', '08:30')
+    page.select_option('#nfTz', 'Europe/Moscow')
+    page.check('#nfAlertsOn')
+    page.fill('#nfChance', '60')
+    page.click('#nfSave')
+    admin_ui.expect_toast('Настройки уведомлений сохранены')
+    sub = admin.get('/api/projects/1/notifications').get_json()
+    assert sub['viaTelegram'] and sub['digest']['days'] == [1, 3] and sub['digest']['time'] == '08:30'
+    assert sub['alerts']['enabled'] and sub['alerts']['chanceThreshold'] == 60
+    assert 'Europe/Moscow' in admin_ui.text('#nfDigestStatus')
+    # предпросмотр: цифры совпадают с дашбордом
+    page.click('#nfPreview')
+    page.wait_for_selector('#confirmModal.show iframe.digest-preview')
+    frame = page.frame_locator('iframe.digest-preview')
+    row = frame.locator('tr:has-text("Работа с жалобами")').inner_text()
+    assert ui_chance in row
+    page.click('#confirmOk')
+    page.wait_for_selector('#confirmModal:not(.show)', state='attached')
+    page.click('#nfSendNow')
+    admin_ui.expect_toast('Дайджест отправлен: почта, Telegram')
+    assert fake_mail.sent[-1]['To'] == 'admin@example.ru' and fake_tg.state['messages'][-1]['chat_id'] == '99'
+    page.wait_for_function("document.getElementById('nfDigestStatus').textContent.includes('почта: отправлено')")
+    assert not admin_ui.errors
+
+
+def test_notify_view_for_read_only_user(ui, make_user):
+    make_user('viewer', project_id=1)
+    ui.login('viewer', 'pw-12345')
+    assert ui.page.is_visible('#navNotify') and not ui.page.is_visible('#navNotifyAdmin')
+    ui.go('notify')
+    ui.page.wait_for_selector('#nfDays [data-day]')
+    assert 'не настроил' in ui.text('#nfEmailState')
+    assert not ui.errors

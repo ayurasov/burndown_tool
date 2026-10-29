@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,10 +25,29 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 from werkzeug.serving import make_server  # noqa: E402
 
 import app as app_module  # noqa: E402
+
+# Часы демо-стенда: «сейчас» — 14:00 по Москве сегодняшней (по UTC) даты, в выходные — пятницы. Тогда снимки не зависят
+# от времени запуска скрипта: утренний автозапуск уже прошёл, даты сервера и браузера совпадают.
+_demo_day = datetime.now(timezone.utc).date()
+while _demo_day.isoweekday() > 5:
+    _demo_day -= timedelta(days=1)
+DEMO_SHIFT = datetime.now(timezone.utc) - datetime(_demo_day.year, _demo_day.month, _demo_day.day, 11, tzinfo=timezone.utc)
+
+
+class _DemoDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return super().now(tz) - DEMO_SHIFT
+
+
+app_module.datetime = _DemoDatetime
 import fake_jira  # noqa: E402
+import notify  # noqa: E402
+from fake_notify import FakeSMTP, FakeTelegram  # noqa: E402
 import init_db  # noqa: E402
 
 H = 3600
+ADMIN_PASSWORD = 'Demo-Admin-2026'
 
 
 HISTORY = ['2026-07-17', '2026-07-24', '2026-07-28', '2026-07-29']  # срезы состава задач для burn-up
@@ -110,8 +130,9 @@ def start_app():
 def prepare(base, jira_url):
     s = requests.Session()
     s.post(base + '/api/auth/login', json={'username': 'admin', 'password': 'Test198!'})
+    # пароль по умолчанию сменён, как требует руководство, — иначе в меню будет предупреждение о нём
     s.put(base + '/api/profile', json={'displayName': 'Администратор', 'email': 'admin@example.ru',
-                                       'position': 'Администратор системы'})
+                                       'position': 'Администратор системы', 'password': ADMIN_PASSWORD})
     users = {}
     for login, name, pos, role in [('ivanov', 'Иванов Сергей', 'Руководитель проекта', 'manager'),
                                    ('petrova', 'Петрова Анна', 'Аналитик', 'user'),
@@ -129,6 +150,10 @@ def prepare(base, jira_url):
 def main():
     demo_jira()
     jira = fake_jira.FakeJira(token='demo-pat')
+    # почта и Telegram — учебные: письма складываются в память, бот отвечает локально
+    notify.smtplib.SMTP = notify.smtplib.SMTP_SSL = FakeSMTP
+    telegram = FakeTelegram(username='burndown_vector_bot')
+    app_module.app.config['TELEGRAM_API'] = telegram.url
     base = start_app()
     api = prepare(base, jira.url)
     jira_history(api, base, jira.url)
@@ -146,7 +171,9 @@ def main():
             opts = dict(viewport={'width': 1440, 'height': 900}, device_scale_factor=2, color_scheme='light',
                         locale='ru-RU', timezone_id='Europe/Moscow')
             opts.update(kw)
-            return browser.new_context(**opts)
+            ctx = browser.new_context(**opts)
+            ctx.clock.install(time=datetime.now(timezone.utc) - DEMO_SHIFT)
+            return ctx
 
         def login(pg, username, password):
             pg.goto(base + '/login')
@@ -180,7 +207,7 @@ def main():
         pg.goto(base + '/login')
         pg.wait_for_timeout(300)
         shot(pg, 'user/01-login.png')
-        login(pg, 'admin', 'Test198!')
+        login(pg, 'admin', ADMIN_PASSWORD)
         shot(pg, 'user/02-dashboard.png')
         shot(pg.locator('.sidebar'), 'user/03-sidebar.png')
         shot(pg.locator('#view-dashboard .quick-filter'), 'user/04-quick-filter.png')
@@ -236,6 +263,44 @@ def main():
         pg.wait_for_timeout(400)
         shot(pg.locator('#stageBurnupPanel'), 'user/44-project-burnup.png')
 
+        # ── Рассылки (администратор) и уведомления по проекту
+        go('notifyAdmin', '#notifyLogTable thead')
+        pg.fill('#naHost', 'smtp.example.ru')
+        pg.fill('#naPort', '587')
+        pg.fill('#naSender', 'burndown@example.ru')
+        pg.fill('#naLogin', 'burndown')
+        pg.fill('#naPassword', 'demo')
+        pg.fill('#naToken', '123:ABC')
+        pg.fill('#naUrl', 'https://burndown.example.ru')
+        pg.click('#naSave')
+        pg.wait_for_function("document.getElementById('naBotStatus').textContent.includes('@')")
+        hide_toast()
+        go('notify', '#nfDays [data-day]')
+        pg.click('#nfTelegramLink')
+        pg.wait_for_selector('.telegram-steps a')
+        modal('user/47-telegram-link.png')
+        code = pg.get_attribute('.telegram-steps a', 'href').split('start=')[1]
+        telegram.user_starts(code, chat_id=1001)
+        pg.click('#confirmOk')
+        pg.wait_for_function("document.getElementById('nfTelegramState').textContent.includes('Привязан')")
+        pg.check('#nfViaTelegram')
+        pg.check('#nfDigestOn')
+        pg.check('#nfPdf')
+        pg.check('#nfAlertsOn')
+        pg.click('#nfSave')
+        pg.wait_for_timeout(500)
+        pg.click('#nfSendNow')
+        pg.wait_for_function("document.getElementById('nfDigestStatus').textContent.includes('отправлено')")
+        hide_toast()
+        shot(pg.locator('#view-notify'), 'user/45-notify.png')
+        pg.click('#nfPreview')
+        pg.wait_for_selector('#confirmModal.show iframe.digest-preview')
+        pg.wait_for_timeout(500)
+        shot(pg.locator('#confirmModal .modal'), 'user/46-digest-preview.png')
+        pg.keyboard.press('Escape')
+        go('notifyAdmin', '#notifyLogTable tbody tr')
+        pg.fill('#naTestTo', 'ivanov@example.ru')
+        shot(pg.locator('#view-notifyAdmin'), 'admin/10-notify-admin.png')
         # ── Данные по датам
         go('data', '#entriesTable tbody tr')
         shot(pg.locator('#view-data .panel'), 'user/14-data.png')
@@ -363,6 +428,11 @@ def main():
         pg.click('#btnAddProject')
         modal('admin/04-project-add.png')
         pg.keyboard.press('Escape')
+        with app_module.app.app_context():  # реестр пишет время SQLite (CURRENT_TIMESTAMP) — переводим на часы стенда
+            db = app_module.get_db()
+            db.execute('UPDATE audit_log SET created_at = datetime(created_at, ?)',
+                       (f'{-int(DEMO_SHIFT.total_seconds()):+d} seconds',))
+            db.commit()
         pg.set_viewport_size({'width': 1800, 'height': 900})  # реестр — широкая таблица
         go('audit', '#auditLogTable tbody tr')
         shot(pg.locator('#view-audit .panel'), 'admin/05-audit.png')
@@ -373,6 +443,7 @@ def main():
         pg.set_viewport_size({'width': 1440, 'height': 900})
         go('autofill', '.autofill-card')
         shot(pg.locator('#view-autofill .panel'), 'admin/09-autofill.png')
+
         ctx.close()
 
         # ── Режим просмотра (роль «Пользователь»)
@@ -388,7 +459,7 @@ def main():
         # ── Телефон
         ctx = context(viewport={'width': 390, 'height': 844}, is_mobile=True, has_touch=True)
         pg = ctx.new_page()
-        login(pg, 'admin', 'Test198!')
+        login(pg, 'admin', ADMIN_PASSWORD)
         shot(pg, 'user/22-mobile.png')
         pg.click('#sidebarToggle')
         pg.wait_for_timeout(400)
@@ -396,6 +467,7 @@ def main():
         ctx.close()
         browser.close()
     jira.stop()
+    telegram.stop()
     optimize_png()
     print('Снимки:', sum(1 for _ in OUT.rglob('*.png')))
 

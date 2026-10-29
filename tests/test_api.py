@@ -432,8 +432,11 @@ def test_secret_key_persisted_next_to_db(tmp_path, monkeypatch):
     assert key_file.read_text() == key1 and len(key1) == 64
     assert oct(key_file.stat().st_mode & 0o777) == '0o600'
     assert app_module.load_secret_key() == key1  # повторный запуск — тот же ключ
-    monkeypatch.setenv('SECRET_KEY', 'from-env')
-    assert app_module.load_secret_key() == 'from-env'
+    monkeypatch.setenv('SECRET_KEY', 'k' * 40)
+    assert app_module.load_secret_key() == 'k' * 40
+    # ключ из примера README / слишком короткий — не используется: берётся случайный ключ из файла
+    monkeypatch.setenv('SECRET_KEY', 'ваш-секретный-ключ-замените-это')
+    assert app_module.load_secret_key() == key1
 
 
 def test_indexes_created(db_path):
@@ -441,7 +444,7 @@ def test_indexes_created(db_path):
     conn = sqlite3.connect(db_path)
     names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
     conn.close()
-    assert {'idx_entries_service_date', 'idx_services_project', 'idx_audit_project'} <= names
+    assert {'ux_entries_service_date', 'idx_services_project', 'idx_audit_project'} <= names
 
 
 def test_migrate_old_database_keeps_data(db_path, monkeypatch):
@@ -449,7 +452,7 @@ def test_migrate_old_database_keeps_data(db_path, monkeypatch):
     import sqlite3
     import app as app_module
     conn = sqlite3.connect(db_path)
-    for idx in ('idx_entries_service_date', 'idx_services_project', 'idx_audit_project'):
+    for idx in ('ux_entries_service_date', 'idx_services_project', 'idx_audit_project'):
         conn.execute(f'DROP INDEX {idx}')
     conn.execute('ALTER TABLE services DROP COLUMN is_done')
     conn.execute('ALTER TABLE services DROP COLUMN stage_group')
@@ -460,7 +463,7 @@ def test_migrate_old_database_keeps_data(db_path, monkeypatch):
     cols = [r[1] for r in conn.execute('PRAGMA table_info(services)')]
     assert 'is_done' in cols and 'stage_group' in cols
     assert conn.execute('SELECT COUNT(*) FROM entries').fetchone()[0] == 24
-    assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_entries_service_date'").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name = 'ux_entries_service_date'").fetchone()[0] == 1
     conn.close()
 
 

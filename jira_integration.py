@@ -16,9 +16,11 @@ timeoriginalestimate — оценка; в секундах), и суммирую
 
 import base64
 import hashlib
+import os
 from datetime import datetime
 import re
 import time
+from urllib.parse import urlsplit
 
 # Без этих библиотек (не выполнен pip install -r requirements.txt после обновления) приложение работает,
 # недоступна только связь с Jira — с понятным сообщением вместо падения при запуске.
@@ -57,6 +59,29 @@ MAX_ATTEMPTS = 3
 
 class JiraError(Exception):
     """Ошибка обращения к Jira с понятным пользователю текстом."""
+
+
+def check_base_url(base_url):
+    """Адрес Jira: http(s)://хост[:порт][/путь] — без логина в адресе, параметров и якоря (иначе путь запросов
+    к API можно подменить). JIRA_ALLOWED_HOSTS (через запятую) ограничивает хосты: «jira.company.ru»
+    или «.company.ru» — домен и все поддомены."""
+    url = (base_url or '').strip().rstrip('/')
+    if not re.match(r'^https?://', url, re.IGNORECASE):
+        raise JiraError('Адрес Jira должен начинаться с http:// или https://')
+    try:
+        parts = urlsplit(url)
+        parts.port  # noqa: B018 — проверка порта: ValueError, если он некорректный
+    except ValueError:
+        raise JiraError('Некорректный адрес Jira')
+    if not parts.hostname or '@' in parts.netloc or parts.query or parts.fragment or '?' in url or '#' in url \
+            or re.search(r'\s', url):
+        raise JiraError('Адрес Jira — только https://хост[:порт][/путь], без логина, параметров «?» и «#»')
+    allowed = [h.strip().lower() for h in os.environ.get('JIRA_ALLOWED_HOSTS', '').split(',') if h.strip()]
+    host = parts.hostname.lower()
+    if allowed and not any(host == h or (h.startswith('.') and (host.endswith(h) or host == h[1:]))
+                           for h in allowed):
+        raise JiraError(f'Подключение к {host} запрещено настройками сервера (JIRA_ALLOWED_HOSTS)')
+    return url
 
 
 def _require_libs():
@@ -181,9 +206,7 @@ class JiraClient:
     def __init__(self, base_url, instance_type, login, token, accept_invalid_certs=False, timeout=(15, 60)):
         if instance_type not in INSTANCE_TYPES:
             raise JiraError('Неизвестный тип подключения к Jira')
-        self.base_url = (base_url or '').strip().rstrip('/')
-        if not re.match(r'^https?://', self.base_url):
-            raise JiraError('Адрес Jira должен начинаться с http:// или https://')
+        self.base_url = check_base_url(base_url)
         _require_libs()
         self.instance_type = instance_type
         self.timeout = timeout
@@ -212,7 +235,8 @@ class JiraClient:
         """Запрос с повтором при 429/503 (с учётом Retry-After) и понятными сообщениями об ошибках."""
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                resp = self.session.request(method, url, timeout=self.timeout, **kwargs)
+                # без перенаправлений: запросы с токеном идут только на адрес, указанный в подключении
+                resp = self.session.request(method, url, timeout=self.timeout, allow_redirects=False, **kwargs)
             except requests.exceptions.SSLError as e:
                 raise JiraError('Ошибка TLS/сертификата. Если Jira использует самоподписанный или корпоративный '
                                 f'сертификат, включите «Не проверять TLS-сертификат». ({e})')
@@ -222,6 +246,11 @@ class JiraClient:
                 raise JiraError('Jira не ответила вовремя — попробуйте ещё раз')
             except requests.exceptions.ConnectionError as e:
                 raise JiraError(f'Не удалось подключиться к {self.base_url}: проверьте адрес и доступность сети ({e})')
+            if resp.is_redirect:
+                target = urlsplit(resp.headers.get('Location') or '')
+                where = f' на {target.scheme}://{target.netloc}{target.path}' if target.netloc else ''
+                raise JiraError(f'Jira перенаправляет запрос ({resp.status_code}){where} — укажите в подключении '
+                                'итоговый адрес Jira (например, с https:// или с путём /jira)')
             if resp.status_code in (429, 503) and attempt < MAX_ATTEMPTS:
                 try:
                     delay = min(float(resp.headers.get('Retry-After', attempt)), 10.0)
@@ -232,13 +261,23 @@ class JiraClient:
             return resp
         return resp
 
-    def json(self, method, url, not_found=None, **kwargs):
+    def json(self, method, url, not_found=None, kind=dict, **kwargs):
         resp = self.request(method, url, **kwargs)
         self.check(resp, url, not_found)
+        return self.parse(resp, url, kind)
+
+    @staticmethod
+    def parse(resp, url, kind=dict):
+        """Тело ответа Jira: JSON ожидаемого вида (объект или список), иначе понятная ошибка — например,
+        когда вместо Jira отвечает страница входа SSO или прокси."""
         try:
-            return resp.json()
+            data = resp.json()
         except ValueError:
-            raise JiraError(f'Jira вернула не JSON ({url}) — проверьте адрес Jira')
+            data = None
+        if not isinstance(data, kind):
+            raise JiraError(f'Jira вернула неожиданный ответ ({url}) — проверьте адрес Jira; '
+                            'возможно, отвечает страница входа или прокси')
+        return data
 
     @staticmethod
     def check(resp, url, not_found=None):
@@ -261,12 +300,12 @@ class JiraClient:
         data = self.json('GET', self.structure_api('structure'), params={'limit': 1000},
                          not_found='Плагин Structure недоступен в этой Jira (REST API Structure не найден)')
         return [{'id': s.get('id'), 'name': s.get('name') or f"Структура {s.get('id')}"}
-                for s in data.get('structures', []) if isinstance(s.get('id'), int)]
+                for s in (data.get('structures') or []) if isinstance(s, dict) and isinstance(s.get('id'), int)]
 
     def forest_rows(self, structure_id):
         data = self.json('POST', self.structure_api('forest/latest'), json={'structureId': structure_id},
                          not_found=f'Структура {structure_id} не найдена или плагин Structure недоступен')
-        return parse_forest_formula(data.get('formula', ''))
+        return parse_forest_formula(str(data.get('formula') or ''))
 
     def issue(self, key, fields):
         """Задача по ключу; None, если её нет или нет прав на просмотр."""
@@ -275,7 +314,7 @@ class JiraClient:
         if resp.status_code == 404:
             return None
         self.check(resp, url)
-        return resp.json()
+        return self.parse(resp, url)
 
     def search(self, jql, fields):
         """Все задачи по JQL (постранично: startAt в Server/DC, nextPageToken в Cloud) → {id: fields}.
@@ -339,9 +378,9 @@ class JiraClient:
 
     def statuses(self):
         """{id статуса: (название, категория)}."""
-        data = self.json('GET', self.api('status'))
+        data = self.json('GET', self.api('status'), kind=list)
         return {str(st.get('id')): (st.get('name') or '', (st.get('statusCategory') or {}).get('key') or 'new')
-                for st in (data if isinstance(data, list) else [])}
+                for st in data if isinstance(st, dict)}
 
     def issues_by_ids(self, ids, fields):
         """{id: fields} для задач по ID (пакетами); недоступные пользователю задачи пропускаются."""
@@ -354,9 +393,11 @@ class JiraClient:
 
     def list_fields(self):
         """Поля Jira, пригодные для среза: учёт времени и числовые (в т. ч. пользовательские)."""
-        data = self.json('GET', self.api('field'))
+        data = self.json('GET', self.api('field'), kind=list)
         out = []
-        for f in data if isinstance(data, list) else []:
+        for f in data:
+            if not isinstance(f, dict):
+                continue
             fid = f.get('id') or ''
             ftype = (f.get('schema') or {}).get('type')
             if fid in TIME_FIELD_NAMES or ftype == 'number':
@@ -367,14 +408,20 @@ class JiraClient:
 
 
 def _error_text(resp):
+    """Сообщения об ошибке из ответа Jira (errorMessages, errors, message). Произвольное тело ответа
+    не показывается: адрес мог указывать не на Jira."""
     try:
         data = resp.json()
     except ValueError:
-        return (resp.text or '')[:200].strip()
-    messages = list(data.get('errorMessages') or [])
-    messages += [f'{k}: {v}' for k, v in (data.get('errors') or {}).items()]
-    if not messages and data.get('message'):
-        messages.append(str(data['message']))
+        return ''
+    if not isinstance(data, dict):
+        return ''
+    messages = [str(m) for m in (data.get('errorMessages') or []) if isinstance(data.get('errorMessages'), list)]
+    errors = data.get('errors')
+    if isinstance(errors, dict):
+        messages += [f'{k}: {v}' for k, v in errors.items()]
+    if not messages and isinstance(data.get('message'), str):
+        messages.append(data['message'])
     return '; '.join(messages)[:300]
 
 
@@ -587,6 +634,7 @@ def compute_history(client, structure_id, mappings, field_map, moments, progress
         items = []
         for it in current:
             issues = []
+            raw = {metric: [] for metric in METRICS}  # значения полей до перевода в часы — округление один раз, как в срезе
             for cur in it['issues']:
                 if cur['key'] not in data:
                     continue
@@ -600,10 +648,13 @@ def compute_history(client, structure_id, mappings, field_map, moments, progress
                 f = dict(values, __key=cur['key'], summary=cur['summary'],
                          status={'name': name, 'statusCategory': {'key': category}})
                 issues.append(issue_detail(f, field_map, cur['container']))
+                for metric in METRICS:
+                    if field_map[metric]['field']:
+                        raw[metric].append(values.get(field_map[metric]['field']))
             totals = {}
             for metric in METRICS:
                 spec = field_map[metric]
-                totals[metric] = sum_hours([i[metric] for i in issues], 'hours') if spec['field'] else None
+                totals[metric] = sum_hours(raw[metric], spec['unit']) if spec['field'] else None
             items.append(dict(serviceId=it['serviceId'], issueCount=len(issues), warnings=[], issues=issues, **totals))
         out[day] = items
     if keys and not any(it['issueCount'] for items in out.values() for it in items):

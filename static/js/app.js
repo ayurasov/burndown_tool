@@ -53,6 +53,15 @@ function api(url, opts){
   });
 }
 
+/* Подсказка из title недоступна на телефоне и с клавиатуры: касание, щелчок или Enter показывают её внизу экрана */
+document.addEventListener('click', function(e){
+  var el = e.target.closest && e.target.closest('[data-tip]');
+  if(el) toast(el.dataset.tip.replace(/\n/g, ' · '));
+});
+document.addEventListener('keydown', function(e){
+  if(e.key === 'Enter' && e.target.dataset && e.target.dataset.tip) toast(e.target.dataset.tip.replace(/\n/g, ' · '));
+});
+
 /* Ошибки API уже показаны пользователю в toast — не засоряем консоль */
 window.addEventListener('unhandledrejection', function(e){ if(e.reason && e.reason.handled) e.preventDefault(); });
 function apiPost(url, data){ return api(url, {method:'POST', body:JSON.stringify(data||{})}); }
@@ -89,14 +98,25 @@ function openModal(opts){
   confirmModal.classList.toggle('modal-xl', opts.size === 'xl');
   confirmCancel.hidden = !!opts.noCancel;
   modalOkHandler = opts.onOk || null;
+  if(!confirmModal.classList.contains('show')) modalReturnFocus = document.activeElement;
   confirmModal.classList.add('show');
+  document.getElementById('appRoot').inert = true;  /* страница под окном недоступна с клавиатуры и для экранного диктора */
   var first = confirmBody.querySelector('input:not([type=file]):not([disabled]),select,textarea');
-  (first || confirmOk).focus();
+  /* в подтверждении удаления фокус — на «Отмена», чтобы Enter не удалял по ошибке */
+  (first || (opts.danger && !opts.noCancel ? confirmCancel : confirmOk)).focus();
 }
+var modalReturnFocus = null;
 function closeModal(){
   confirmOk.disabled = false;
   confirmModal.classList.remove('show');
   modalOkHandler = null;
+  document.getElementById('appRoot').inert = false;
+  if(modalReturnFocus && document.contains(modalReturnFocus)) modalReturnFocus.focus();
+  modalReturnFocus = null;
+}
+function modalFocusables(){
+  return Array.prototype.filter.call(confirmModal.querySelectorAll('a[href],button,input,select,textarea,[tabindex]:not([tabindex="-1"])'),
+    function(el){ return !el.disabled && !el.hidden && el.type !== 'hidden' && el.offsetParent !== null; });
 }
 function askConfirm(title, body, cb, okLabel){
   openModal({title:title, text:body, okLabel:okLabel || 'Удалить', danger:true, onOk:cb});
@@ -109,7 +129,23 @@ confirmOk.addEventListener('click', function(){
 confirmCancel.addEventListener('click', closeModal);
 confirmModal.addEventListener('mousedown', function(e){ if(e.target === confirmModal) closeModal(); });
 document.addEventListener('keydown', function(e){
-  if(e.key === 'Escape' && confirmModal.classList.contains('show')) closeModal();
+  if(!confirmModal.classList.contains('show')) return;
+  if(e.key === 'Escape'){ closeModal(); return; }
+  if(e.key === 'Tab'){  /* фокус не уходит из окна */
+    var items = modalFocusables();
+    if(!items.length) return;
+    var firstEl = items[0], lastEl = items[items.length - 1];
+    if(e.shiftKey && document.activeElement === firstEl){ lastEl.focus(); e.preventDefault(); }
+    else if(!e.shiftKey && document.activeElement === lastEl){ firstEl.focus(); e.preventDefault(); }
+    return;
+  }
+  /* Enter в поле формы — как «Сохранить» (кроме многострочных полей и полей выбора файла) */
+  var t = e.target;
+  if(e.key === 'Enter' && modalOkHandler && !confirmOk.disabled && confirmBody.contains(t) && t.tagName === 'INPUT' &&
+     ['checkbox', 'radio', 'file', 'button', 'submit'].indexOf(t.type) === -1 && !e.isComposing){
+    e.preventDefault();
+    confirmOk.click();
+  }
 });
 
 function fmtNum(v){
@@ -198,6 +234,11 @@ function fmtDate(d){
   if(!d) return '—';
   return d.split('-').reverse().join('.');
 }
+/* «04.12.2026 — 18.12.2026»; одинаковые границы — одна дата; нет даты — «не сгорает» */
+function fmtDateRange(a, b){
+  var fa = a ? fmtDate(a) : 'не сгорает', fb = b ? fmtDate(b) : 'не сгорает';
+  return fa === fb ? fa : fa + ' — ' + fb;
+}
 function fmtShortDate(d){ return d.slice(5).split('-').reverse().join('.'); }
 function isNum(v){ return v !== null && v !== undefined && !isNaN(v); }
 /* Ячейка burn rate: отрицательное значение = остаток вырос */
@@ -249,10 +290,30 @@ themeToggle.addEventListener('click', function(){
 var appRoot = document.getElementById('appRoot');
 var sidebarToggle = document.getElementById('sidebarToggle');
 var sidebarScrim = document.getElementById('sidebarScrim');
-function setSidebarCollapsed(collapsed){ appRoot.classList.toggle('collapsed', collapsed); }
-sidebarToggle.addEventListener('click', function(){ setSidebarCollapsed(!appRoot.classList.contains('collapsed')); });
+var sidebarEl = document.querySelector('.sidebar');
+var mobileLayout = window.matchMedia('(max-width: 900px)');
+function setSidebarCollapsed(collapsed){
+  appRoot.classList.toggle('collapsed', collapsed);
+  sidebarEl.inert = collapsed;  /* скрытое меню не попадает в обход клавишей Tab */
+  sidebarToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+}
+sidebarToggle.addEventListener('click', function(){
+  var open = appRoot.classList.contains('collapsed');
+  setSidebarCollapsed(!open);
+  if(open && mobileLayout.matches){  /* на телефоне фокус — в открытое меню */
+    var target = sidebarEl.querySelector('.nav-item.active') || sidebarEl.querySelector('.nav-item');
+    if(target) target.focus();
+  }
+});
 sidebarScrim.addEventListener('click', function(){ setSidebarCollapsed(true); });
-if(window.matchMedia('(max-width: 900px)').matches) setSidebarCollapsed(true);
+document.addEventListener('keydown', function(e){
+  if(e.key === 'Escape' && mobileLayout.matches && !appRoot.classList.contains('collapsed') &&
+     !confirmModal.classList.contains('show')){
+    setSidebarCollapsed(true);
+    sidebarToggle.focus();
+  }
+});
+setSidebarCollapsed(mobileLayout.matches);
 
 document.getElementById('btnLogout').addEventListener('click', function(){
   apiPost('/api/auth/logout').then(function(){ window.location.href = '/login'; });
@@ -408,7 +469,9 @@ function monteCarloForecast(dates, remainingVals, targetDate){
   var intervals = burnIntervals(pts);
   if(intervals.length < 2) return null;
   var last = pts[pts.length-1];
-  var key = JSON.stringify([intervals, last, targetDate || '']);
+  /* ключ — тот же, что у сервера (forecast.py mc_key): цифры в письмах совпадают с дашбордом */
+  var key = intervals.map(function(it){ return it.end + ':' + it.len + ':' + it.rate.toFixed(6); }).join(';') +
+    '|' + last.d + ':' + last.y.toFixed(6) + '|' + (targetDate || '');
   if(mcCache[key]) return mcCache[key];
   var res;
   if(last.y <= 0){
@@ -442,12 +505,12 @@ function monteCarloForecast(dates, remainingVals, targetDate){
 }
 function probabilityCell(mc){
   if(!mc) return '<td class="num muted-cell" title="Нужно не меньше трёх замеров остатка">—</td>';
-  var range = 'Диапазон 70%: '+(mc.p15 ? fmtDate(mc.p15) : 'не сгорает')+' — '+(mc.p85 ? fmtDate(mc.p85) : 'не сгорает')+
+  var range = 'Диапазон 70%: '+fmtDateRange(mc.p15, mc.p85)+
     '\nМедиана (P50): '+(mc.p50 ? fmtDate(mc.p50) : 'не сгорает')+'\nПо '+mc.intervals+' интервалам между замерами';
   if(mc.probability === null) return '<td class="num muted-cell" title="'+escapeAttr('Нет цели. '+range)+'">—</td>';
   var pct = Math.round(mc.probability * 100);
   var cls = pct >= 80 ? 'prob-high' : (pct >= 50 ? 'prob-mid' : 'prob-low');
-  return '<td class="num nowrap"><span class="prob '+cls+'" title="'+escapeAttr(range)+'">'+pct+'%</span></td>';
+  return '<td class="num nowrap"><span class="prob '+cls+'" title="'+escapeAttr(range)+'" data-tip="'+escapeAttr(range)+'" tabindex="0">'+pct+'%</span></td>';
 }
 
 /* Изменение оценки (объёма работ) от первого до последнего заполненного значения */
@@ -624,7 +687,7 @@ function baseChartOptions(yTitle, extraTooltipCtx){
 function renderLegend(containerId, datasets){
   var el = document.getElementById(containerId);
   if(!el) return;
-  el.innerHTML = datasets.filter(function(d){ return !d.hideInLegend; }).map(function(d){
+  el.innerHTML = datasets.filter(function(d){ return !d.hideInLegend && d.label; }).map(function(d){
     return '<span><span class="legend-dot'+(d.isRange ? ' legend-range' : '')+'" style="background:'+(d.isRange ? d.backgroundColor : d.borderColor)+'"></span>'+escapeHtml(d.label)+'</span>';
   }).join('');
 }
@@ -639,7 +702,7 @@ function rangeDatasets(stat){
   var span = Math.max(1, daysBetween(start, mc.p85));
   var upperAtP15 = rem * (1 - daysBetween(start, mc.p15) / span);
   return [
-    {label: 'Диапазон прогноза 70%: ' + fmtDate(mc.p15) + ' — ' + fmtDate(mc.p85),
+    {label: 'Диапазон прогноза 70%: ' + fmtDateRange(mc.p15, mc.p85),
      data: [{x: start, y: rem}, {x: mc.p15, y: 0}, {x: mc.p85, y: 0}],
      borderColor: color + '66', backgroundColor: color + '1f', borderWidth: 1, pointRadius: 0, tension: 0, isRange: true},
     {label: '', data: [{x: start, y: rem}, {x: mc.p15, y: Math.max(0, upperAtP15)}, {x: mc.p85, y: 0}],
@@ -657,7 +720,8 @@ function avgLineDataset(dates, burnRate, lastRemaining, lastDate){
   return {
     label: 'Средняя динамика (' + fmtNum(burnRate) + ' ч/день)',
     data: [{x: baseDate, y: Math.max(0,startVal)}, {x: lastDate, y: Math.max(0,lastRemaining)}],
-    borderColor: getCss('--color-success'), borderDash: [6,4], pointRadius: 0, borderWidth: 1.5, tension: 0
+    /* нейтральный серый: зелёный совпадал с цветом одного из эпиков на графике этапа */
+    borderColor: getCss('--color-text-muted'), borderDash: [6,4], pointRadius: 0, borderWidth: 1.5, tension: 0
   };
 }
 
@@ -675,6 +739,12 @@ function targetLineDataset(lastDate, lastValue, targetDate, label){
 function forecastDataset(reg, baseDate, firstDate, lastRow, targetDate){
   if(!reg) return null;
   var endDate = targetDate || addDays(lastRow.date, 21);
+  /* цель уже прошла или прогноз «0» позже неё — линия доводится до нуля (не дальше полугода), а не обрывается в воздухе */
+  if(reg.slope < 0){
+    var zeroDate = addDays(baseDate, Math.ceil(-reg.intercept / reg.slope));
+    var cap = addDays(lastRow.date, 180);
+    if(zeroDate > endDate) endDate = zeroDate < cap ? zeroDate : (cap > endDate ? cap : endDate);
+  }
   var startX = daysBetween(baseDate, firstDate);
   var endX = Math.max(daysBetween(baseDate, endDate), startX + 1);
   var forecastPts = [];
@@ -701,6 +771,28 @@ function buildDatasetsForMetric(metric, serviceIds){
 /* ════════════════════════════════════════════════════════════════
    Chart rendering
 ════════════════════════════════════════════════════════════════ */
+/* Пустой график: вместо осей 0–1 без линий — пояснение, что показать нечего и почему. message = null — график есть */
+function setChartEmpty(canvasId, message){
+  var canvas = document.getElementById(canvasId);
+  var wrap = canvas.parentElement;
+  var note = wrap.querySelector('.chart-empty');
+  canvas.hidden = !!message;
+  if(!message){ if(note) note.remove(); return false; }
+  if(!note){ note = document.createElement('div'); note.className = 'chart-empty'; wrap.appendChild(note); }
+  note.textContent = message;
+  return true;
+}
+function noEpicsMessage(){
+  return STATE.services.length ? 'Не выбран ни один эпик — отметьте эпики в фильтре «Эпики на дашборде»'
+    : 'В проекте пока нет эпиков — добавьте их в разделе «Эпики (блоки задач)»';
+}
+function noValuesMessage(rows, metric){
+  if(!rows.length) return 'По эпику ещё нет замеров — внесите их в разделе «Данные по датам»';
+  if(!rows.some(function(r){ return isNum(r[metric]); })) return 'Значения «' + HOUR_LABELS[metric] + '» по эпику не вносились';
+  return null;
+}
+var HOUR_LABELS = {remaining: 'Остаток', spent: 'Затрачено', estimate: 'Оценка'};
+
 function renderEpicCharts(){
   renderEpicRemainingChart();
   renderEpicSpentChart();
@@ -713,8 +805,9 @@ function renderEpicRemainingChart(){
   destroyChart('epicRemaining');
   var sid = parseInt(document.getElementById('chartServiceSelect').value, 10);
   var svc = serviceById(sid);
-  if(!svc){ document.getElementById('legendRemaining').innerHTML = ''; return; }
+  if(!svc){ document.getElementById('legendRemaining').innerHTML = ''; setChartEmpty('chartRemaining', noEpicsMessage()); return; }
   var rows = entriesForService(sid);
+  if(setChartEmpty('chartRemaining', noValuesMessage(rows, 'remaining'))){ document.getElementById('legendRemaining').innerHTML = ''; return; }
   var stat = computeServiceStatus(sid);
   var palette = colorPalette();
 
@@ -752,6 +845,10 @@ function renderEpicSpentChart(){
   var sid = parseInt(document.getElementById('chartServiceSelect').value, 10);
   var svc = serviceById(sid);
   var rows = svc ? entriesForService(sid) : [];
+  if(setChartEmpty('chartSpentEpic', svc ? noValuesMessage(rows, 'spent') : noEpicsMessage())){
+    document.getElementById('legendSpentEpic').innerHTML = '';
+    return;
+  }
   var palette = colorPalette();
   var data = rows.map(function(r){ return {x:r.date, y:r.spent}; });
   var datasets = [{ label: svc ? svc.name : '', data: data, borderColor: palette[1], backgroundColor: palette[1]+'33', spanGaps:true, tension:0.25, cubicInterpolationMode:'monotone', pointRadius:3, borderWidth:2 }];
@@ -765,6 +862,10 @@ function renderEpicEstimateChart(){
   var sid = parseInt(document.getElementById('chartServiceSelect').value, 10);
   var svc = serviceById(sid);
   var rows = svc ? entriesForService(sid) : [];
+  if(setChartEmpty('chartEstimateEpic', svc ? noValuesMessage(rows, 'estimate') : noEpicsMessage())){
+    document.getElementById('legendEstimateEpic').innerHTML = '';
+    return;
+  }
   var palette = colorPalette();
   var data = rows.map(function(r){ return {x:r.date, y:r.estimate}; });
   var datasets = [{ label: svc ? svc.name : '', data: data, borderColor: palette[2], backgroundColor: palette[2]+'33', spanGaps:true, tension:0.25, cubicInterpolationMode:'monotone', pointRadius:3, borderWidth:2 }];
@@ -783,21 +884,17 @@ allEpicsBlock.addEventListener('toggle', function(){
 function renderAllEpicsCharts(){
   ['allRemaining','allSpent','allEstimate'].forEach(destroyChart);
   if(!allEpicsBlock.open) return;  /* свёрнутый блок не рисуем — графики построятся при раскрытии */
-  destroyChart('allRemaining');
   var ids = visibleDashboardServices().map(function(s){ return s.id; });
-  var datasets = buildDatasetsForMetric('remaining', ids);
-  renderLegend('legendRemainingAll', datasets);
-  charts.allRemaining = new Chart(document.getElementById('chartRemainingAll'), {type:'line', data:{datasets:datasets}, options: baseChartOptions('Часы (Ост.время)')});
-
-  destroyChart('allSpent');
-  var spentDs = buildDatasetsForMetric('spent', ids);
-  renderLegend('legendSpent', spentDs);
-  charts.allSpent = new Chart(document.getElementById('chartSpent'), {type:'line', data:{datasets:spentDs}, options: baseChartOptions('Часы')});
-
-  destroyChart('allEstimate');
-  var estDs = buildDatasetsForMetric('estimate', ids);
-  renderLegend('legendEstimate', estDs);
-  charts.allEstimate = new Chart(document.getElementById('chartEstimate'), {type:'line', data:{datasets:estDs}, options: baseChartOptions('Часы')});
+  [['remaining', 'allRemaining', 'chartRemainingAll', 'legendRemainingAll', 'Часы (Ост.время)'],
+   ['spent', 'allSpent', 'chartSpent', 'legendSpent', 'Часы'],
+   ['estimate', 'allEstimate', 'chartEstimate', 'legendEstimate', 'Часы']].forEach(function(c){
+    var hasValues = ids.some(function(sid){ return entriesForService(sid).some(function(r){ return isNum(r[c[0]]); }); });
+    var empty = !ids.length ? noEpicsMessage() : (hasValues ? null : 'Значения «' + HOUR_LABELS[c[0]] + '» по выбранным эпикам не вносились');
+    if(setChartEmpty(c[2], empty)){ document.getElementById(c[3]).innerHTML = ''; return; }
+    var datasets = buildDatasetsForMetric(c[0], ids);
+    renderLegend(c[3], datasets);
+    charts[c[1]] = new Chart(document.getElementById(c[2]), {type:'line', data:{datasets:datasets}, options: baseChartOptions(c[4])});
+  });
 }
 
 function refreshCharts(){
@@ -856,7 +953,7 @@ function renderSummaryTable(){
             mc:stat.mc, probability:stat.mc ? stat.mc.probability : null};
   });
   if(!rows.length){
-    html += '<tr><td colspan="9" class="empty-cell">Нет эпиков для отображения — проверьте фильтр выше.</td></tr>';
+    html += '<tr><td colspan="9" class="empty-cell">'+(STATE.services.length ? 'Нет эпиков для отображения — проверьте фильтр выше.' : 'В проекте пока нет эпиков — добавьте их в разделе «Эпики (блоки задач)».')+'</td></tr>';
   }
   applyTableSort('summaryTable', rows).forEach(function(r){
     html += '<tr'+(r.isDone?' class="done-row"':'')+'><td class="nowrap">'+escapeHtml(r.etap)+'</td><td>'+escapeHtml(r.name)+'</td><td class="num">'+hoursToStr(r.remaining)+'</td>'+rateCell(r.burnRate,' ч')+scopeCell(r.scope)+'<td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+forecastText(r)+'</td>'+probabilityCell(r.mc)+'<td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
@@ -1211,11 +1308,13 @@ function renderDataView(){
   document.getElementById('dataEmptyHint').style.display = rows.length ? 'none' : '';
   table.style.display = rows.length ? '' : 'none';
 
-  var numInput = function(r, field){ return '<input type="number" step="0.01" min="0" value="'+(r[field] ?? '')+'" data-field="'+field+'">'; };
+  var numInput = function(r, field){ return '<input type="number" step="0.01" min="0" value="'+(r[field] ?? '')+'" data-field="'+field+'" aria-label="'+HOUR_LABELS[field]+', ч, '+fmtDate(r.date)+'">'; };
   var html = '<colgroup><col class="col-date"><col class="col-num"><col class="col-num"><col class="col-num"><col class="col-actions"></colgroup>'+
-    '<thead><tr><th class="sortable" data-sort="date">Дата</th><th class="sortable" data-sort="remaining">Остаток, ч</th><th class="sortable" data-sort="spent">Затрачено, ч</th><th class="sortable" data-sort="estimate">Оценка, ч</th><th></th></tr></thead><tbody>';
+    '<thead><tr><th class="sortable" data-sort="date">Дата</th><th class="sortable" data-sort="remaining">Остаток, ч</th><th class="sortable" data-sort="spent">Затрачено, ч</th><th class="sortable" data-sort="estimate">Оценка, ч</th><th class="actions-col"></th></tr></thead><tbody>';
   rows.forEach(function(r){
-    html += '<tr data-id="'+r.id+'"><td><input type="date" value="'+r.date+'" data-field="date" required></td><td>'+numInput(r,'remaining')+'</td><td>'+numInput(r,'spent')+'</td><td>'+numInput(r,'estimate')+'</td><td class="row-actions">'+actionBtn('delete','Удалить',ICON_DELETE)+'</td></tr>';
+    html += '<tr data-id="'+r.id+'"><td data-label="Дата"><input type="date" value="'+r.date+'" data-field="date" required aria-label="Дата замера"></td>'+
+      '<td data-label="Остаток, ч">'+numInput(r,'remaining')+'</td><td data-label="Затрачено, ч">'+numInput(r,'spent')+'</td>'+
+      '<td data-label="Оценка, ч">'+numInput(r,'estimate')+'</td><td class="row-actions">'+actionBtn('delete','Удалить',ICON_DELETE)+'</td></tr>';
   });
   html += '</tbody>';
   table.innerHTML = html;
@@ -1278,7 +1377,7 @@ function renderServicesView(){
   var table = document.getElementById('servicesTable');
   var groupHint = 'Группа для «Свода по этапам»; пусто — группировка по этапу';
   var html = '<colgroup><col class="col-drag"><col class="col-etap"><col class="col-name"><col class="col-target"><col class="col-done"><col class="col-group"><col class="col-count"><col class="col-actions"></colgroup>'+
-    '<thead><tr><th></th><th class="sortable" data-sort="etap">Этап</th><th class="sortable" data-sort="name">Название эпика</th><th class="sortable" data-sort="targetDate">Целевая дата</th><th class="center" title="Сданный функционал не учитывается в рамках этапа">Сдано</th><th class="sortable" data-sort="stageGroup" title="'+groupHint+'">Группа в своде</th><th class="sortable num" data-sort="count">Замеров</th><th></th></tr></thead><tbody>';
+    '<thead><tr><th class="drag-col"></th><th class="sortable" data-sort="etap">Этап</th><th class="sortable" data-sort="name">Название эпика</th><th class="sortable" data-sort="targetDate">Целевая дата</th><th class="center" title="Сданный функционал не учитывается в рамках этапа">Сдано</th><th class="sortable" data-sort="stageGroup" title="'+groupHint+'">Группа в своде</th><th class="sortable num" data-sort="count">Замеров</th><th class="actions-col"></th></tr></thead><tbody>';
   var services = getSortedServices();
   if(!services.length){
     html += '<tr><td colspan="8" class="empty-cell">Эпиков пока нет — добавьте первый.</td></tr>';
@@ -1402,7 +1501,10 @@ function saveSettings(prevSettings){
    Admin: User management
 ════════════════════════════════════════════════════════════════ */
 var allUsersCache = [];
-function field(label, inputHtml){ return '<div class="setting-item"><label class="small">'+label+'</label>'+inputHtml+'</div>'; }
+function field(label, inputHtml){
+  var id = /\bid="([^"]+)"/.exec(inputHtml);  /* подпись связана с полем — щелчок по ней и экранный диктор находят поле */
+  return '<div class="setting-item"><label class="small"'+(id ? ' for="'+id[1]+'"' : '')+'>'+label+'</label>'+inputHtml+'</div>';
+}
 function roleOptions(current){
   return ['user','manager','admin'].map(function(r){
     var label = r === 'manager' ? 'Руководитель проекта' : ROLE_LABELS[r];
@@ -1644,11 +1746,12 @@ function updateRoleUI(){
   var admin = isGlobalAdmin();
   document.getElementById('readonlyBanner').style.display = (!canEdit() && currentProjectId) ? '' : 'none';
   document.getElementById('adminNav').style.display = admin ? '' : 'none';
-  ['navUsers','navProjects','navAudit','btnExport'].forEach(function(id){ document.getElementById(id).style.display = admin ? '' : 'none'; });
+  ['navUsers','navProjects','navAudit','navNotifyAdmin','btnExport'].forEach(function(id){ document.getElementById(id).style.display = admin ? '' : 'none'; });
   document.getElementById('navSettings').style.display = canEdit() ? '' : 'none';
   document.getElementById('navJira').style.display = canEdit() ? '' : 'none';
   document.getElementById('navAutofill').style.display = canEdit() ? '' : 'none';
   document.getElementById('sectionsNav').style.display = currentProjectId ? '' : 'none';
+  document.getElementById('defaultPwWarning').hidden = !(currentUser && currentUser.defaultPassword);
   if(currentUser){
     document.getElementById('userInfo').innerHTML = userAvatarHtml(currentUser, 'avatar')+
       '<div class="user-info-text"><span class="user-info-name">'+escapeHtml(currentUser.displayName||currentUser.username)+'</span>'+roleBadge(currentUser.role)+'</div>';
@@ -1661,7 +1764,7 @@ function updateRoleUI(){
 var navItems = document.querySelectorAll('.nav-item');
 var pageTitle = document.getElementById('pageTitle');
 var pageSub = document.getElementById('pageSub');
-var ADMIN_VIEWS = ['users', 'projects', 'audit'];
+var ADMIN_VIEWS = ['users', 'projects', 'audit', 'notifyAdmin'];
 var PDF_VIEWS = ['dashboard', 'stages', 'data'];
 var titles = {
   dashboard: ['Дашборд сгорания', 'Свод по эпикам и этапам'],
@@ -1671,6 +1774,8 @@ var titles = {
   settings: ['Настройки проекта', 'Параметры прогноза и расчёта burn rate'],
   jira: ['Связь с Jira', 'Подключение и кнопки среза данных из Structure'],
   autofill: ['Автозаполнение', 'Срез из Jira по расписанию'],
+  notify: ['Уведомления', 'Дайджест и оповещения по проекту'],
+  notifyAdmin: ['Рассылки', 'Почта, Telegram-бот и журнал отправок'],
   users: ['Управление пользователями', 'Пользователи, роли и доступ к проектам'],
   projects: ['Управление проектами', 'Создание, редактирование и удаление проектов'],
   audit: ['Реестр изменений', 'Журнал всех изменений с фильтрами']
@@ -1695,7 +1800,8 @@ function navigate(view){
     pageSub.textContent = titles[view][1] + (ADMIN_VIEWS.indexOf(view) === -1 ? projectTitleSuffix() : '');
   }
   var renderers = {dashboard:renderDashboard, stages:renderStagesView, data:renderDataView, services:renderServicesView,
-    settings:renderSettingsView, jira:renderJiraView, autofill:renderAutofillView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); }};
+    settings:renderSettingsView, jira:renderJiraView, autofill:renderAutofillView, notify:renderNotifyView,
+    notifyAdmin:renderNotifyAdminView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); }};
   if(renderers[view] && (currentProjectId || ADMIN_VIEWS.indexOf(view) !== -1)) renderers[view]();
   var reportView = PDF_VIEWS.indexOf(view) !== -1 && currentProjectId;
   document.getElementById('btnPdf').style.display = reportView ? '' : 'none';
@@ -1856,7 +1962,7 @@ function openBulkMeasurement(opts){
         '<button type="button" class="btn btn-ghost btn-sm" id="bulkFillPrev" title="Заполнить пустые поля значениями предыдущего замера">Подставить прошлые значения</button>'+
       '</div>'+
       (opts.intro ? '<p class="bulk-note bulk-intro">'+opts.intro+'</p>' : '')+
-      '<p class="bulk-note">Пустые строки не сохраняются. Если замер на эту дату уже есть, он будет обновлён. Серым показаны значения предыдущего замера'+(opts.services ? '' : '; сданные эпики не выводятся')+'.</p>'+
+      '<p class="bulk-note">Пустые строки не сохраняются. Если замер на эту дату уже есть, он будет обновлён; пустое поле не меняет уже внесённое значение. Серым показаны значения предыдущего замера'+(opts.services ? '' : '; сданные эпики не выводятся')+'.</p>'+
       '<div class="table-scroll"><table class="data-table compact-table bulk-table" id="bulkTable"><thead><tr><th>Эпик</th><th class="num">Остаток, ч</th><th class="num">Затрачено, ч</th><th class="num">Оценка, ч</th></tr></thead><tbody>'+
       services.map(function(s){
         return '<tr data-sid="'+s.id+'"><td><span class="bulk-etap">'+escapeHtml(s.etap)+'</span> '+escapeHtml(s.name)+noteHtml(s.id)+'</td>'+
@@ -2797,7 +2903,7 @@ function openHistoryRestore(button){
         field('Шаг', '<select id="hrStep"><option value="week">раз в неделю</option><option value="day">каждый день</option></select>')+
         field('Часовой пояс', '<select id="hrTz">'+zones.map(function(z){ return '<option value="'+escapeAttr(z)+'"'+(z === tz ? ' selected' : '')+'>'+escapeHtml(z)+'</option>'; }).join('')+'</select>')+
       '</div>'+
-      '<label class="quick-filter-item"><input type="checkbox" id="hrKeep" checked> Не изменять даты, где замер уже внесён</label>'+
+      '<label class="quick-filter-item check-wrap"><input type="checkbox" id="hrKeep" checked> Не изменять даты, где замер уже внесён</label>'+
       '<ul class="bulk-note history-notes">'+
         '<li>Берётся текущий состав задач кнопки: задачи учитываются с даты их создания; задачи, которые раньше были в структуре и потом убраны, не учитываются.</li>'+
         '<li>Стандартные поля учёта времени и статусы восстанавливаются точно. Для пользовательских полей — если Jira пишет их изменения в журнал.</li>'+
@@ -2842,6 +2948,215 @@ function showHistoryProgress(button, job){
       if(render(j)) clearInterval(timer);
     }).catch(function(){ clearInterval(timer); });
   }, 1000);
+}
+
+
+/* ════════════════════════════════════════════════════════════════
+   Уведомления: подписка пользователя на проект (дайджест и оповещения)
+════════════════════════════════════════════════════════════════ */
+var notifyState = null;
+var nfForm = document.getElementById('notifyForm');
+
+function renderNotifyView(){
+  var pid = currentProjectId;
+  api('/api/projects/'+pid+'/notifications').then(function(data){
+    if(pid !== currentProjectId) return;
+    notifyState = data;
+    fillNotifyForm(data);
+  }).catch(function(){});
+}
+
+function fillNotifyForm(d){
+  var ch = d.channels;
+  document.getElementById('nfViaEmail').checked = d.viaEmail;
+  document.getElementById('nfViaTelegram').checked = d.viaTelegram;
+  document.getElementById('nfEmailState').innerHTML = !ch.emailReady ?
+    '<span class="muted-cell">Администратор ещё не настроил отправку почты</span>' :
+    (ch.email ? escapeHtml(ch.email) : '<span class="prob-low">В профиле не указан email — обратитесь к администратору</span>');
+  document.getElementById('nfTelegramState').innerHTML = !ch.telegramReady ?
+    '<span class="muted-cell">Администратор ещё не подключил Telegram-бота</span>' :
+    (ch.telegramLinked ? '<span class="prob-high">✓ Привязан</span>' + (ch.botName ? ' <span class="muted-cell">бот @' + escapeHtml(ch.botName) + '</span>' : '') :
+      '<span class="muted-cell">Не привязан</span>');
+  document.getElementById('nfTelegramLink').hidden = !ch.telegramReady || ch.telegramLinked;
+  document.getElementById('nfTelegramUnlink').hidden = !ch.telegramLinked;
+  var dg = d.digest;
+  document.getElementById('nfDigestOn').checked = dg.enabled;
+  document.getElementById('nfDays').innerHTML = WEEKDAYS.map(function(w){
+    return '<label><input type="checkbox" data-day="'+w[0]+'"'+(dg.days.indexOf(w[0]) !== -1 ? ' checked' : '')+'><span>'+w[1]+'</span></label>';
+  }).join('');
+  document.getElementById('nfTime').value = dg.time;
+  var browserTz = '';
+  try { browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch(e){}
+  var zones = TIMEZONES.slice();
+  [dg.timezone, browserTz].forEach(function(z){ if(z && zones.indexOf(z) === -1) zones.push(z); });
+  document.getElementById('nfTz').innerHTML = zones.map(function(z){
+    return '<option value="'+escapeAttr(z)+'"'+(z === dg.timezone ? ' selected' : '')+'>'+escapeHtml(z)+(z === browserTz ? ' — ваш' : '')+'</option>';
+  }).join('');
+  document.getElementById('nfPdf').checked = dg.pdf;
+  document.getElementById('nfDigestStatus').innerHTML =
+    '<dt>Последний дайджест</dt><dd>'+(dg.lastAt ? fmtDateTime(dg.lastAt) + ' — <span class="autofill-result '+(dg.lastStatus === 'ok' ? 'ok' : 'error')+'">'+escapeHtml(dg.lastMessage || '')+'</span>' : '—')+'</dd>'+
+    '<dt>Следующий</dt><dd>'+(dg.enabled && dg.nextAt ? fmtLocalIso(dg.nextAt) + ' <span class="muted-cell">('+escapeHtml(dg.timezone)+')</span>' : '<span class="muted-cell">дайджест выключен</span>')+'</dd>';
+  var al = d.alerts;
+  document.getElementById('nfAlertsOn').checked = al.enabled;
+  document.querySelectorAll('#nfAlertTypes [data-type]').forEach(function(cb){ cb.checked = al.types.indexOf(cb.dataset.type) !== -1; });
+  document.getElementById('nfChance').value = al.chanceThreshold;
+  document.getElementById('nfScope').value = al.scopeThreshold;
+}
+
+function notifyFormData(){
+  return {
+    viaEmail: document.getElementById('nfViaEmail').checked,
+    viaTelegram: document.getElementById('nfViaTelegram').checked,
+    digest: {enabled: document.getElementById('nfDigestOn').checked,
+             days: Array.prototype.map.call(document.querySelectorAll('#nfDays [data-day]:checked'), function(c){ return parseInt(c.dataset.day, 10); }),
+             time: document.getElementById('nfTime').value, timezone: document.getElementById('nfTz').value,
+             pdf: document.getElementById('nfPdf').checked},
+    alerts: {enabled: document.getElementById('nfAlertsOn').checked,
+             types: Array.prototype.map.call(document.querySelectorAll('#nfAlertTypes [data-type]:checked'), function(c){ return c.dataset.type; }),
+             chanceThreshold: parseInt(document.getElementById('nfChance').value, 10) || 50,
+             scopeThreshold: parseInt(document.getElementById('nfScope').value, 10) || 10}
+  };
+}
+
+nfForm.addEventListener('submit', function(e){
+  e.preventDefault();
+  apiPut('/api/projects/'+currentProjectId+'/notifications', notifyFormData()).then(function(data){
+    notifyState = data;
+    fillNotifyForm(data);
+    toast('Настройки уведомлений сохранены');
+  }).catch(function(){});
+});
+
+document.getElementById('nfPreview').addEventListener('click', function(){
+  api('/api/projects/'+currentProjectId+'/notifications/preview').then(function(data){
+    openModal({title: data.subject, size: 'xl', okLabel: 'Закрыть', noCancel: true,
+      html: '<iframe class="digest-preview" title="Предпросмотр дайджеста" sandbox></iframe>'});
+    confirmBody.querySelector('iframe').srcdoc = '<!doctype html><meta charset="utf-8"><body style="margin:16px;background:#fff">' + data.html;
+  }).catch(function(){});
+});
+
+document.getElementById('nfSendNow').addEventListener('click', function(){
+  var btn = this;
+  btn.disabled = true;
+  apiPost('/api/projects/'+currentProjectId+'/notifications/test').then(function(data){
+    toast('Дайджест отправлен: ' + data.results.map(function(r){ return r.channel === 'email' ? 'почта' : 'Telegram'; }).join(', '));
+  }).catch(function(){}).then(function(){ btn.disabled = false; renderNotifyView(); });
+});
+
+document.getElementById('nfTelegramLink').addEventListener('click', function(){
+  apiPost('/api/profile/telegram/link').then(function(link){
+    openModal({
+      title: 'Привязать Telegram', okLabel: 'Проверить',
+      html: '<ol class="telegram-steps">'+
+        '<li>Откройте бота <b>@'+escapeHtml(link.botName)+'</b> по ссылке: <a href="'+escapeAttr(link.url)+'" target="_blank" rel="noopener">'+escapeHtml(link.url)+'</a></li>'+
+        '<li>Нажмите в Telegram <b>Запустить</b> (Start).</li>'+
+        '<li>Вернитесь сюда и нажмите <b>Проверить</b>.</li></ol>'+
+        '<p class="bulk-note">Ссылка действует, пока вы не запросите новую. Бот пришлёт подтверждение.</p>',
+      onOk: function(){
+        apiPost('/api/profile/telegram/check').then(function(r){
+          if(!r.linked){ toast('Бот ещё не получил команду Start — откройте ссылку и нажмите «Запустить»'); return; }
+          closeModal();
+          toast('Telegram привязан');
+          renderNotifyView();
+        }).catch(function(){});
+        return false;
+      }
+    });
+  }).catch(function(){});
+});
+
+document.getElementById('nfTelegramUnlink').addEventListener('click', function(){
+  askConfirm('Отвязать Telegram?', 'Сообщения в Telegram перестанут приходить по всем проектам.', function(){
+    apiDelete('/api/profile/telegram').then(function(){ toast('Telegram отвязан'); renderNotifyView(); });
+  }, 'Отвязать');
+});
+
+/* ════════════════════════════════════════════════════════════════
+   Администрирование: рассылки (SMTP, Telegram-бот, журнал отправок)
+════════════════════════════════════════════════════════════════ */
+var NOTIFY_KINDS = {digest: 'Дайджест', alert: 'Оповещение', test: 'Проверка'};
+
+function renderNotifyAdminView(){
+  api('/api/admin/notify-settings').then(fillNotifyAdmin).catch(function(){});
+  loadNotifyLog();
+}
+
+function fillNotifyAdmin(d){
+  document.getElementById('naHost').value = d.smtp.host;
+  document.getElementById('naPort').value = d.smtp.port;
+  document.getElementById('naSecurity').value = d.smtp.security;
+  document.getElementById('naSender').value = d.smtp.sender;
+  document.getElementById('naLogin').value = d.smtp.login;
+  var pw = document.getElementById('naPassword');
+  pw.value = '';
+  pw.placeholder = d.smtp.hasPassword ? 'Сохранён — оставьте пустым, чтобы не менять' : 'если сервер требует входа';
+  var token = document.getElementById('naToken');
+  token.value = '';
+  token.placeholder = d.telegram.hasToken ? 'Сохранён — оставьте пустым, чтобы не менять' : '123456:ABC-DEF…';
+  var st = document.getElementById('naBotStatus');
+  st.textContent = !d.telegram.hasToken ? 'Бот не подключён' : (d.telegram.botName ? '✓ Бот @' + d.telegram.botName : 'Токен сохранён, бот не проверен');
+  st.className = 'jira-status' + (d.telegram.botName ? ' ok' : '');
+  document.getElementById('naBotRemove').hidden = !d.telegram.hasToken;
+  document.getElementById('naUrl').value = d.publicUrl;
+}
+
+function notifyAdminData(extra){
+  return Object.assign({
+    smtp: {host: document.getElementById('naHost').value.trim(), port: parseInt(document.getElementById('naPort').value, 10) || null,
+           security: document.getElementById('naSecurity').value, sender: document.getElementById('naSender').value.trim(),
+           login: document.getElementById('naLogin').value.trim(), password: document.getElementById('naPassword').value},
+    telegram: {token: document.getElementById('naToken').value.trim()},
+    publicUrl: document.getElementById('naUrl').value.trim()
+  }, extra || {});
+}
+
+function saveNotifyAdmin(extra, message){
+  return apiPut('/api/admin/notify-settings', notifyAdminData(extra)).then(function(d){
+    fillNotifyAdmin(d);
+    if(message) toast(message);
+    return d;
+  });
+}
+
+document.getElementById('notifyAdminForm').addEventListener('submit', function(e){
+  e.preventDefault();
+  saveNotifyAdmin(null, 'Настройки рассылок сохранены').catch(function(){});
+});
+document.getElementById('naTestEmail').addEventListener('click', function(){
+  var to = document.getElementById('naTestTo').value.trim();
+  if(!to){ toast('Укажите, куда отправить тестовое письмо'); return; }
+  var btn = this;
+  btn.disabled = true;
+  saveNotifyAdmin().then(function(){
+    return apiPost('/api/admin/notify-settings/test-email', {to: to});
+  }).then(function(){ toast('Тестовое письмо отправлено на ' + to); }).catch(function(){}).then(function(){
+    btn.disabled = false;
+    loadNotifyLog();
+  });
+});
+document.getElementById('naBotTest').addEventListener('click', function(){
+  saveNotifyAdmin().then(function(){
+    return apiPost('/api/admin/notify-settings/test-telegram');
+  }).then(function(r){ toast('Бот @' + r.botName + ' отвечает'); renderNotifyAdminView(); }).catch(function(){});
+});
+document.getElementById('naBotRemove').addEventListener('click', function(){
+  askConfirm('Отключить Telegram-бота?', 'Сообщения в Telegram перестанут приходить всем пользователям; привязки сохранятся.', function(){
+    saveNotifyAdmin({telegram: {clearToken: true}}, 'Telegram-бот отключён').catch(function(){});
+  }, 'Отключить');
+});
+document.getElementById('naLogReload').addEventListener('click', loadNotifyLog);
+
+function loadNotifyLog(){
+  var table = document.getElementById('notifyLogTable');
+  api('/api/admin/notify-log').then(function(rows){
+    if(!rows.length){ emptyTable(table, 'Отправок пока не было', 'Здесь появятся дайджесты, оповещения и тестовые отправки.'); return; }
+    table.innerHTML = '<thead><tr><th>Время</th><th>Кому</th><th>Проект</th><th>Что</th><th>Канал</th><th>Результат</th></tr></thead><tbody>'+
+      rows.map(function(r){
+        return '<tr><td class="mono nowrap">'+fmtDateTime(r.createdAt)+'</td><td>'+escapeHtml(r.username || '—')+'</td><td>'+escapeHtml(r.projectName || '—')+'</td>'+
+          '<td>'+escapeHtml(NOTIFY_KINDS[r.kind] || r.kind)+'</td><td>'+(r.channel === 'email' ? 'Почта' : 'Telegram')+'</td>'+
+          '<td><span class="autofill-result '+(r.status === 'ok' ? 'ok' : 'error')+'">'+(r.status === 'ok' ? '✓ ' : '✗ ')+escapeHtml(r.message || (r.status === 'ok' ? 'отправлено' : ''))+'</span></td></tr>';
+      }).join('')+'</tbody>';
+  }).catch(function(){});
 }
 
 
@@ -2896,11 +3211,11 @@ function renderAutofillView(){
         '<div class="setting-item"><span class="field-label">Дни недели</span><div class="weekday-picker">'+WEEKDAYS.map(function(d){
           return '<label><input type="checkbox" data-day="'+d[0]+'"'+(s.days.indexOf(d[0]) !== -1 ? ' checked' : '')+'><span>'+d[1]+'</span></label>';
         }).join('')+'</div></div>'+
-        '<div class="setting-item"><label class="small">Время запуска</label><input type="time" data-f="time" value="'+escapeAttr(s.time)+'" required></div>'+
-        '<div class="setting-item"><label class="small">Часовой пояс</label><select data-f="timezone">'+zones.map(function(z){
+        '<div class="setting-item"><label class="small" for="afTime'+b.id+'">Время запуска</label><input type="time" id="afTime'+b.id+'" data-f="time" value="'+escapeAttr(s.time)+'" required></div>'+
+        '<div class="setting-item"><label class="small" for="afTz'+b.id+'">Часовой пояс</label><select id="afTz'+b.id+'" data-f="timezone">'+zones.map(function(z){
           return '<option value="'+escapeAttr(z)+'"'+(z === s.timezone ? ' selected' : '')+'>'+escapeHtml(z)+(z === browserTz ? ' — ваш' : '')+'</option>';
         }).join('')+'</select></div>'+
-        '<label class="quick-filter-item autofill-overwrite"><input type="checkbox" data-f="overwrite"'+(s.overwrite ? ' checked' : '')+'> Перезаписывать замер, если на эту дату он уже внесён</label>'+
+        '<label class="quick-filter-item check-wrap autofill-overwrite"><input type="checkbox" data-f="overwrite"'+(s.overwrite ? ' checked' : '')+'> Перезаписывать замер, если на эту дату он уже внесён</label>'+
       '</fieldset>'+
       '<div class="form-actions">'+
         '<button type="button" class="btn btn-ghost btn-sm" data-action="run"'+(locked ? ' disabled' : '')+'>Запустить сейчас</button>'+
@@ -3000,6 +3315,12 @@ function readPhoto(file, cb){
 }
 
 /* Профиль — открывается по клику на блок пользователя */
+document.getElementById('defaultPwWarning').addEventListener('click', function(){
+  openProfile();
+  var pw = document.getElementById('profilePassword');
+  if(pw) pw.focus();
+});
+
 function openProfile(){
   var admin = isGlobalAdmin();
   var photo = currentUser.photo || '';  /* итоговое фото после правок в окне */
@@ -3011,7 +3332,7 @@ function openProfile(){
         '<div class="profile-photo-section">'+
           '<div id="profileAvatarBox">'+userAvatarHtml(currentUser, 'profile-avatar')+'</div>'+
           '<div class="profile-photo-btns">'+
-            '<label class="btn btn-ghost btn-sm">Загрузить фото<input type="file" accept="image/*" id="profilePhotoFile" hidden></label>'+
+            '<label class="btn btn-ghost btn-sm file-btn">Загрузить фото<input type="file" accept="image/*" id="profilePhotoFile" class="visually-hidden"></label>'+
             '<button type="button" class="btn btn-ghost btn-sm text-danger" id="profileDeletePhoto"'+(photo?'':' hidden')+'>Удалить фото</button>'+
           '</div>'+
           '<div class="profile-photo-hint">JPG или PNG, до 1,5 МБ</div>'+
@@ -3043,6 +3364,7 @@ function openProfile(){
       if(pw) data.password = pw;
       apiPut('/api/profile', data).then(function(){
         Object.assign(currentUser, data);
+        if(data.password) currentUser.defaultPassword = false;
         delete currentUser.password;
         updateRoleUI();
         toast('Профиль обновлён');
@@ -3186,6 +3508,7 @@ function loadProjects(){
 function init(){
   api('/api/auth/me').then(function(data){
     currentUser = data.user;
+    currentUser.defaultPassword = !!data.defaultPassword;
     updateRoleUI();
     loadProjects();
   }).catch(function(){
@@ -3199,17 +3522,20 @@ function init(){
 var auditPageLabels = {
   dashboard: 'Дашборд', stages: 'Свод по этапам', data: 'Данные по датам',
   services: 'Эпики', settings: 'Настройки', users: 'Пользователи',
-  projects: 'Проекты', profile: 'Профиль', jira: 'Связь с Jira'
+  projects: 'Проекты', profile: 'Профиль', jira: 'Связь с Jira', notify: 'Рассылки'
 };
 var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление', autofill: 'Автозаполнение', restore: 'Восстановление истории' };
 var auditEntityLabels = { project: 'Проект', service: 'Эпик', entry: 'Замер', user: 'Пользователь', stage_target: 'Цель этапа', settings: 'Настройки',
-  jira_connection: 'Подключение к Jira', jira_button: 'Кнопка среза', jira_schedule: 'Расписание автозаполнения' };
+  jira_connection: 'Подключение к Jira', jira_button: 'Кнопка среза', jira_schedule: 'Расписание автозаполнения',
+  notify_settings: 'Настройки рассылок' };
 var auditFieldLabels = {
   name: 'Название', description: 'Описание', etap: 'Этап', targetDate: 'Целевая дата', isDone: 'Сдано', stageGroup: 'Группа в своде',
   date: 'Дата', remaining: 'Остаток', spent: 'Затрачено', estimate: 'Оценка',
   username: 'Логин', displayName: 'Имя', email: 'Email', position: 'Должность', role: 'Роль',
   jiraUrl: 'Адрес Jira', jiraAuth: 'Тип подключения', jiraLogin: 'Логин Jira', jiraToken: 'Токен Jira',
   autofill: 'Расписание', result: 'Результат',
+  smtpHost: 'SMTP-сервер', smtpPort: 'Порт SMTP', smtpSecurity: 'Защита SMTP', smtpLogin: 'Логин SMTP', smtpFrom: 'Отправитель',
+  smtpPassword: 'Пароль SMTP', telegramToken: 'Токен Telegram-бота', publicUrl: 'Адрес Burndown',
   forecastMethod: 'Метод прогноза', riskBufferDays: 'Буфер риска', burnrateMethod: 'Метод burn rate', burnrateWindowDays: 'Окно burn rate'
 };
 /* В БД время хранится в UTC (CURRENT_TIMESTAMP) — показываем в локальном часовом поясе */
