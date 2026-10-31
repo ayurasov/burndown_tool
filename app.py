@@ -29,8 +29,9 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from init_db import create_auth_tables, create_indexes, create_jira_tables, create_notify_tables
+from init_db import create_auth_tables, create_indexes, create_jira_tables, create_notify_tables, upgrade_settings
 import forecast as fc
+import insights as ins
 import jira_integration as jira
 import notify
 
@@ -118,6 +119,7 @@ def migrate_db():
         create_jira_tables(conn)
         create_notify_tables(conn)
         create_auth_tables(conn)
+        upgrade_settings(conn)
         create_indexes(conn)
         conn.commit()
         adopt_project_jira_connection(conn)
@@ -357,12 +359,21 @@ def text_change(old, new, field=None):
 
 
 HOUR_FIELDS = {'remaining': 'Остаток', 'spent': 'Затрачено', 'estimate': 'Оценка'}
-SETTINGS_FIELDS = [
-    ('forecastMethod', 'forecast_method'),
-    ('riskBufferDays', 'risk_buffer_days'),
-    ('burnrateMethod', 'burnrate_method'),
-    ('burnrateWindowDays', 'burnrate_window_days'),
-]
+SETTINGS_FIELDS = fc.SETTINGS_COLUMNS
+# настройки с выбором из списка и числовые настройки: ключ → (название, допустимые значения | (мин, макс))
+SETTINGS_CHOICES = {
+    'forecastMethod': ('Метод прогноза', ('linear', 'average')),
+    'burnrateMethod': ('Метод расчёта burn rate', ('all', 'rolling')),
+    'units': ('Единицы', ('hours', 'days')),
+    'rangeConfidence': ('Уровень доверия диапазона', tuple(fc.MC_QUANTILES)),
+}
+SETTINGS_INTS = {
+    'riskBufferDays': ('Буфер риска', 0, 365), 'burnrateWindowDays': ('Окно скользящего среднего', 1, 365),
+    'staleDays': ('Замер устарел через', 1, 365), 'scopeThreshold': ('Рост объёма', 1, 1000),
+    'slipThreshold': ('Сдвиг прогноза', 1, 365), 'chanceThreshold': ('Порог шанса успеть', 1, 99),
+    'insightWindowDays': ('Период сравнения', 7, 365),
+}
+CALENDAR_MAX_DATES = 2000
 
 
 def parse_entry_values(data):
@@ -637,10 +648,48 @@ def api_me():
             'email': user['email'] or '',
             'position': user['position'] or '',
             'photo': user['photo'] or '',
-            'role': user['role']
+            'role': user['role'],
+            'prefs': user_prefs(user),
         },
         'defaultPassword': bool(session.get('default_pw')),
     })
+
+
+# Блоки дашборда и свода, которые пользователь может скрыть (вид — личная настройка)
+VIEW_BLOCKS = {
+    'dashboard': ('insights', 'kpis', 'epic', 'epicExtra', 'drift', 'burnup', 'allEpics', 'composition', 'summary', 'burnRate'),
+    'stages': ('stageInsights', 'stageKpis', 'stageCharts', 'stageSummary', 'stageJira', 'stageBurnup', 'stageBurnRate'),
+}
+
+
+def user_prefs(user):
+    try:
+        prefs = json.loads(user['prefs'] or '{}')
+    except (ValueError, TypeError, IndexError, KeyError):
+        prefs = {}
+    hidden = prefs.get('hiddenBlocks') if isinstance(prefs, dict) else None
+    return {'hiddenBlocks': {view: [b for b in (hidden or {}).get(view, []) if b in blocks]
+                             for view, blocks in VIEW_BLOCKS.items()} if isinstance(hidden, dict) else
+            {view: [] for view in VIEW_BLOCKS}}
+
+
+@app.route('/api/profile/prefs', methods=['PUT'])
+@login_required
+def api_save_prefs():
+    """Личный вид: какие блоки дашборда и свода по этапам скрыты."""
+    hidden = json_body().get('hiddenBlocks')
+    if not isinstance(hidden, dict):
+        raise ValidationError('Укажите скрытые блоки')
+    clean = {}
+    for view, blocks in VIEW_BLOCKS.items():
+        items = hidden.get(view) or []
+        if not isinstance(items, list) or any(b not in blocks for b in items):
+            raise ValidationError('Неизвестный блок')
+        clean[view] = sorted(set(items), key=blocks.index)
+    db = get_db()
+    db.execute('UPDATE users SET prefs = ? WHERE id = ?', (json.dumps({'hiddenBlocks': clean}), session['user_id']))
+    db.commit()
+    return jsonify({'success': True, 'prefs': {'hiddenBlocks': clean}})
 
 
 # ─── API: Projects ──────────────────────────────────────────────
@@ -755,8 +804,8 @@ def project_payload(db, pid):
             'spent': e['spent'], 'estimate': e['estimate']
         } for e in entries],
         'stageTargets': {r['stage_name']: r['target_date'] for r in stage_targets},
-        # пустые значения в БД не передаём — фронтенд подставит значения по умолчанию
-        'settings': {key: settings[col] for key, col in SETTINGS_FIELDS if settings and settings[col] is not None},
+        # пустые значения в БД — значения по умолчанию
+        'settings': fc.settings_dict(settings),
     }
 
 
@@ -1052,57 +1101,61 @@ def api_update_stage_target(pid):
 
 # ─── API: Settings ──────────────────────────────────────────────
 
+def _setting_value(key, value):
+    """Значение настройки из запроса → значение для БД (проверка типа и пределов)."""
+    if key in SETTINGS_CHOICES:
+        title, allowed = SETTINGS_CHOICES[key]
+        if value not in allowed:
+            raise ValidationError(f'Недопустимое значение поля «{title}»')
+        return value
+    if key in SETTINGS_INTS:
+        title, low, high = SETTINGS_INTS[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValidationError(f'Поле «{title}»: целое число от {low} до {high}')
+        return int_value(value, title, low, high)
+    if key == 'workdays':
+        if not isinstance(value, bool):
+            raise ValidationError('Поле «Рабочие дни»: да или нет')
+        return int(value)
+    if key == 'hoursPerDay':
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 1 <= value <= 24:
+            raise ValidationError('Поле «Часов в рабочем дне»: число от 1 до 24')
+        return float(value)
+    if key in fc.DATE_LIST_KEYS:
+        title = 'Праздники' if key == 'holidays' else 'Рабочие выходные'
+        if not isinstance(value, list) or len(value) > CALENDAR_MAX_DATES:
+            raise ValidationError(f'Поле «{title}»: список дат (не больше {CALENDAR_MAX_DATES})')
+        return ','.join(sorted({parse_date(d, title) for d in value}))
+    raise ValidationError(f'Неизвестная настройка «{key}»')
+
+
 @app.route('/api/projects/<int:pid>/settings', methods=['PUT'])
 @login_required
 def api_update_settings(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
-    data = {k: v for k, v in json_body().items() if v is not None}  # null — не менять
-    if 'forecastMethod' in data and data['forecastMethod'] not in ('linear', 'average'):
-        raise ValidationError('Недопустимый метод прогноза')
-    if 'burnrateMethod' in data and data['burnrateMethod'] not in ('all', 'rolling'):
-        raise ValidationError('Недопустимый метод расчёта burn rate')
-    for key, minimum in (('riskBufferDays', 0), ('burnrateWindowDays', 1)):
-        if key in data:
-            if isinstance(data[key], bool) or not isinstance(data[key], int) or data[key] < minimum:
-                raise ValidationError(f'Поле «{key}»: целое число не меньше {minimum}')
+    columns = dict(SETTINGS_FIELDS)
+    data = {k: v for k, v in json_body().items() if v is not None and k in columns}  # null — не менять
+    values = {columns[k]: _setting_value(k, v) for k, v in data.items()}
     db = get_db()
     existing = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
-    if existing:
-        db.execute('''
-            UPDATE settings SET
-                forecast_method = ?,
-                risk_buffer_days = ?,
-                burnrate_method = ?,
-                burnrate_window_days = ?
-            WHERE project_id = ?
-        ''', (
-            data.get('forecastMethod', existing['forecast_method']),
-            data.get('riskBufferDays', existing['risk_buffer_days']),
-            data.get('burnrateMethod', existing['burnrate_method']),
-            data.get('burnrateWindowDays', existing['burnrate_window_days']),
-            pid
-        ))
-    else:
-        db.execute('''
-            INSERT INTO settings (project_id, forecast_method, risk_buffer_days, burnrate_method, burnrate_window_days)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (
-            pid,
-            data.get('forecastMethod', 'linear'),
-            data.get('riskBufferDays', 3),
-            data.get('burnrateMethod', 'all'),
-            data.get('burnrateWindowDays', 14)
-        ))
+    if not existing:
+        db.execute('INSERT INTO settings (project_id) VALUES (?)', (pid,))
+    if values:
+        db.execute(f"UPDATE settings SET {', '.join(f'{c} = ?' for c in values)} WHERE project_id = ?",
+                   (*values.values(), pid))
     db.commit()
     changes = []
     for key, col in SETTINGS_FIELDS:
+        if col not in values:
+            continue
         old_val = existing[col] if existing else None
-        if key in data and str(old_val) != str(data[key]):
-            changes.append({'field': key, 'old': None if old_val is None else str(old_val), 'new': str(data[key])})
+        if str(old_val) != str(values[col]):
+            changes.append({'field': key, 'old': None if old_val is None else str(old_val), 'new': str(values[col])})
     if changes:
         audit_log('settings', 'update', 'settings', None, pid, changes)
-    return jsonify({'success': True})
+    return jsonify({'success': True, 'settings': fc.settings_dict(
+        db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone())})
 
 
 # ─── API: Связь с Jira (срез данных из Structure) ────────────────
@@ -1439,26 +1492,25 @@ def _days(a, b):
 
 
 def burnup_forecast(history, settings=None):
-    """Когда «Выполнено» догонит «Объём» (как в интерфейсе): темпы — наклоны регрессии по срезам,
-    при скользящем burn rate — по срезам окна. → {'date', 'converges', 'doneRate', 'scopeRate'} или None."""
+    """Когда «Выполнено» догонит «Объём» (как burnupForecast в интерфейсе): темпы — наклоны регрессии по срезам,
+    при скользящем burn rate — по срезам окна; дни — календарные или рабочие (настройки проекта).
+    settings — настройки проекта (fc.settings_dict). → {'date', 'converges', 'doneRate', 'scopeRate', 'tooFar'?} или None."""
     if not history or len(history) < 2:
         return None
+    settings = settings or fc.DEFAULT_SETTINGS
+    cal = fc.calendar_for(settings)
     pts = history
-    if settings and settings['burnrate_method'] == 'rolling':
-        cutoff = (datetime.strptime(history[-1]['date'], '%Y-%m-%d')
-                  - timedelta(days=settings['burnrate_window_days'] or 14)).date().isoformat()
+    if settings.get('burnrateMethod') == 'rolling':
+        cutoff = fc.add_days(history[-1]['date'], -(settings.get('burnrateWindowDays') or 14))
         windowed = [p for p in history if p['date'] >= cutoff]
         pts = windowed if len(windowed) >= 2 else history[-2:]
     base = pts[0]['date']
-    if _days(base, pts[-1]['date']) <= 0:
+    if cal.span(base, pts[-1]['date']) <= 0:
         return None
 
     def slope(field):
-        xs = [_days(base, p['date']) for p in pts]
-        ys = [p[field] for p in pts]
-        n = len(xs)
-        denom = n * sum(x * x for x in xs) - sum(xs) ** 2
-        return (n * sum(x * y for x, y in zip(xs, ys)) - sum(xs) * sum(ys)) / denom if denom else None
+        reg = fc.linear_forecast([(cal.span(base, p['date']), p[field]) for p in pts])
+        return reg[0] if reg else None
 
     done_rate, scope_rate = slope('done'), slope('scope')
     if done_rate is None or scope_rate is None:
@@ -1471,10 +1523,9 @@ def burnup_forecast(history, settings=None):
     speed = done_rate - scope_rate
     if speed <= 0:
         return out
-    if gap / speed > 3 * 365:
+    if gap / speed > cal.horizon:
         return dict(out, tooFar=True)  # сходится, но дальше трёх лет — «> 3 лет», как в интерфейсе
-    return dict(out, converges=True, date=(datetime.strptime(last['date'], '%Y-%m-%d')
-                                           + timedelta(days=math.ceil(gap / speed))).date().isoformat())
+    return dict(out, converges=True, date=cal.shift(last['date'], math.ceil(gap / speed)))
 
 
 def aggregate_composition(history, latest, sids):
@@ -1512,12 +1563,17 @@ def _composition_pdf_row(label, history, latest, settings, target=None):
     if f and f['converges'] and target and f['date'] > target:
         forecast += ' (позже)'
     return [label, str(latest['counts']['done']), str(latest['counts']['indeterminate']), str(latest['counts']['new']),
-            pct, _fmt_num(latest['scope']), forecast, str(latest.get('problemIssues') or '—'), _fmt_date(latest['date'])]
+            pct, _fmt_num(ins.to_units(latest['scope'], settings or fc.DEFAULT_SETTINGS)), forecast,
+            str(latest.get('problemIssues') or '—'), _fmt_date(latest['date'])]
 
 
 COMPOSITION_PDF_HEAD = ['', 'Готово', 'В работе', 'Не начато', 'Выполнено', 'Объём, ч', 'Прогноз по задачам',
                         'Неполные данные', 'Срез']
 COMPOSITION_PDF_WIDTHS = [3.2, 0.8, 0.9, 0.9, 1, 0.9, 1.7, 1.4, 1]
+
+
+def _composition_head(unit):
+    return [f'Объём, {unit}' if h == 'Объём, ч' else h for h in COMPOSITION_PDF_HEAD]
 
 
 def jira_composition(db, pid):
@@ -2410,10 +2466,11 @@ def api_digest_preview(pid):
     if not can_view_project(session['user_id'], pid):
         return jsonify({'error': 'Нет доступа'}), 403
     db = get_db()
-    overview = project_overview(db, pid)
+    overview = digest_overview(db, pid)
     sub = _subscription(db, session['user_id'], pid)
     prev = json.loads(sub['digest_snapshot']) if sub and sub['digest_snapshot'] else None
     msg = render_digest(overview, prev, notify_settings(db).get('public_url'))
+    overview.pop('insights', None)
     return jsonify({'subject': msg['subject'], 'html': msg['html'], 'overview': overview})
 
 
@@ -2471,15 +2528,99 @@ def project_overview(db, pid, today=None):
         stages.append({'name': name, 'target': stage_targets.get(name) or None, 'remaining': st['lastRemaining'],
                        'status': st['status'], 'forecast': st['forecastZero'], 'noBurn': st['noBurn'], 'tooFar': st['tooFar'],
                        'probability': st['mc']['probability'] if st['mc'] else None})
-    autofill = [{'button': b['name'], 'lastStatus': b['last_status'], 'lastMessage': b['last_message'],
-                 'lastRunAt': b['last_run_at']} for b in db.execute(
-        'SELECT b.name, s.last_status, s.last_message, s.last_run_at FROM jira_snapshot_buttons b '
-        'JOIN jira_schedules s ON s.button_id = b.id WHERE b.project_id = ? AND s.enabled = 1 ORDER BY b.sort_order, b.id',
-        (pid,))]
+    autofill = _autofill_state(db, pid)
     counts = {k: sum(1 for e in epics if e['status'] == k) for k in ('ok', 'risk', 'danger')}
     return {'project': {'id': project['id'], 'name': project['name']}, 'date': today or datetime.now().date().isoformat(),
             'kpi': dict(counts, epics=len(epics), remaining=round(sum(e['remaining'] or 0 for e in epics), 2)),
-            'epics': epics, 'stages': stages, 'autofill': autofill}
+            'epics': epics, 'stages': stages, 'autofill': autofill, 'settings': settings}
+
+
+def digest_overview(db, pid, today=None):
+    """Сводка для дайджеста: статусы эпиков (project_overview) и «Выводы» проекта (project_insights)."""
+    ov = project_overview(db, pid, today)
+    ov['insights'] = project_insights(db, pid, ov['date'])['summary']
+    return ov
+
+
+def _autofill_state(db, pid):
+    return [{'button': b['name'], 'lastStatus': b['last_status'], 'lastMessage': b['last_message'],
+             'lastRunAt': b['last_run_at']} for b in db.execute(
+        'SELECT b.name, s.last_status, s.last_message, s.last_run_at FROM jira_snapshot_buttons b '
+        'JOIN jira_schedules s ON s.button_id = b.id WHERE b.project_id = ? AND s.enabled = 1 ORDER BY b.sort_order, b.id',
+        (pid,))]
+
+
+def project_insights(db, pid, today=None):
+    """«Выводы» по проекту (insights.py): эпики и этапы с драйверами прогноза и сводка для руководителя.
+    Учитываются несданные эпики; today — дата, относительно которой оценивается свежесть данных и прошедшие цели."""
+    project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
+    settings = fc.settings_dict(db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone())
+    today = today or datetime.now().date().isoformat()
+    services = db.execute('SELECT * FROM services WHERE project_id = ? AND NOT COALESCE(is_done, 0) '
+                          'ORDER BY sort_order, id', (pid,)).fetchall()
+    rows = {s['id']: [dict(r) for r in db.execute('SELECT date, remaining, spent, estimate FROM entries WHERE '
+                                                  'service_id = ? ORDER BY date', (s['id'],))] for s in services}
+    history, latest = jira_composition(db, pid)
+    epics, by_id, groups = [], {}, {}
+    for s in services:
+        e = ins.epic_insight({'id': s['id'], 'name': s['name'], 'etap': s['etap'], 'stage': stage_key(s),
+                              'target': s['target_date'] or None}, rows[s['id']], settings, today,
+                             history.get(s['id']), latest.get(s['id']))
+        epics.append(e)
+        by_id[s['id']] = e
+        groups.setdefault(stage_key(s), []).append(s['id'])
+    stage_targets = {r['stage_name']: r['target_date'] for r in
+                     db.execute('SELECT * FROM stage_targets WHERE project_id = ?', (pid,))}
+
+    def scope_of(ids):
+        agg = aggregate_composition(history, latest, [i for i in ids if i in latest])
+        return [(p['date'], p['scope']) for p in agg[0]] if agg else None
+    stages = []
+    for name, ids in groups.items():
+        dates, series = fc.aggregate_series([rows[i] for i in ids])
+        stages.append(ins.stage_insight(name, stage_targets.get(name) or None, [by_id[i] for i in ids], dates, series,
+                                        settings, today, scope_of(ids)))
+    dates, series = fc.aggregate_series([rows[s['id']] for s in services])
+    project_drv = ins.series_drivers(dates, series['remaining'], series['estimate'], None, settings, today,
+                                     scope_of([s['id'] for s in services]), with_mc=False)
+    summary = ins.project_summary(project_drv, epics, stages, settings, _autofill_state(db, pid))
+    return {'project': {'id': project['id'], 'name': project['name']}, 'date': today,
+            'settings': {k: settings[k] for k in ('units', 'hoursPerDay', 'workdays', 'rangeConfidence', 'insightWindowDays')},
+            'summary': summary, 'epics': epics, 'stages': stages}
+
+
+@app.route('/api/projects/<int:pid>/insights')
+@login_required
+def api_project_insights(pid):
+    if not can_view_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет доступа к проекту'}), 403
+    db = get_db()
+    if not db.execute('SELECT 1 FROM projects WHERE id = ?', (pid,)).fetchone():
+        return jsonify({'error': 'Проект не найден'}), 404
+    return jsonify(project_insights(db, pid))
+
+
+def accessible_projects(db, uid):
+    user = db.execute('SELECT * FROM users WHERE id = ?', (uid,)).fetchone()
+    if user['role'] == 'admin':
+        return db.execute('SELECT * FROM projects ORDER BY id').fetchall()
+    return db.execute('SELECT p.* FROM projects p JOIN user_projects up ON p.id = up.project_id WHERE up.user_id = ? '
+                      'ORDER BY p.id', (uid,)).fetchall()
+
+
+@app.route('/api/portfolio')
+@login_required
+def api_portfolio():
+    """Портфель: сводка по всем доступным проектам — от самых острых к благополучным."""
+    db = get_db()
+    items = []
+    for p in accessible_projects(db, session['user_id']):
+        data = project_insights(db, p['id'])
+        top = data['summary']['top'][:3]
+        items.append({'id': p['id'], 'name': p['name'], 'description': p['description'], 'summary': dict(
+            {k: data['summary'][k] for k in ('status', 'headline', 'facts', 'counts', 'stageCounts', 'health')}, top=top),
+            'epics': len(data['epics']), 'stages': len(data['stages'])})
+    return jsonify(ins.portfolio_summary(items))
 
 
 def _pct(p):
@@ -2496,19 +2637,22 @@ def _ru_num(v):
     return text.replace(',', '\u00a0').replace('.', ',')
 
 
-def _hours(v):
-    return '—' if v is None else _ru_num(v) + ' ч'
+def _hours(v, settings=None):
+    """Объём работ в единицах проекта (часы или человеко-дни), как на дашборде."""
+    return ins.fmt_work(v, settings or fc.DEFAULT_SETTINGS)
 
 
 def render_digest(ov, prev, public_url):
     """Дайджест проекта → subject, text, html (письмо), telegram (HTML Telegram). prev — состояние прошлого дайджеста."""
     prev_epics = {str(e['id']): e for e in (prev or {}).get('epics', [])}
+    settings = ov.get('settings') or fc.DEFAULT_SETTINGS
+    summary = ov.get('insights')
     k = ov['kpi']
     worse = [e for e in ov['epics'] if e['status'] in ('risk', 'danger')]
     subject = f"Burndown · {ov['project']['name']}: " + (
         f"под угрозой {len(worse)} из {k['epics']} эпиков" if worse else f"сроки в порядке ({k['epics']} эпиков)")
     head = (f"Успевают: {k['ok']} · риск: {k['risk']} · не успевают: {k['danger']} · "
-            f"остаток: {_ru_num(k['remaining'])} ч")
+            f"остаток: {_hours(k['remaining'], settings)}")
 
     def change(e):
         p = prev_epics.get(str(e['id']))
@@ -2523,13 +2667,22 @@ def render_digest(ov, prev, public_url):
                 parts.append(f"шанс {'+' if d > 0 else ''}{d} п.п.")
         if p.get('remaining') is not None and e['remaining'] is not None and p['remaining'] != e['remaining']:
             d = round(e['remaining'] - p['remaining'], 2)
-            parts.append(f"остаток {'+' if d > 0 else ''}{_ru_num(d)} ч")
+            parts.append(f"остаток {'+' if d > 0 else ''}{_hours(d, settings)}")
         return ', '.join(parts)
 
+    def subject_of(f):
+        return f"{f['subject']}: " if f.get('subject') else ''
+    top = (summary or {}).get('top', [])[:5]
+    health = (summary or {}).get('health', [])[:3]
     lines = [subject, head, '']
+    if summary:
+        lines += ['Главное: ' + summary['headline']]
+        lines += [f"• {subject_of(f)}{f['text']}" for f in top]
+        lines += (['Данные:'] + [f"• {f['text']}" for f in health]) if health else []
+        lines += ['']
     for e in ov['epics']:
         ch = change(e)
-        lines.append(f"• {e['name']} — {STATUS_TITLES[e['status']]}; остаток {_hours(e['remaining'])}; "
+        lines.append(f"• {e['name']} — {STATUS_TITLES[e['status']]}; остаток {_hours(e['remaining'], settings)}; "
                      f"прогноз {_forecast_text(e)}; "
                      f"цель {_fmt_date(e['target'])}; шанс {_pct(e['probability'])}"
                      + (f"; с прошлого дайджеста: {ch}" if ch else ''))
@@ -2551,16 +2704,32 @@ def render_digest(ov, prev, public_url):
             + (f"<div style='font-size:12px;color:#964219'>{esc(ch)}</div>" if ch else '') + "</td>"
             f"<td style='padding:6px 8px;border-bottom:1px solid #e3e7f0;color:{color};font-weight:600;white-space:nowrap'>"
             f"{esc(STATUS_TITLES[e['status']])}</td>"
-            f"<td style='padding:6px 8px;border-bottom:1px solid #e3e7f0;text-align:right;white-space:nowrap'>{esc(_hours(e['remaining']))}</td>"
+            f"<td style='padding:6px 8px;border-bottom:1px solid #e3e7f0;text-align:right;white-space:nowrap'>{esc(_hours(e['remaining'], settings))}</td>"
             f"<td style='padding:6px 8px;border-bottom:1px solid #e3e7f0;white-space:nowrap'>{esc(forecast_text)}</td>"
             f"<td style='padding:6px 8px;border-bottom:1px solid #e3e7f0;white-space:nowrap'>{esc(_fmt_date(e['target']))}</td>"
             f"<td style='padding:6px 8px;border-bottom:1px solid #e3e7f0;text-align:right'>{esc(_pct(e['probability']))}</td></tr>")
     th = "style='padding:6px 8px;text-align:left;font-size:12px;color:#5c6470;border-bottom:2px solid #01696f'"
+    sev_colors = {'danger': STATUS_COLORS['danger'], 'risk': STATUS_COLORS['risk'], 'info': '#006494', 'ok': STATUS_COLORS['ok']}
+
+    def li(f):
+        subj = f"<b>{esc(f['subject'])}:</b> " if f.get('subject') else ''
+        return (f"<li style='margin:0 0 4px'><span style='color:{sev_colors[f['severity']]}'>●</span> "
+                f"{subj}{esc(f['text'])}</li>")
+    insights_html = ''
+    if summary:
+        insights_html = (
+            f"<div style='border-left:4px solid {STATUS_COLORS.get(summary['status'], '#5c6470')};background:#f7f8f9;"
+            "padding:10px 14px;margin:0 0 14px'>"
+            f"<div style='font-weight:600;font-size:15px;margin-bottom:6px'>{esc(summary['headline'])}</div>"
+            + (f"<ul style='margin:0;padding-left:0;list-style:none;font-size:13px'>{''.join(li(f) for f in top)}</ul>" if top else '')
+            + (f"<div style='font-size:12px;color:#5c6470;margin-top:6px'>Данные:</div><ul style='margin:0;padding-left:0;"
+               f"list-style:none;font-size:12px'>{''.join(li(f) for f in health)}</ul>" if health else '')
+            + '</div>')
     html_body = (
         "<div style='font-family:Arial,sans-serif;color:#1c2126;max-width:760px'>"
         f"<h2 style='color:#01696f;margin:0 0 4px'>{esc(ov['project']['name'])}</h2>"
         f"<div style='color:#5c6470;margin-bottom:12px'>Дайджест Burndown на {esc(_fmt_date(ov['date']))}</div>"
-        f"<p style='margin:0 0 12px'><b>{esc(head)}</b></p>"
+        f"{insights_html}<p style='margin:0 0 12px'><b>{esc(head)}</b></p>"
         "<table style='border-collapse:collapse;width:100%;font-size:14px'><thead><tr>"
         f"<th {th}>Эпик</th><th {th}>Статус</th><th {th}>Остаток</th><th {th}>Прогноз «0»</th><th {th}>Цель</th>"
         f"<th {th}>Шанс успеть</th></tr></thead><tbody>{''.join(row_html)}</tbody></table>"
@@ -2572,10 +2741,14 @@ def render_digest(ov, prev, public_url):
           "«Уведомления» проекта.</p></div>")
 
     tg = [f"<b>{esc(ov['project']['name'])}</b> — дайджест на {esc(_fmt_date(ov['date']))}", esc(head), '']
+    sev_icons = {'danger': '⛔', 'risk': '⚠️', 'info': 'ℹ️', 'ok': '✅'}
+    if summary:
+        tg += [f"<b>{esc(summary['headline'])}</b>"] + [
+            f"{sev_icons[f['severity']]} {esc(subject_of(f))}{esc(f['text'])}" for f in top[:3]] + ['']
     icons = {'ok': '✅', 'risk': '⚠️', 'danger': '⛔', 'notarget': '◽', 'unknown': '◽'}
     for e in ov['epics']:
         ch = change(e)
-        tg.append(f"{icons[e['status']]} <b>{esc(e['name'])}</b>: {esc(_hours(e['remaining']))}, "
+        tg.append(f"{icons[e['status']]} <b>{esc(e['name'])}</b>: {esc(_hours(e['remaining'], settings))}, "
                   f"шанс {esc(_pct(e['probability']))}" + (f"\n    <i>{esc(ch)}</i>" if ch else ''))
     if errors:
         tg += ['', '<b>Автозаполнение с ошибкой:</b>'] + [f"• {esc(a['button'])}: {esc(a['lastMessage'])}" for a in errors]
@@ -2621,7 +2794,7 @@ def send_digest(db, user, sub, save_state=True):
         today = datetime.now(timezone.utc).astimezone(ZoneInfo(sub['timezone'])).date().isoformat()
     except (ZoneInfoNotFoundError, ValueError, TypeError):
         today = None
-    ov = project_overview(db, project['id'], today)
+    ov = digest_overview(db, project['id'], today)
     prev = json.loads(sub['digest_snapshot']) if sub['digest_snapshot'] else None
     msg = render_digest(ov, prev, notify_settings(db).get('public_url'))
     attachments = []
@@ -3197,6 +3370,14 @@ def build_project_pdf(db, project, page_type, epics_arg=None, show_done=False):
 
     page_title = PDF_PAGES[page_type][0]
     now_str = datetime.now().strftime('%d.%m.%Y %H:%M')
+    settings = fc.settings_dict(db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone())
+    cal = fc.calendar_for(settings)
+    unit = ins.unit_label(settings)
+
+    def work(v):
+        """Объём работ в единицах проекта (в отчёте «Данные по датам» — в часах, как вводится)."""
+        return _fmt_num(None if v is None else ins.to_units(v, settings))
+    insights_data = project_insights(db, pid) if page_type in ('dashboard', 'stages') else None
 
     from fpdf import FPDF
     font_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'fonts')
@@ -3222,12 +3403,21 @@ def build_project_pdf(db, project, page_type, epics_arg=None, show_done=False):
         total_remaining = sum_last(services, 'remaining')
         total_spent = sum_last(services, 'spent')
         total_estimate = sum_last(services, 'estimate')
+        epic_insights = {e['id']: e for e in insights_data['epics']}
+        selected = {s['id'] for s in services}
+        if set(epic_insights) <= selected:  # отчёт по всему проекту — сводка выводов
+            _pdf_insights_summary(pdf, insights_data['summary'])
+        else:
+            _pdf_heading(pdf, 'Выводы по выбранным эпикам')
+            for s in services:
+                if s['id'] in epic_insights:
+                    _pdf_series_insight(pdf, s['name'], epic_insights[s['id']], limit=3)
 
         _pdf_heading(pdf, 'Ключевые показатели')
         kpi_data = [
-            ('Остаток, ч', _fmt_num(total_remaining)),
-            ('Затрачено, ч', _fmt_num(total_spent)),
-            ('Оценка, ч', _fmt_num(total_estimate)),
+            (f'Остаток, {unit}', work(total_remaining)),
+            (f'Затрачено, {unit}', work(total_spent)),
+            (f'Оценка, {unit}', work(total_estimate)),
             ('Эпиков', str(len(services))),
         ]
         col_w = (pdf.w - pdf.l_margin - pdf.r_margin) / len(kpi_data)
@@ -3242,35 +3432,46 @@ def build_project_pdf(db, project, page_type, epics_arg=None, show_done=False):
             pdf.cell(col_w, 7, val)
         pdf.ln(9)
 
+        _pdf_heading(pdf, 'Сроки по эпикам')
+        term_rows = []
+        for s in services:
+            e = epic_insights.get(s['id'])
+            if not e:
+                term_rows.append([s['etap'], s['name'], 'Сдан', '—', _fmt_date(s['target_date']), '—', ''])
+                continue
+            term_rows.append([s['etap'], s['name'], STATUS_TITLES[e['status']], _forecast_text(e), _fmt_date(e['target']),
+                              _pct(e['probability']), e['headline']['text'] if e['headline'] else ''])
+        _pdf_table(pdf, ['Этап', 'Эпик', 'Статус', 'Прогноз «0»', 'Цель', 'Шанс', 'Главное'], term_rows,
+                   widths=[1, 2.6, 1.1, 1, 1, 0.6, 4.6])
+
         _pdf_heading(pdf, 'Сводная таблица по эпикам (последний замер)')
         rows = [[s['etap'], s['name'], _fmt_date(s['target_date']),
-                 _fmt_num(last_value(s['id'], 'remaining')),
-                 _fmt_num(last_value(s['id'], 'spent')),
-                 _fmt_num(last_value(s['id'], 'estimate'))] for s in services]
-        rows.append(['Итого', '', '', _fmt_num(total_remaining), _fmt_num(total_spent), _fmt_num(total_estimate)])
-        _pdf_table(pdf, ['Этап', 'Эпик', 'Целевая дата', 'Остаток, ч', 'Затрачено, ч', 'Оценка, ч'], rows,
+                 work(last_value(s['id'], 'remaining')),
+                 work(last_value(s['id'], 'spent')),
+                 work(last_value(s['id'], 'estimate'))] for s in services]
+        rows.append(['Итого', '', '', work(total_remaining), work(total_spent), work(total_estimate)])
+        _pdf_table(pdf, ['Этап', 'Эпик', 'Целевая дата', f'Остаток, {unit}', f'Затрачено, {unit}', f'Оценка, {unit}'], rows,
                    widths=[1.2, 3.5, 1.2, 1, 1, 1], total_row=True)
 
         all_dates = sorted({e['date'] for e in entries
                             if e['remaining'] is not None and e['service_id'] in {s['id'] for s in services}})
         dates = all_dates[-5:]
         if dates:
-            _pdf_heading(pdf, 'Burn rate по эпикам, ч/день (последние 5 дат)')
+            _pdf_heading(pdf, f'Burn rate по эпикам, {ins.rate_label(settings)} (последние 5 дат)')
             br_rows, all_rates = [], []
             for s in services:
-                rates = _daily_rates(by_service.get(s['id'], []), dates)
+                rates = _daily_rates(by_service.get(s['id'], []), dates, cal)
                 all_rates.append(rates)
-                br_rows.append([f"{s['etap']} — {s['name']}"] + [_fmt_num(r) for r in rates])
+                br_rows.append([f"{s['etap']} — {s['name']}"] + [work(r) for r in rates])
             totals = []
             for i in range(len(dates)):
                 vals = [r[i] for r in all_rates if r[i] is not None]
                 totals.append(sum(vals) if vals else None)
-            br_rows.append(['Итого по проекту'] + [_fmt_num(t) for t in totals])
+            br_rows.append(['Итого по проекту'] + [work(t) for t in totals])
             _pdf_table(pdf, ['Эпик'] + [_fmt_date(d)[:5] for d in dates], br_rows,
                        widths=[4] + [1] * len(dates), total_row=True)
 
         history, latest = jira_composition(db, pid)
-        settings = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
         with_comp = [s for s in services if s['id'] in latest]
         comp_rows = [_composition_pdf_row(s['name'], history[s['id']], latest[s['id']], settings, s['target_date'])
                      for s in with_comp]
@@ -3279,29 +3480,39 @@ def build_project_pdf(db, project, page_type, epics_arg=None, show_done=False):
             comp_rows.append(_composition_pdf_row('Итого по проекту', agg_history, agg_latest, settings))
         if comp_rows:
             _pdf_heading(pdf, 'Задачи Jira по эпикам (последний срез)')
-            _pdf_table(pdf, ['Эпик'] + COMPOSITION_PDF_HEAD[1:], comp_rows, widths=COMPOSITION_PDF_WIDTHS,
+            _pdf_table(pdf, ['Эпик'] + _composition_head(unit)[1:], comp_rows, widths=COMPOSITION_PDF_WIDTHS,
                        total_row=len(with_comp) > 1)
 
     elif page_type == 'stages':
         stage_groups = {}
         for s in services:
             stage_groups.setdefault(stage_key(s), []).append(s)
+        stage_insights = {st['name']: st for st in insights_data['stages']}
+        if stage_insights:
+            _pdf_heading(pdf, 'Выводы по этапам')
+            for name in stage_groups:
+                if name in stage_insights:
+                    _pdf_series_insight(pdf, name, stage_insights[name])
         _pdf_heading(pdf, 'Сводка по этапам')
-        st_rows = [[name, str(len(svcs)), _fmt_num(sum_last(svcs, 'remaining')), _fmt_date(stage_targets.get(name))]
-                   for name, svcs in stage_groups.items()]
-        _pdf_table(pdf, ['Этап', 'Эпиков', 'Остаток (сумма), ч', 'Цель'], st_rows, widths=[3, 1, 1.5, 1.5])
+        st_rows = []
+        for name, svcs in stage_groups.items():
+            st = stage_insights.get(name)
+            st_rows.append([name, str(len(svcs)), work(sum_last(svcs, 'remaining')), _fmt_date(stage_targets.get(name)),
+                            _forecast_text(st) if st else '—', _pct(st['probability']) if st else '—',
+                            STATUS_TITLES[st['status']] if st else 'Сдан'])
+        _pdf_table(pdf, ['Этап', 'Эпиков', f'Остаток (сумма), {unit}', 'Цель', 'Прогноз «0»', 'Шанс', 'Статус'], st_rows,
+                   widths=[3, 0.8, 1.5, 1.2, 1.2, 0.8, 1.3])
 
         for stage_name, svcs in stage_groups.items():
             _pdf_heading(pdf, f'{stage_name} — детали по эпикам')
             d_rows = [[s['name'], _fmt_date(s['target_date']),
-                       _fmt_num(last_value(s['id'], 'remaining')),
-                       _fmt_num(last_value(s['id'], 'spent')),
-                       _fmt_num(last_value(s['id'], 'estimate'))] for s in svcs]
-            _pdf_table(pdf, ['Эпик', 'Целевая дата', 'Остаток, ч', 'Затрачено, ч', 'Оценка, ч'], d_rows,
+                       work(last_value(s['id'], 'remaining')),
+                       work(last_value(s['id'], 'spent')),
+                       work(last_value(s['id'], 'estimate'))] for s in svcs]
+            _pdf_table(pdf, ['Эпик', 'Целевая дата', f'Остаток, {unit}', f'Затрачено, {unit}', f'Оценка, {unit}'], d_rows,
                        widths=[4, 1.2, 1, 1, 1])
 
         history, latest = jira_composition(db, pid)
-        settings = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
         comp_rows, all_ids = [], []
         for stage_name, svcs in stage_groups.items():
             ids = [s['id'] for s in svcs if s['id'] in latest]
@@ -3313,7 +3524,7 @@ def build_project_pdf(db, project, page_type, epics_arg=None, show_done=False):
             agg_history, agg_latest = aggregate_composition(history, latest, all_ids)
             comp_rows.append(_composition_pdf_row('Итого по проекту', agg_history, agg_latest, settings))
             _pdf_heading(pdf, 'Задачи Jira по этапам (последний срез)')
-            _pdf_table(pdf, ['Этап'] + COMPOSITION_PDF_HEAD[1:], comp_rows, widths=COMPOSITION_PDF_WIDTHS, total_row=True)
+            _pdf_table(pdf, ['Этап'] + _composition_head(unit)[1:], comp_rows, widths=COMPOSITION_PDF_WIDTHS, total_row=True)
 
     elif page_type == 'data':
         for s in services:
@@ -3357,8 +3568,10 @@ def _fmt_date(d):
     return '.'.join(reversed(parts)) if len(parts) == 3 else str(d)
 
 
-def _daily_rates(svc_entries, dates):
-    """Дневной burn rate эпика на каждую дату: (предыдущий заполненный остаток − текущий) / дней."""
+def _daily_rates(svc_entries, dates, cal=None):
+    """Дневной burn rate эпика на каждую дату: (предыдущий заполненный остаток − текущий) / дней
+    (календарных или рабочих — по настройкам проекта, как на дашборде)."""
+    cal = cal or fc.CALENDAR_DAYS
     filled = [e for e in svc_entries if e['remaining'] is not None]
     rates = []
     for d in dates:
@@ -3367,12 +3580,69 @@ def _daily_rates(svc_entries, dates):
             rates.append(None)
             continue
         prev = filled[idx - 1]
-        days = (datetime.strptime(d, '%Y-%m-%d') - datetime.strptime(prev['date'], '%Y-%m-%d')).days
+        days = cal.span(prev['date'], d)
         rates.append((prev['remaining'] - filled[idx]['remaining']) / days if days > 0 else None)
     return rates
 
 
+PDF_SEVERITY = {'danger': (161, 44, 123), 'risk': (150, 66, 25), 'info': (0, 100, 148), 'ok': (58, 106, 29)}
+
+
+def _pdf_findings(pdf, items, with_subject=False):
+    """Выводы списком: цветная точка важности и текст с переносом строк."""
+    page_w = pdf.w - pdf.l_margin - pdf.r_margin
+    for f in items:
+        if pdf.will_page_break(5):
+            pdf.add_page()
+        pdf.set_font('DejaVu', '', 9)
+        pdf.set_text_color(*PDF_SEVERITY[f['severity']])
+        pdf.cell(5, 4.6, '●')
+        pdf.set_text_color(*PDF_TEXT)
+        text = (f"{f['subject']}: " if with_subject and f.get('subject') else '') + f['text']
+        pdf.multi_cell(page_w - 5, 4.6, text, new_x='LMARGIN', new_y='NEXT')
+
+
+def _pdf_insights_summary(pdf, summary):
+    """Сводка «Выводы»: главное, ключевые цифры, первоочередные риски, хорошие новости и состояние данных."""
+    page_w = pdf.w - pdf.l_margin - pdf.r_margin
+    _pdf_heading(pdf, 'Выводы')
+    pdf.set_font('DejaVu', 'B', 11)
+    pdf.set_text_color(*(PDF_SEVERITY[summary['status']] if summary['status'] in ('danger', 'risk') else PDF_TEXT))
+    pdf.multi_cell(page_w, 5.5, summary['headline'], new_x='LMARGIN', new_y='NEXT')
+    if summary['facts']:
+        pdf.set_font('DejaVu', '', 9)
+        pdf.set_text_color(*PDF_MUTED)
+        pdf.multi_cell(page_w, 5, ' · '.join(f"{f['label']}: {f['value']}" + (f" ({f['hint']})" if f.get('hint') else '')
+                                             for f in summary['facts']), new_x='LMARGIN', new_y='NEXT')
+    for title, items, subject in (('Главные риски', summary['top'], True), ('Хорошие новости', summary['wins'], True),
+                                  ('Данные', summary['health'], False)):
+        if items:
+            pdf.ln(1)
+            pdf.set_font('DejaVu', 'B', 9)
+            pdf.set_text_color(*PDF_MUTED)
+            pdf.cell(0, 5, title, new_x='LMARGIN', new_y='NEXT')
+            _pdf_findings(pdf, items, subject)
+
+
+def _pdf_series_insight(pdf, name, item, limit=None):
+    """Этап или эпик: название, статус и прогноз одной строкой, ниже — выводы."""
+    if pdf.will_page_break(10):
+        pdf.add_page()
+    pdf.ln(1)
+    pdf.set_font('DejaVu', 'B', 9)
+    pdf.set_text_color(*PDF_TEXT)
+    meta = [STATUS_TITLES[item['status']], f"прогноз {_forecast_text(item)}"]
+    if item.get('target'):
+        meta.append(f"цель {_fmt_date(item['target'])}")
+    if item.get('probability') is not None:
+        meta.append(f"шанс {_pct(item['probability'])}")
+    pdf.multi_cell(pdf.w - pdf.l_margin - pdf.r_margin, 5, f"{name} — " + ' · '.join(meta), new_x='LMARGIN', new_y='NEXT')
+    _pdf_findings(pdf, item['findings'][:limit] if limit else item['findings'])
+
+
 def _pdf_heading(pdf, text):
+    if pdf.will_page_break(22):  # заголовок не остаётся внизу страницы без содержимого
+        pdf.add_page()
     pdf.ln(2)
     pdf.set_font('DejaVu', 'B', 11)
     pdf.set_text_color(*PDF_PRIMARY)

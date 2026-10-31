@@ -22,7 +22,9 @@ function todayIso(){ return localIsoDate(new Date()); }
 var dashboardFilter = { hideDone:false, epics:null }; /* epics: {id:bool} выбор эпиков для дашборда; null = видны все */
 var stageShowDone = false; /* показывать сданные эпики в своде по этапам */
 
-var DEFAULT_SETTINGS = { forecastMethod:'linear', riskBufferDays:3, burnrateMethod:'all', burnrateWindowDays:14 };
+var DEFAULT_SETTINGS = { forecastMethod:'linear', riskBufferDays:3, burnrateMethod:'all', burnrateWindowDays:14,
+  rangeConfidence:70, workdays:false, holidays:[], extraWorkdays:[], units:'hours', hoursPerDay:8,
+  staleDays:10, scopeThreshold:10, slipThreshold:7, chanceThreshold:50, insightWindowDays:28 };
 var charts = {};
 var currentView = 'dashboard';
 
@@ -31,6 +33,7 @@ var currentView = 'dashboard';
 ════════════════════════════════════════════════════════════════ */
 function api(url, opts){
   opts = opts || {};
+  if(opts.method && opts.method !== 'GET') invalidateInsights();  /* данные меняются — выводы пересчитываются */
   opts.headers = opts.headers || {};
   opts.headers['Content-Type'] = 'application/json';
   return fetch(url, Object.assign({credentials:'same-origin'}, opts)).catch(function(){
@@ -153,10 +156,17 @@ function fmtNum(v){
   var r = Math.round(v*100)/100;
   return (r === 0 ? 0 : r).toLocaleString('ru-RU', {maximumFractionDigits:2}); /* без «-0» */
 }
+/* Единицы отображения (настройки проекта): часы или человеко-дни. Замеры хранятся и вводятся в часах. */
+function unitDiv(){ var st = STATE.settings || {}; return st.units === 'days' ? (st.hoursPerDay || 8) : 1; }
+function unitSuffix(){ return (STATE.settings || {}).units === 'days' ? 'чел.-дн.' : 'ч'; }
+function rateUnit(){ return unitSuffix() + '/' + ((STATE.settings || {}).workdays ? 'раб. день' : 'день'); }
+function unitAxisTitle(what){ return ((STATE.settings || {}).units === 'days' ? 'Человеко-дни' : 'Часы') + (what ? ' (' + what + ')' : ''); }
+function fmtWorkNum(v){ return fmtNum(Math.round(v / unitDiv() * 100) / 100); }
 function hoursToStr(v){
   if(v === null || v === undefined || isNaN(v)) return '—';
-  return fmtNum(v) + ' ч';
+  return fmtWorkNum(v) + ' ' + unitSuffix();
 }
+function signedWork(v){ return (v > 0 ? '+' : '') + fmtWorkNum(v) + ' ' + unitSuffix(); }
 function escapeHtml(str){
   var d = document.createElement('div');
   d.textContent = str == null ? '' : String(str);
@@ -230,6 +240,45 @@ function addDays(dateStr, days){
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0,10);
 }
+/* Календарь расчёта сроков — тот же, что в forecast.py (calendar_for): календарные дни или рабочие (пн–пт без
+   праздников проекта, с перенесёнными рабочими днями). span(a, b) — длина периода (a, b] в днях расчёта,
+   shift(a, n) — дата через n дней расчёта. */
+var MC_HORIZON_WORKDAYS = 3 * 261;
+var CALENDAR_DAYS = {workdays: false, signature: '', horizon: 3 * 365, span: daysBetween, shift: addDays};
+var calCache = {key: null, cal: null};
+function isoOrdinal(d){ return Math.round(Date.parse(d + 'T00:00:00Z') / 86400000); }
+function ordinalIso(o){ return new Date(o * 86400000).toISOString().slice(0, 10); }
+function workCalendar(){
+  var st = STATE.settings || {};
+  if(!st.workdays) return CALENDAR_DAYS;
+  var holidays = st.holidays || [], extra = st.extraWorkdays || [];
+  var signature = 'w:' + holidays.join(',') + '|' + extra.join(',');
+  if(calCache.key === signature) return calCache.cal;
+  var on = {}, off = {}, onList = [], offList = [];
+  extra.forEach(function(d){ var o = isoOrdinal(d); if(!on[o]){ on[o] = true; onList.push(o); } });
+  holidays.forEach(function(d){ var o = isoOrdinal(d); if(!on[o] && !off[o]){ off[o] = true; offList.push(o); } });
+  var weekday = function(o){ return (o + 3) % 7 < 5; };  /* 01.01.1970 — четверг; пн = 0 */
+  var isWork = function(o){ return on[o] ? true : (off[o] ? false : weekday(o)); };
+  var count = function(oa, ob){
+    var n = ob - oa, full = Math.floor(n / 7), c = full * 5, k;
+    for(k = oa + full * 7 + 1; k <= ob; k++) if(weekday(k)) c++;
+    for(k = 0; k < offList.length; k++) if(offList[k] > oa && offList[k] <= ob && weekday(offList[k])) c--;
+    for(k = 0; k < onList.length; k++) if(onList[k] > oa && onList[k] <= ob && !weekday(onList[k])) c++;
+    return c;
+  };
+  var cal = {workdays: true, signature: signature, horizon: MC_HORIZON_WORKDAYS,
+    span: function(a, b){ var oa = isoOrdinal(a), ob = isoOrdinal(b); return ob >= oa ? count(oa, ob) : -count(ob, oa); },
+    shift: function(a, n){
+      if(n <= 0) return addDays(a, n);
+      var o = isoOrdinal(a), c = 0;
+      while(c < n){ o++; if(isWork(o)) c++; }
+      return ordinalIso(o);
+    }};
+  calCache = {key: signature, cal: cal};
+  return cal;
+}
+var MC_QUANTILES = {50: [0.25, 0.75], 70: [0.15, 0.85], 80: [0.1, 0.9], 90: [0.05, 0.95]};
+function rangeConfidence(){ var c = (STATE.settings || {}).rangeConfidence; return MC_QUANTILES[c] ? c : 70; }
 function fmtDate(d){
   if(!d) return '—';
   return d.split('-').reverse().join('.');
@@ -242,16 +291,16 @@ function fmtDateRange(a, b){
 function fmtShortDate(d){ return d.slice(5).split('-').reverse().join('.'); }
 function isNum(v){ return v !== null && v !== undefined && !isNaN(v); }
 /* Ячейка burn rate: отрицательное значение = остаток вырос */
-function rateCell(v, suffix){
+function rateCell(v, withUnit){
   if(!isNum(v)) return '<td class="num">—</td>';
   var neg = Math.round(v*100) < 0;
-  return '<td class="num'+(neg?' neg':'')+'"'+(neg?' title="Остаток вырос"':'')+'>'+fmtNum(v)+(suffix||'')+'</td>';
+  return '<td class="num'+(neg?' neg':'')+'"'+(neg?' title="Остаток вырос"':'')+'>'+fmtWorkNum(v)+(withUnit ? ' ' + unitSuffix() : '')+'</td>';
 }
 /* Ячейка изменения оценки: рост объёма подсвечивается */
 function scopeCell(v){
   if(!isNum(v)) return '<td class="num">—</td>';
   var r = Math.round(v*100)/100;
-  return '<td class="num'+(r>0?' scope-up':'')+'"'+(r>0?' title="Оценка выросла с первого замера"':'')+'>'+(r>0?'+':'')+fmtNum(r)+' ч</td>';
+  return '<td class="num'+(r>0?' scope-up':'')+'"'+(r>0?' title="Оценка выросла с первого замера"':'')+'>'+signedWork(r)+'</td>';
 }
 function forecastText(row){
   return row.forecastZero ? fmtDate(row.forecastZero) : (row.tooFar ? '> 3 лет' : (row.noBurn ? 'не сгорает' : '—'));
@@ -385,7 +434,7 @@ function avgBurnRate(dates, remainingVals){
     pts = windowed;
   }
   var first = pts[0], last = pts[pts.length-1];
-  var days = daysBetween(first.d, last.d);
+  var days = workCalendar().span(first.d, last.d);
   if(days <= 0) return null;
   return (first.y - last.y) / days;
 }
@@ -450,7 +499,8 @@ function aggregateSeries(rowsBySvc){
 /* ── Прогноз диапазоном (Монте-Карло) ─────────────────────────────
    Берём интервалы между замерами (скорость сгорания и длина интервала) и много раз «проигрываем» будущее,
    выбирая интервалы случайно с весом по длине. Получаем распределение даты обнуления остатка:
-   P15/P50/P85 и вероятность успеть к цели. Генератор детерминирован — цифры не «прыгают» между перерисовками. */
+   границы диапазона (уровень доверия — в настройках проекта: 50/70/80/90 %), медиану P50 и вероятность успеть к цели.
+   Генератор детерминирован — цифры не «прыгают» между перерисовками. */
 var MC_RUNS = 2000, MC_HORIZON_DAYS = 3 * 365;
 var mcCache = {};
 function seededRandom(seed){
@@ -467,9 +517,9 @@ function hashString(str){
   return h >>> 0;
 }
 function burnIntervals(pts){
-  var list = [];
+  var list = [], cal = workCalendar();
   for(var i = 1; i < pts.length; i++){
-    var len = daysBetween(pts[i-1].d, pts[i].d);
+    var len = cal.span(pts[i-1].d, pts[i].d);
     if(len > 0) list.push({end: pts[i].d, len: len, rate: (pts[i-1].y - pts[i].y) / len});
   }
   if(STATE.settings && STATE.settings.burnrateMethod === 'rolling' && list.length){
@@ -495,20 +545,23 @@ function monteCarloForecast(dates, remainingVals, targetDate){
   if(intervals.length < 2) return null;
   var last = pts[pts.length-1];
   var doneDate = zeroReachedDate(pts);
-  /* ключ — тот же, что у сервера (forecast.py mc_key): цифры в письмах совпадают с дашбордом */
+  var cal = workCalendar(), confidence = rangeConfidence(), q = MC_QUANTILES[confidence];
+  /* ключ (и зерно генератора) — те же, что у сервера (forecast.py mc_key): цифры в письмах совпадают с дашбордом */
   var key = intervals.map(function(it){ return it.end + ':' + it.len + ':' + it.rate.toFixed(6); }).join(';') +
     '|' + last.d + ':' + last.y.toFixed(6) + '|' + (targetDate || '');
-  if(mcCache[key]) return mcCache[key];
+  var cacheKey = key + '|' + cal.signature + '|' + confidence;
+  if(mcCache[cacheKey]) return mcCache[cacheKey];
   var res;
   if(doneDate){  /* остаток уже обнулён — дата завершения известна */
-    res = {p15: doneDate, p50: doneDate, p85: doneDate, probability: targetDate ? (doneDate <= targetDate ? 1 : 0) : null, intervals: intervals.length};
+    res = {lo: doneDate, p50: doneDate, hi: doneDate, confidence: confidence,
+           probability: targetDate ? (doneDate <= targetDate ? 1 : 0) : null, intervals: intervals.length};
   } else {
     var total = intervals.reduce(function(sum, it){ return sum + it.len; }, 0);
     var rnd = seededRandom(hashString(key));
     var days = [];
     for(var r = 0; r < MC_RUNS; r++){
       var rem = last.y, day = 0;
-      while(day < MC_HORIZON_DAYS){
+      while(day < cal.horizon){
         var pick = rnd() * total, it = intervals[0];
         for(var k = 0; k < intervals.length; k++){ pick -= intervals[k].len; if(pick <= 0){ it = intervals[k]; break; } }
         if(it.rate > 0 && rem <= it.rate * it.len){ day += rem / it.rate; rem = 0; break; }
@@ -518,20 +571,20 @@ function monteCarloForecast(dates, remainingVals, targetDate){
       days.push(rem <= 0 ? day : Infinity);
     }
     days.sort(function(a, b){ return a - b; });
-    var at = function(q){ var d = days[Math.floor(q * (days.length - 1))]; return isFinite(d) ? addDays(last.d, Math.ceil(d)) : null; };
+    var at = function(qq){ var d = days[Math.floor(qq * (days.length - 1))]; return isFinite(d) ? cal.shift(last.d, Math.ceil(d)) : null; };
     var probability = null;
     if(targetDate){
-      var limit = daysBetween(last.d, targetDate);
+      var limit = cal.span(last.d, targetDate);
       probability = days.filter(function(d){ return Math.ceil(d) <= limit; }).length / days.length;
     }
-    res = {p15: at(0.15), p50: at(0.5), p85: at(0.85), probability: probability, intervals: intervals.length};
+    res = {lo: at(q[0]), p50: at(0.5), hi: at(q[1]), confidence: confidence, probability: probability, intervals: intervals.length};
   }
-  mcCache[key] = res;
+  mcCache[cacheKey] = res;
   return res;
 }
 function probabilityCell(mc){
   if(!mc) return '<td class="num muted-cell" title="Нужно не меньше трёх замеров остатка">—</td>';
-  var range = 'Диапазон 70%: '+fmtDateRange(mc.p15, mc.p85)+
+  var range = 'Диапазон '+mc.confidence+'%: '+fmtDateRange(mc.lo, mc.hi)+
     '\nМедиана (P50): '+(mc.p50 ? fmtDate(mc.p50) : 'не сгорает')+'\nПо '+mc.intervals+' интервалам между замерами';
   if(mc.probability === null) return '<td class="num muted-cell" title="'+escapeAttr('Нет цели. '+range)+'">—</td>';
   var pct = Math.round(mc.probability * 100);
@@ -549,23 +602,24 @@ function computeStatus(dates, remainingVals, targetDate){
   var empty = {status:'unknown', forecastZeroDate:null, noBurn:false, tooFar:false, finished:false, burnRate:null, lastRemaining:null,
                reg:null, zeroX:null, baseDate:null, lastDate:null, mc:null};
   if(!dates.length) return empty;
+  var cal = workCalendar();
   var baseDate = dates[0];
   var lastDate = dates[dates.length-1];
-  var pts = dates.map(function(d,i){ return {x:daysBetween(baseDate, d), y:remainingVals[i]}; }).filter(function(p){ return p.y !== null && p.y !== undefined; });
+  var pts = dates.map(function(d,i){ return {x:cal.span(baseDate, d), y:remainingVals[i], d:d}; }).filter(function(p){ return p.y !== null && p.y !== undefined; });
   var burnRate = avgBurnRate(dates, remainingVals);
   /* Последний заполненный замер: пустая строка «+ Новая дата» не обнуляет остаток */
   var lastRemaining = pts.length ? pts[pts.length-1].y : null;
   var lastX = pts.length ? pts[pts.length-1].x : null;
-  if(lastX !== null) lastDate = addDays(baseDate, lastX);
-  var targetX = targetDate ? daysBetween(baseDate, targetDate) : null;
+  if(lastX !== null) lastDate = pts[pts.length-1].d;
+  var targetX = targetDate ? cal.span(baseDate, targetDate) : null;
   /* есть замеры, но нет цели — отдельный статус; «нет данных» — только когда нечего прогнозировать */
   var status = (pts.length && targetX === null) ? 'notarget' : 'unknown';
   var buffer = (STATE.settings && STATE.settings.riskBufferDays) || 0;
   var byDay = function(day){ return day <= targetX ? 'ok' : (day <= targetX + buffer ? 'risk' : 'danger'); };
   var mc = monteCarloForecast(dates, remainingVals, targetDate);
-  var doneDate = zeroReachedDate(pts.map(function(p){ return {d: addDays(baseDate, p.x), y: p.y}; }));
+  var doneDate = zeroReachedDate(pts);
   if(doneDate){  /* работы завершены: прогноз — фактическая дата обнуления */
-    var doneX = daysBetween(baseDate, doneDate);
+    var doneX = cal.span(baseDate, doneDate);
     return Object.assign(empty, {status: targetX === null ? 'notarget' : byDay(doneX), forecastZeroDate: doneDate, finished: true,
       burnRate: burnRate, lastRemaining: lastRemaining, zeroX: doneX, baseDate: baseDate, lastDate: lastDate, mc: mc});
   }
@@ -586,12 +640,13 @@ function computeStatus(dates, remainingVals, targetDate){
     zeroX = -reg.intercept / reg.slope;
     /* линия регрессии пересекла ноль раньше последнего замера, а работа осталась — считаем от последнего замера */
     if(lastRemaining > 0 && zeroX < lastX) zeroX = lastX + lastRemaining / -reg.slope;
-    if(zeroX - lastX > MC_HORIZON_DAYS){
+    if(zeroX - lastX > cal.horizon){
       tooFar = true;  /* дальше трёх лет — не дата, а «> 3 лет» */
       if(targetX !== null) status = 'danger';
     } else {
       var zeroDay = Math.round(zeroX);  /* статус — по той же дате, что показана */
-      forecastZeroDate = addDays(baseDate, zeroDay);
+      forecastZeroDate = cal.shift(baseDate, zeroDay);
+      if(forecastZeroDate < lastDate) forecastZeroDate = lastDate;  /* замер в выходной: не раньше последнего замера */
       if(targetX !== null) status = byDay(zeroDay);
     }
   } else if(noBurn && targetX !== null){
@@ -691,7 +746,7 @@ function baseChartOptions(yTitle, extraTooltipCtx){
               return (ds.epicName || '') + ': завершение ' + fmtDate(ds.targetDate);
             }
             var val = ctx.parsed.y;
-            var lines = [(ds.label || '') + ': ' + fmtNum(val) + ' ч'];
+            var lines = [(ds.label || '') + ': ' + hoursToStr(val)];
             /* For actual datasets, add deviation info using interpolation at this point's date */
             if(ds.isActual && extraTooltipCtx){
               var date = ctx.raw ? ctx.raw.x : null;
@@ -700,14 +755,14 @@ function baseChartOptions(yTitle, extraTooltipCtx){
                   var avgVal = interpolateValue(extraTooltipCtx.avgPts, date);
                   if(avgVal !== null && !isNaN(avgVal)){
                     var dev = val - avgVal;
-                    lines.push('Средняя динамика: ' + fmtNum(avgVal) + ' ч (откл.: ' + (dev >= 0 ? '+' : '') + fmtNum(dev) + ' ч)');
+                    lines.push('Средняя динамика: ' + hoursToStr(avgVal) + ' (откл.: ' + signedWork(dev) + ')');
                   }
                 }
                 if(extraTooltipCtx.forecastPts){
                   var fcVal = interpolateValue(extraTooltipCtx.forecastPts, date);
                   if(fcVal !== null && !isNaN(fcVal)){
                     var dev2 = val - fcVal;
-                    lines.push('Прогноз: ' + fmtNum(fcVal) + ' ч (откл.: ' + (dev2 >= 0 ? '+' : '') + fmtNum(dev2) + ' ч)');
+                    lines.push('Прогноз: ' + hoursToStr(fcVal) + ' (откл.: ' + signedWork(dev2) + ')');
                   }
                 }
               }
@@ -719,7 +774,8 @@ function baseChartOptions(yTitle, extraTooltipCtx){
     },
     scales:{
       x:{ type:'time', time:{unit:'day', tooltipFormat:'dd.MM.yyyy', displayFormats:{day:'dd.MM'}}, grid:{color:getCss('--color-divider')}, ticks:{color:getCss('--color-text-muted')} },
-      y:{ title:{display:true, text:yTitle, color:getCss('--color-text-muted')}, grid:{color:getCss('--color-divider')}, ticks:{color:getCss('--color-text-muted')}, beginAtZero:true }
+      y:{ title:{display:true, text:yTitle, color:getCss('--color-text-muted')}, grid:{color:getCss('--color-divider')},
+          ticks:{color:getCss('--color-text-muted'), callback: function(v){ return fmtWorkNum(v); }}, beginAtZero:true }
     }
   };
   return opts;
@@ -733,20 +789,20 @@ function renderLegend(containerId, datasets){
   }).join('');
 }
 
-/* Диапазон прогноза 70% (P15–P85 Монте-Карло): две линии от последнего остатка к нулю с заливкой между ними */
+/* Диапазон прогноза (Монте-Карло, уровень доверия из настроек): две линии от последнего остатка к нулю с заливкой между ними */
 function rangeDatasets(stat){
   var mc = stat.mc;
-  if(!mc || !mc.p15 || !mc.p85 || !isNum(stat.lastRemaining) || stat.lastRemaining <= 0) return [];
+  if(!mc || !mc.lo || !mc.hi || !isNum(stat.lastRemaining) || stat.lastRemaining <= 0) return [];
   var color = getCss('--color-orange');
   var rem = stat.lastRemaining, start = stat.lastDate;
   /* обе границы — в одних и тех же точках по оси X, иначе заливка между ними рисуется с разрывом */
-  var span = Math.max(1, daysBetween(start, mc.p85));
-  var upperAtP15 = rem * (1 - daysBetween(start, mc.p15) / span);
+  var span = Math.max(1, daysBetween(start, mc.hi));
+  var upperAtLo = rem * (1 - daysBetween(start, mc.lo) / span);
   return [
-    {label: 'Диапазон прогноза 70%: ' + fmtDateRange(mc.p15, mc.p85),
-     data: [{x: start, y: rem}, {x: mc.p15, y: 0}, {x: mc.p85, y: 0}],
+    {label: 'Диапазон прогноза ' + mc.confidence + '%: ' + fmtDateRange(mc.lo, mc.hi),
+     data: [{x: start, y: rem}, {x: mc.lo, y: 0}, {x: mc.hi, y: 0}],
      borderColor: color + '66', backgroundColor: color + '1f', borderWidth: 1, pointRadius: 0, tension: 0, isRange: true},
-    {label: '', data: [{x: start, y: rem}, {x: mc.p15, y: Math.max(0, upperAtP15)}, {x: mc.p85, y: 0}],
+    {label: '', data: [{x: start, y: rem}, {x: mc.lo, y: Math.max(0, upperAtLo)}, {x: mc.hi, y: 0}],
      borderColor: color + '66', backgroundColor: color + '1f', borderWidth: 1, pointRadius: 0, tension: 0, fill: '-1',
      isRange: true, hideInLegend: true}
   ];
@@ -756,10 +812,10 @@ function avgLineDataset(dates, burnRate, lastRemaining, lastDate){
   if(!dates.length || burnRate === null || burnRate === undefined || lastRemaining === null) return null;
   var baseDate = dates[0];
   lastDate = lastDate || dates[dates.length-1];
-  var daysSpan = Math.max(1, daysBetween(baseDate, lastDate));
+  var daysSpan = Math.max(1, workCalendar().span(baseDate, lastDate));
   var startVal = lastRemaining + burnRate * daysSpan;
   return {
-    label: 'Средняя динамика (' + fmtNum(burnRate) + ' ч/день)',
+    label: 'Средняя динамика (' + fmtWorkNum(burnRate) + ' ' + rateUnit() + ')',
     data: [{x: baseDate, y: Math.max(0,startVal)}, {x: lastDate, y: Math.max(0,lastRemaining)}],
     /* нейтральный серый: зелёный совпадал с цветом одного из эпиков на графике этапа */
     borderColor: getCss('--color-text-muted'), borderDash: [6,4], pointRadius: 0, borderWidth: 1.5, tension: 0
@@ -785,10 +841,11 @@ function forecastDataset(stat, firstDate, lastRow, targetDate){
   var cap = addDays(lastRow.date, 180);
   var zeroDate = stat.forecastZeroDate || (stat.tooFar ? cap : null);
   if(zeroDate && zeroDate > endDate) endDate = zeroDate < cap ? zeroDate : (cap > endDate ? cap : endDate);
-  var startX = daysBetween(baseDate, firstDate);
-  var endX = Math.max(daysBetween(baseDate, endDate), startX + 1);
+  var cal = workCalendar();
+  var startX = cal.span(baseDate, firstDate);
+  var endX = Math.max(cal.span(baseDate, endDate), startX + 1);
   /* прогноз от последнего замера (регрессия пересекла ноль раньше него) — прямая из последней точки в дату «0» */
-  var lastX = daysBetween(baseDate, stat.lastDate);
+  var lastX = cal.span(baseDate, stat.lastDate);
   var anchored = stat.zeroX !== null && reg.slope < 0 && -reg.intercept / reg.slope < lastX;
   var lineY = function(x){
     if(anchored) return x <= lastX ? reg.slope*x + reg.intercept : stat.lastRemaining * (1 - (x - lastX) / (stat.zeroX - lastX));
@@ -798,7 +855,7 @@ function forecastDataset(stat, firstDate, lastRow, targetDate){
   var steps = 16;
   for(var i=0; i<=steps; i++){
     var x = startX + (endX-startX)*i/steps;
-    forecastPts.push({x: addDays(baseDate, Math.round(x)), y: Math.max(0, lineY(x))});
+    forecastPts.push({x: cal.shift(baseDate, Math.round(x)), y: Math.max(0, lineY(x))});
   }
   if(stat.forecastZeroDate && stat.forecastZeroDate <= endDate){  /* линия доходит до нуля в показанную дату */
     forecastPts = forecastPts.filter(function(p){ return p.x < stat.forecastZeroDate; });
@@ -887,7 +944,7 @@ function renderEpicRemainingChart(){
   renderLegend('legendRemaining', datasets);
   var ctx = document.getElementById('chartRemaining');
   var tooltipCtx = { avgPts: avgPts, forecastPts: fcData };
-  charts.epicRemaining = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions('Часы (Ост.время)', tooltipCtx)});
+  charts.epicRemaining = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle('ост. время'), tooltipCtx)});
 }
 
 function renderEpicSpentChart(){
@@ -904,7 +961,7 @@ function renderEpicSpentChart(){
   var datasets = [{ label: svc ? svc.name : '', data: data, borderColor: palette[1], backgroundColor: palette[1]+'33', spanGaps:true, tension:0.25, cubicInterpolationMode:'monotone', pointRadius:3, borderWidth:2 }];
   renderLegend('legendSpentEpic', datasets);
   var ctx = document.getElementById('chartSpentEpic');
-  charts.epicSpent = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions('Часы')});
+  charts.epicSpent = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle())});
 }
 
 function renderEpicEstimateChart(){
@@ -921,7 +978,7 @@ function renderEpicEstimateChart(){
   var datasets = [{ label: svc ? svc.name : '', data: data, borderColor: palette[2], backgroundColor: palette[2]+'33', spanGaps:true, tension:0.25, cubicInterpolationMode:'monotone', pointRadius:3, borderWidth:2 }];
   renderLegend('legendEstimateEpic', datasets);
   var ctx = document.getElementById('chartEstimateEpic');
-  charts.epicEstimate = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions('Часы')});
+  charts.epicEstimate = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle())});
 }
 
 var allEpicsBlock = document.getElementById('allEpicsBlock');
@@ -935,9 +992,9 @@ function renderAllEpicsCharts(){
   ['allRemaining','allSpent','allEstimate'].forEach(destroyChart);
   if(!allEpicsBlock.open) return;  /* свёрнутый блок не рисуем — графики построятся при раскрытии */
   var ids = visibleDashboardServices().map(function(s){ return s.id; });
-  [['remaining', 'allRemaining', 'chartRemainingAll', 'legendRemainingAll', 'Часы (Ост.время)'],
-   ['spent', 'allSpent', 'chartSpent', 'legendSpent', 'Часы'],
-   ['estimate', 'allEstimate', 'chartEstimate', 'legendEstimate', 'Часы']].forEach(function(c){
+  [['remaining', 'allRemaining', 'chartRemainingAll', 'legendRemainingAll', unitAxisTitle('ост. время')],
+   ['spent', 'allSpent', 'chartSpent', 'legendSpent', unitAxisTitle()],
+   ['estimate', 'allEstimate', 'chartEstimate', 'legendEstimate', unitAxisTitle()]].forEach(function(c){
     var hasValues = ids.some(function(sid){ return entriesForService(sid).some(function(r){ return isNum(r[c[0]]); }); });
     var empty = !ids.length ? noEpicsMessage() : (hasValues ? null : 'Значения «' + HOUR_LABELS[c[0]] + '» по выбранным эпикам не вносились');
     if(setChartEmpty(c[2], empty)){ document.getElementById(c[3]).innerHTML = ''; return; }
@@ -986,7 +1043,7 @@ function renderSummaryTable(){
     '<th class="sortable" data-sort="etap">Этап</th>'+
     '<th class="sortable" data-sort="name">Эпик</th>'+
     '<th class="sortable num" data-sort="remaining">Остаток</th>'+
-    '<th class="sortable num" data-sort="burnRate">Burn rate, ч/день</th>'+
+    '<th class="sortable num" data-sort="burnRate">Burn rate, '+rateUnit()+'</th>'+
     '<th class="sortable num" data-sort="scope" title="Изменение первоначальной оценки с первого замера">Δ оценки</th>'+
     '<th class="sortable" data-sort="targetDate">Цель</th>'+
     '<th class="sortable" data-sort="forecastZero">Прогноз «0»</th>'+
@@ -1006,10 +1063,10 @@ function renderSummaryTable(){
     html += '<tr><td colspan="9" class="empty-cell">'+(STATE.services.length ? 'Нет эпиков для отображения — проверьте фильтр выше.' : 'В проекте пока нет эпиков — добавьте их в разделе «Эпики (блоки задач)».')+'</td></tr>';
   }
   applyTableSort('summaryTable', rows).forEach(function(r){
-    html += '<tr'+(r.isDone?' class="done-row"':'')+'><td class="nowrap">'+escapeHtml(r.etap)+'</td><td>'+escapeHtml(r.name)+'</td><td class="num">'+hoursToStr(r.remaining)+'</td>'+rateCell(r.burnRate,' ч')+scopeCell(r.scope)+'<td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+forecastText(r)+'</td>'+probabilityCell(r.mc)+'<td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
+    html += '<tr'+(r.isDone?' class="done-row"':'')+'><td class="nowrap">'+escapeHtml(r.etap)+'</td><td>'+escapeHtml(r.name)+'</td><td class="num">'+hoursToStr(r.remaining)+'</td>'+rateCell(r.burnRate, true)+scopeCell(r.scope)+'<td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+forecastText(r)+'</td>'+probabilityCell(r.mc)+'<td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
   });
   if(rows.length){
-    html += '<tr class="total-row"><td colspan="2">Итого</td><td class="num">'+(hasRemaining?hoursToStr(totalRemaining):'—')+'</td>'+rateCell(hasBurn?totalBurnRate:null,' ч')+scopeCell(hasScope?totalScope:null)+'<td colspan="4"></td></tr>';
+    html += '<tr class="total-row"><td colspan="2">Итого</td><td class="num">'+(hasRemaining?hoursToStr(totalRemaining):'—')+'</td>'+rateCell(hasBurn?totalBurnRate:null, true)+scopeCell(hasScope?totalScope:null)+'<td colspan="4"></td></tr>';
   }
   html += '</tbody>';
   table.innerHTML = html;
@@ -1042,7 +1099,7 @@ function serviceDailyRates(serviceId, dates){
     var idx = -1;
     for(var i=0;i<rows.length;i++){ if(rows[i].date === d){ idx = i; break; } }
     if(idx <= 0) return null;
-    var days = daysBetween(rows[idx-1].date, d);
+    var days = workCalendar().span(rows[idx-1].date, d);
     return days > 0 ? (rows[idx-1].remaining - rows[idx].remaining) / days : null;
   });
 }
@@ -1107,7 +1164,7 @@ function renderStageSummaryTable(){
     '<th class="sortable" data-sort="name">Этап</th>'+
     '<th class="sortable num" data-sort="count">Эпиков</th>'+
     '<th class="sortable num" data-sort="remaining">Остаток (сумма)</th>'+
-    '<th class="sortable num" data-sort="burnRate">Burn rate, ч/день</th>'+
+    '<th class="sortable num" data-sort="burnRate">Burn rate, '+rateUnit()+'</th>'+
     '<th class="sortable num" data-sort="scope" title="Изменение суммарной оценки с первого замера">Δ оценки</th>'+
     '<th class="sortable" data-sort="targetDate">Цель</th>'+
     '<th class="sortable" data-sort="forecastZero">Прогноз «0»</th>'+
@@ -1119,7 +1176,7 @@ function renderStageSummaryTable(){
     return {name:name, count:stageGroups[name].length, remaining:stat.lastRemaining, burnRate:stat.burnRate, scope:stat.scope, targetDate:STATE.stageTargets[name]||'', forecastZero:stat.forecastZeroDate||'', noBurn:stat.noBurn, tooFar:stat.tooFar, status:stat.status, mc:stat.mc, probability:stat.mc ? stat.mc.probability : null};
   });
   applyTableSort('stageSummaryTable', rows).forEach(function(r){
-    html += '<tr><td>'+escapeHtml(r.name)+'</td><td class="num">'+r.count+'</td><td class="num">'+hoursToStr(r.remaining)+'</td>'+rateCell(r.burnRate,' ч')+scopeCell(r.scope)+'<td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+forecastText(r)+'</td>'+probabilityCell(r.mc)+'<td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
+    html += '<tr><td>'+escapeHtml(r.name)+'</td><td class="num">'+r.count+'</td><td class="num">'+hoursToStr(r.remaining)+'</td>'+rateCell(r.burnRate, true)+scopeCell(r.scope)+'<td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+forecastText(r)+'</td>'+probabilityCell(r.mc)+'<td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
   });
   html += '</tbody>';
   table.innerHTML = html;
@@ -1279,7 +1336,7 @@ function renderStageCharts(){
 
     renderLegend('legendStage_'+safeId, datasets);
     var tooltipCtx = { avgPts: avgPts, forecastPts: fcData };
-    charts['stage_'+safeId] = new Chart(canvas, {type:'line', data:{datasets:datasets}, options: baseChartOptions('Часы (суммарный остаток)', tooltipCtx), plugins:[epicTargetLabelPlugin]});
+    charts['stage_'+safeId] = new Chart(canvas, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle('суммарный остаток'), tooltipCtx), plugins:[epicTargetLabelPlugin]});
   });
 }
 
@@ -1508,40 +1565,115 @@ function renderServicesView(){
 /* ════════════════════════════════════════════════════════════════
    Settings view
 ════════════════════════════════════════════════════════════════ */
+/* Списки дат календаря: «01.01.2026», «2026-01-01», диапазоны «01.01.2026 – 08.01.2026»; через запятую или с новой строки */
+function parseDateToken(t){
+  var m = t.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/), iso;
+  if(m) iso = m[3] + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[1]).slice(-2);
+  else if(/^\d{4}-\d{2}-\d{2}$/.test(t)) iso = t;
+  else return null;
+  var d = new Date(iso + 'T00:00:00Z');
+  return !isNaN(d) && d.toISOString().slice(0, 10) === iso ? iso : null;
+}
+function parseDateList(text){
+  var out = {}, bad = [];
+  text.split(/[\n,;]+/).map(function(x){ return x.trim(); }).filter(Boolean).forEach(function(item){
+    var parts = item.split(/\s*(?:–|—|\.\.|\s-\s)\s*/);
+    var a = parseDateToken(parts[0]), b = parts.length > 1 ? parseDateToken(parts[1]) : a;
+    if(!a || !b || parts.length > 2 || b < a || daysBetween(a, b) > 366){ bad.push(item); return; }
+    for(var d = a; d <= b; d = addDays(d, 1)) out[d] = true;
+  });
+  return {dates: Object.keys(out).sort(), bad: bad};
+}
+/* обратно в текст: подряд идущие даты — диапазоном */
+function formatDateList(dates){
+  var lines = [], i = 0;
+  while(i < dates.length){
+    var j = i;
+    while(j + 1 < dates.length && addDays(dates[j], 1) === dates[j + 1]) j++;
+    lines.push(j > i ? fmtDate(dates[i]) + ' – ' + fmtDate(dates[j]) : fmtDate(dates[i]));
+    i = j + 1;
+  }
+  return lines.join('\n');
+}
 function renderSettingsView(){
   var st = STATE.settings;
   var burnMethod = st.burnrateMethod || 'all';
-  var opt = function(value, label, current){ return '<option value="'+value+'"'+(current===value?' selected':'')+'>'+label+'</option>'; };
+  var opt = function(value, label, current){ return '<option value="'+value+'"'+(String(current)===String(value)?' selected':'')+'>'+label+'</option>'; };
+  var num = function(id, label, value, min, max, hint){
+    return '<div class="setting-item"><label class="small" for="'+id+'">'+label+'</label><input type="number" id="'+id+'" min="'+min+'" max="'+max+'" step="1" value="'+value+'">'+
+      (hint ? '<div class="setting-hint">'+hint+'</div>' : '')+'</div>';
+  };
   document.getElementById('settingsGrid').innerHTML =
+    '<div class="settings-divider">Прогноз</div>'+
     '<div class="setting-item"><label class="small" for="setForecastMethod">Метод прогноза</label><select id="setForecastMethod">'+opt('linear','Линейная регрессия',st.forecastMethod)+opt('average','Средняя скорость сгорания (burn rate)',st.forecastMethod)+'</select></div>'+
-    '<div class="setting-item"><label class="small" for="setRiskBuffer">Буфер риска, дней</label><input type="number" id="setRiskBuffer" min="0" step="1" value="'+(st.riskBufferDays ?? 3)+'"></div>'+
+    num('setRiskBuffer', 'Буфер риска, дней', st.riskBufferDays ?? 3, 0, 365, 'Прогноз позже цели не больше чем на столько дней — «Риск», а не «Не успеваем»')+
+    '<div class="setting-item"><label class="small" for="setConfidence">Диапазон прогноза</label><select id="setConfidence">'+
+      [50, 70, 80, 90].map(function(c){ return opt(c, c + '% сценариев', st.rangeConfidence); }).join('')+'</select>'+
+      '<div class="setting-hint">Между оптимистичной и пессимистичной датой — указанная доля сценариев Монте-Карло</div></div>'+
     '<div class="settings-divider">Расчёт среднего burn rate</div>'+
     '<div class="setting-item"><label class="small" for="setBurnrateMethod">Метод расчёта</label><select id="setBurnrateMethod">'+opt('all','По всей истории',burnMethod)+opt('rolling','Скользящее среднее',burnMethod)+'</select></div>'+
-    '<div class="setting-item"><label class="small" for="setBurnrateWindow">Окно скользящего среднего, дней</label><input type="number" id="setBurnrateWindow" min="1" step="1" value="'+(st.burnrateWindowDays || 14)+'"'+(burnMethod!=='rolling'?' disabled':'')+'></div>';
+    '<div class="setting-item"><label class="small" for="setBurnrateWindow">Окно скользящего среднего, дней</label><input type="number" id="setBurnrateWindow" min="1" step="1" value="'+(st.burnrateWindowDays || 14)+'"'+(burnMethod!=='rolling'?' disabled':'')+'></div>'+
+    '<div class="settings-divider">Календарь</div>'+
+    '<div class="setting-item setting-wide"><label class="checkbox-row"><input type="checkbox" id="setWorkdays"'+(st.workdays?' checked':'')+'> Считать сроки в рабочих днях</label>'+
+      '<div class="setting-hint">Прогноз, burn rate и шанс успеть — без выходных и праздников: работа идёт с понедельника по пятницу, кроме праздников, плюс рабочие выходные.</div></div>'+
+    '<div class="setting-item"><label class="small" for="setHolidays">Праздники и нерабочие дни</label><textarea id="setHolidays" rows="5" placeholder="01.01.2026 – 08.01.2026&#10;23.02.2026"'+(st.workdays?'':' disabled')+'>'+escapeHtml(formatDateList(st.holidays || []))+'</textarea>'+
+      '<div class="setting-hint">Даты или диапазоны, по одному в строке</div></div>'+
+    '<div class="setting-item"><label class="small" for="setExtraWorkdays">Рабочие выходные (переносы)</label><textarea id="setExtraWorkdays" rows="5" placeholder="27.12.2025"'+(st.workdays?'':' disabled')+'>'+escapeHtml(formatDateList(st.extraWorkdays || []))+'</textarea>'+
+      '<div class="setting-hint">Суббота или воскресенье, которые объявлены рабочими</div></div>'+
+    '<div class="settings-divider">Единицы</div>'+
+    '<div class="setting-item"><label class="small" for="setUnits">Показывать объём работ</label><select id="setUnits">'+opt('hours','В часах',st.units)+opt('days','В человеко-днях',st.units)+'</select>'+
+      '<div class="setting-hint">Только отображение: замеры вводятся и хранятся в часах</div></div>'+
+    '<div class="setting-item"><label class="small" for="setHoursPerDay">Часов в человеко-дне</label><input type="number" id="setHoursPerDay" min="1" max="24" step="0.5" value="'+(st.hoursPerDay || 8)+'"'+(st.units!=='days'?' disabled':'')+'></div>'+
+    '<div class="settings-divider">Выводы</div>'+
+    num('setStaleDays', 'Замер устарел через, дней', st.staleDays || 10, 1, 365, 'Нет замера дольше — вывод «данные могли устареть»')+
+    num('setScopeThreshold', 'Рост объёма, %', st.scopeThreshold || 10, 1, 1000, 'Объём вырос сильнее за период сравнения — вывод о росте объёма')+
+    num('setSlipThreshold', 'Сдвиг прогноза, дней', st.slipThreshold || 7, 1, 365, 'Прогноз сдвинулся сильнее за период сравнения — вывод о сдвиге')+
+    num('setChanceThreshold', 'Порог шанса успеть, %', st.chanceThreshold || 50, 1, 99, 'Прогноз в срок, но шанс ниже — вывод о неустойчивом темпе')+
+    num('setInsightWindow', 'Период сравнения, дней', st.insightWindowDays || 28, 7, 365, 'За какой срок сравниваются темп, объём и прогноз');
 
-  var bind = function(id, apply){
-    document.getElementById(id).addEventListener('change', function(e){
+  var bind = function(id, apply, event){
+    document.getElementById(id).addEventListener(event || 'change', function(e){
       var prev = Object.assign({}, st);
-      apply(e.target);
+      if(apply(e.target) === false) return;
       saveSettings(prev);
       renderSettingsView();
     });
   };
+  var intIn = function(el, low, high, dflt){ var v = parseInt(el.value, 10); return isNaN(v) ? dflt : Math.min(high, Math.max(low, v)); };
+  var dateList = function(key){ return function(el){
+    var res = parseDateList(el.value);
+    if(res.bad.length){ toast('Не распознаны даты: ' + res.bad.slice(0, 3).join(', ') + ' — формат ДД.ММ.ГГГГ или диапазон через «–»'); return false; }
+    st[key] = res.dates;
+  }; };
   bind('setForecastMethod', function(el){ st.forecastMethod = el.value; });
-  bind('setRiskBuffer', function(el){ st.riskBufferDays = Math.max(0, parseInt(el.value, 10) || 0); });
+  bind('setRiskBuffer', function(el){ st.riskBufferDays = intIn(el, 0, 365, 0); });
+  bind('setConfidence', function(el){ st.rangeConfidence = parseInt(el.value, 10); });
   bind('setBurnrateMethod', function(el){ st.burnrateMethod = el.value; });
-  bind('setBurnrateWindow', function(el){ st.burnrateWindowDays = Math.max(1, parseInt(el.value, 10) || 14); });
+  bind('setBurnrateWindow', function(el){ st.burnrateWindowDays = intIn(el, 1, 365, 14); });
+  bind('setWorkdays', function(el){ st.workdays = el.checked; });
+  bind('setHolidays', dateList('holidays'));
+  bind('setExtraWorkdays', dateList('extraWorkdays'));
+  bind('setUnits', function(el){ st.units = el.value; });
+  bind('setHoursPerDay', function(el){ var v = parseFloat(el.value); st.hoursPerDay = isNaN(v) ? 8 : Math.min(24, Math.max(1, v)); });
+  bind('setStaleDays', function(el){ st.staleDays = intIn(el, 1, 365, 10); });
+  bind('setScopeThreshold', function(el){ st.scopeThreshold = intIn(el, 1, 1000, 10); });
+  bind('setSlipThreshold', function(el){ st.slipThreshold = intIn(el, 1, 365, 7); });
+  bind('setChanceThreshold', function(el){ st.chanceThreshold = intIn(el, 1, 99, 50); });
+  bind('setInsightWindow', function(el){ st.insightWindowDays = intIn(el, 7, 365, 28); });
   applyReadonlyToView('view-settings');
 }
 
+var SETTINGS_KEYS = ['forecastMethod', 'riskBufferDays', 'burnrateMethod', 'burnrateWindowDays', 'rangeConfidence', 'workdays',
+  'holidays', 'extraWorkdays', 'units', 'hoursPerDay', 'staleDays', 'scopeThreshold', 'slipThreshold', 'chanceThreshold', 'insightWindowDays'];
 function saveSettings(prevSettings){
   if(!canEdit()) return;
-  apiPut('/api/projects/'+currentProjectId+'/settings', {
-    forecastMethod: STATE.settings.forecastMethod,
-    riskBufferDays: STATE.settings.riskBufferDays,
-    burnrateMethod: STATE.settings.burnrateMethod,
-    burnrateWindowDays: STATE.settings.burnrateWindowDays
-  }).then(function(){ toast('Настройки сохранены'); }).catch(function(){
+  var body = {};
+  SETTINGS_KEYS.forEach(function(k){ body[k] = STATE.settings[k]; });
+  apiPut('/api/projects/'+currentProjectId+'/settings', body).then(function(r){
+    /* на месте: экран настроек держит ссылку на этот объект — следующее изменение не должно потеряться */
+    if(r && r.settings) Object.assign(STATE.settings, r.settings);
+    toast('Настройки сохранены');
+  }).catch(function(){
     if(prevSettings){
       STATE.settings = prevSettings;
       if(currentView === 'settings') renderSettingsView();
@@ -1817,13 +1949,15 @@ var navItems = document.querySelectorAll('.nav-item');
 var pageTitle = document.getElementById('pageTitle');
 var pageSub = document.getElementById('pageSub');
 var ADMIN_VIEWS = ['users', 'projects', 'audit', 'integrations'];
+var GLOBAL_VIEWS = ADMIN_VIEWS.concat(['portfolio']);  /* не относятся к выбранному проекту */
 var PDF_VIEWS = ['dashboard', 'stages', 'data'];
 var titles = {
+  portfolio: ['Портфель проектов', 'Сводка по всем доступным проектам'],
   dashboard: ['Дашборд сгорания', 'Свод по эпикам и этапам'],
   stages: ['Свод по этапам', 'Агрегированное сгорание по укрупнённым этапам'],
   data: ['Данные по датам', 'Внесение и редактирование замеров'],
   services: ['Эпики (блоки задач)', 'Список эпиков проекта и целевых дат'],
-  settings: ['Настройки проекта', 'Параметры прогноза и расчёта burn rate'],
+  settings: ['Настройки проекта', 'Прогноз, календарь, единицы и пороги выводов'],
   jira: ['Связь с Jira', 'Кнопки среза: задачи Jira по эпикам проекта'],
   autofill: ['Автозаполнение', 'Срез из Jira по расписанию'],
   notify: ['Уведомления', 'Дайджест и оповещения по проекту'],
@@ -1842,19 +1976,20 @@ function navigate(view){
   var isAdminView = ADMIN_VIEWS.indexOf(view) !== -1;
   if(isAdminView && !isGlobalAdmin()) view = 'dashboard';
   if(['settings', 'jira', 'autofill'].indexOf(view) !== -1 && !canEdit()) view = 'dashboard';
-  if(!isAdminView && !currentProjectId && isGlobalAdmin()) view = 'projects';
+  if(GLOBAL_VIEWS.indexOf(view) === -1 && !currentProjectId && isGlobalAdmin()) view = 'projects';
   currentView = view;
   navItems.forEach(function(n){ n.classList.toggle('active', n.dataset.view === view); });
-  var viewId = (!currentProjectId && ADMIN_VIEWS.indexOf(view) === -1) ? 'view-empty' : 'view-'+view;
+  var viewId = (!currentProjectId && GLOBAL_VIEWS.indexOf(view) === -1) ? 'view-empty' : 'view-'+view;
   document.querySelectorAll('.view').forEach(function(v){ v.classList.toggle('active', v.id === viewId); });
   if(titles[view]){
     pageTitle.textContent = titles[view][0];
-    pageSub.textContent = titles[view][1] + (ADMIN_VIEWS.indexOf(view) === -1 ? projectTitleSuffix() : '');
+    pageSub.textContent = titles[view][1] + (GLOBAL_VIEWS.indexOf(view) === -1 ? projectTitleSuffix() : '');
   }
   var renderers = {dashboard:renderDashboard, stages:renderStagesView, data:renderDataView, services:renderServicesView,
     settings:renderSettingsView, jira:renderJiraView, autofill:renderAutofillView, notify:renderNotifyView,
-    integrations:renderIntegrationsView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); }};
-  if(renderers[view] && (currentProjectId || ADMIN_VIEWS.indexOf(view) !== -1)) renderers[view]();
+    integrations:renderIntegrationsView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); },
+    portfolio:renderPortfolioView};
+  if(renderers[view] && (currentProjectId || GLOBAL_VIEWS.indexOf(view) !== -1)) renderers[view]();
   var reportView = PDF_VIEWS.indexOf(view) !== -1 && currentProjectId;
   document.getElementById('btnPdf').style.display = reportView ? '' : 'none';
   document.getElementById('btnPrint').style.display = (reportView && view !== 'data') ? '' : 'none';
@@ -1872,6 +2007,9 @@ navItems.forEach(function(n){
    Dashboard render
 ════════════════════════════════════════════════════════════════ */
 function renderStagesView(){
+  applyBlockPrefs();
+  updateUnitLabels();
+  renderStageInsights();
   document.getElementById('stageShowDone').checked = stageShowDone;
   buildStagePanelsSkeleton();
   renderStageKpis();
@@ -1881,7 +2019,13 @@ function renderStagesView(){
   renderStageJira();
 }
 
+function updateUnitLabels(){
+  document.querySelectorAll('.rate-unit').forEach(function(el){ el.textContent = rateUnit(); });
+}
 function renderDashboard(){
+  applyBlockPrefs();
+  updateUnitLabels();
+  renderInsightsPanel();
   renderDashboardFilterBar();
   populateServiceSelects();
   updateEpicTargetInput();
@@ -1892,6 +2036,253 @@ function renderDashboard(){
   renderAllEpicsCharts();
   renderBurnRateTable();
 }
+
+/* ════════════════════════════════════════════════════════════════
+   Выводы: проект → этапы → эпики (расчёт на сервере, insights.py) и портфель проектов
+════════════════════════════════════════════════════════════════ */
+var insightsCache = {pid: null, data: null, promise: null, stamp: 0};
+function invalidateInsights(){ insightsCache.pid = null; insightsCache.data = null; insightsCache.promise = null; insightsCache.stamp++; }
+function loadInsights(){
+  var pid = currentProjectId;
+  if(!pid) return Promise.resolve(null);
+  if(insightsCache.pid === pid && insightsCache.data) return Promise.resolve(insightsCache.data);
+  if(insightsCache.pid === pid && insightsCache.promise) return insightsCache.promise;
+  var stamp = ++insightsCache.stamp;
+  insightsCache.pid = pid;
+  insightsCache.promise = api('/api/projects/' + pid + '/insights').then(function(d){
+    if(stamp === insightsCache.stamp){ insightsCache.data = d; insightsCache.promise = null; }
+    return d;
+  }, function(err){ if(stamp === insightsCache.stamp) invalidateInsights(); throw err; });
+  return insightsCache.promise;
+}
+var SEVERITY_LABELS = {danger: 'Не успеваем', risk: 'Риск', info: 'К сведению', ok: 'Хорошо'};
+function findingHtml(f, withSubject){
+  var subject = '';
+  if(withSubject && f.subject && f.ref){
+    subject = '<button type="button" class="insight-subject" data-level="' + f.ref.level + '" data-ref="' +
+      escapeAttr(f.ref.level === 'epic' ? f.ref.id : f.ref.name) + '">' + escapeHtml(f.subject) + '</button> ';
+  }
+  return '<li class="insight insight-' + f.severity + '"><span class="insight-dot" aria-hidden="true"></span>' +
+    '<span class="sr-only">' + SEVERITY_LABELS[f.severity] + ': </span><span class="insight-text">' + subject + escapeHtml(f.text) + '</span></li>';
+}
+function findingsList(items, withSubject, empty){
+  if(!items || !items.length) return empty ? '<p class="insight-empty">' + empty + '</p>' : '';
+  return '<ul class="insight-list">' + items.map(function(f){ return findingHtml(f, withSubject); }).join('') + '</ul>';
+}
+function seriesMeta(x){
+  var parts = ['прогноз ' + (x.forecast ? fmtDate(x.forecast) : (x.tooFar ? '> 3 лет' : (x.noBurn ? 'не сгорает' : '—')))];
+  if(x.target) parts.push('цель ' + fmtDate(x.target));
+  if(x.probability !== null && x.probability !== undefined) parts.push('шанс ' + Math.round(x.probability * 100) + '%');
+  if(isNum(x.remaining)) parts.push('остаток ' + hoursToStr(x.remaining));
+  return parts.join(' · ');
+}
+function insightsHeadHtml(summary){
+  return '<div class="insight-head insight-head-' + summary.status + '">' +
+    '<div class="insight-headline">' + escapeHtml(summary.headline) + '</div>' +
+    (summary.facts.length ? '<div class="insight-facts">' + summary.facts.map(function(f){
+      return '<div class="insight-fact"><div class="insight-fact-label">' + escapeHtml(f.label) + '</div><div class="insight-fact-value">' +
+        escapeHtml(f.value) + '</div>' + (f.hint ? '<div class="insight-fact-hint">' + escapeHtml(f.hint) + '</div>' : '') + '</div>';
+    }).join('') + '</div>' : '') + '</div>';
+}
+function epicDetailHtml(e){
+  return '<details class="insight-epic" data-epic="' + e.id + '"><summary>' + statusBadge(e.status) + ' <span class="insight-epic-name">' +
+    escapeHtml(e.name) + '</span><span class="insight-epic-head">' + escapeHtml(e.headline ? e.headline.text : '') + '</span></summary>' +
+    '<div class="insight-meta">' + seriesMeta(e) + '</div>' + findingsList(e.findings) + '</details>';
+}
+function stageDetailHtml(st, epics, index){
+  return '<div class="insight-stage" id="stageInsight-' + index + '"><div class="insight-stage-head">' + statusBadge(st.status) +
+    ' <b>' + escapeHtml(st.name) + '</b><span class="insight-meta">' + seriesMeta(st) + '</span></div>' +
+    findingsList(st.findings) + '<div class="insight-epics">' + epics.map(epicDetailHtml).join('') + '</div></div>';
+}
+function stageEpics(d, st){ return d.epics.filter(function(e){ return e.stage === st.name; }); }
+function insightsHtml(d){
+  var s = d.summary;
+  var html = insightsHeadHtml(s) + '<div class="insight-cols"><div><div class="insight-col-title">Главные риски</div>' +
+    findingsList(s.top, true, 'Рисков по срокам не видно.') + '</div><div>';
+  if(s.wins.length) html += '<div class="insight-col-title">Хорошие новости</div>' + findingsList(s.wins, true);
+  html += '<div class="insight-col-title">Данные</div>' + findingsList(s.health, false, 'Замеры свежие, цели заданы, ошибок автозаполнения нет.') + '</div></div>';
+  if(d.stages.length){
+    html += '<details class="insight-details"><summary>Подробно по этапам и эпикам</summary>' +
+      d.stages.map(function(st, i){ return stageDetailHtml(st, stageEpics(d, st), i); }).join('') + '</details>';
+  }
+  return html;
+}
+function bindInsightLinks(root){
+  root.querySelectorAll('.insight-subject').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      if(btn.dataset.level === 'epic') return showEpicOnDashboard(parseInt(btn.dataset.ref, 10));
+      showStageInsight(btn.dataset.ref);
+    });
+  });
+}
+function showEpicOnDashboard(sid){
+  var go = function(){
+    var sel = document.getElementById('chartServiceSelect');
+    if(!Array.prototype.some.call(sel.options, function(o){ return parseInt(o.value, 10) === sid; })){
+      /* эпик скрыт фильтром дашборда — показываем его */
+      if(dashboardFilter.epics) dashboardFilter.epics.push(sid);
+      if(dashboardFilter.hideDone && isSvcDone(sid)) dashboardFilter.hideDone = false;
+      renderDashboard();
+    }
+    sel.value = String(sid);
+    sel.dispatchEvent(new Event('change'));
+    var panel = document.querySelector('#view-dashboard [data-block="epic"]');
+    if(panel && panel.scrollIntoView) panel.scrollIntoView({behavior: 'smooth', block: 'start'});
+  };
+  if(currentView !== 'dashboard'){ navigate('dashboard'); setTimeout(go, 0); } else go();
+}
+function showStageInsight(name){
+  var go = function(){
+    loadInsights().then(function(d){
+      var i = d ? d.stages.findIndex(function(st){ return st.name === name; }) : -1;
+      var el = document.getElementById('stageInsight-' + i);
+      if(el && el.scrollIntoView){ el.scrollIntoView({behavior: 'smooth', block: 'start'}); el.classList.add('insight-flash'); setTimeout(function(){ el.classList.remove('insight-flash'); }, 1500); }
+    });
+  };
+  if(currentView !== 'stages'){ navigate('stages'); setTimeout(go, 0); } else go();
+}
+function insightsFailed(body){
+  body.classList.remove('insight-loading');
+  body.innerHTML = '<p class="insight-empty">Не удалось рассчитать выводы — обновите страницу.</p>';
+}
+/* пока выводы пересчитываются, прежние показаны приглушёнными */
+function markInsightsLoading(body){
+  if(!(insightsCache.pid === currentProjectId && insightsCache.data)) body.classList.add('insight-loading');
+}
+function renderInsightsPanel(){
+  var body = document.getElementById('insightsBody');
+  if(blockHidden('dashboard', 'insights')) return;
+  var pid = currentProjectId;
+  markInsightsLoading(body);
+  loadInsights().then(function(d){
+    if(!d || pid !== currentProjectId) return;
+    body.classList.remove('insight-loading');
+    body.innerHTML = insightsHtml(d);
+    bindInsightLinks(body);
+    body.querySelectorAll('.insight-epic').forEach(function(det){
+      det.querySelector('summary').addEventListener('dblclick', function(){ showEpicOnDashboard(parseInt(det.dataset.epic, 10)); });
+    });
+    renderEpicInsights();
+  }).catch(function(){ insightsFailed(body); });
+}
+/* «Почему такой прогноз» под графиком выбранного эпика */
+function renderEpicInsights(){
+  var box = document.getElementById('epicInsights');
+  var sid = parseInt(document.getElementById('chartServiceSelect').value, 10);
+  var d = insightsCache.pid === currentProjectId ? insightsCache.data : null;
+  var e = d ? d.epics.find(function(x){ return x.id === sid; }) : null;
+  box.hidden = !e;
+  if(!e){
+    if(!d && sid && !isSvcDone(sid)) loadInsights().then(function(x){ if(x) renderEpicInsights(); }).catch(function(){});
+    return;
+  }
+  box.innerHTML = '<div class="insight-col-title">Почему такой прогноз</div>' + findingsList(e.findings);
+}
+function renderStageInsights(){
+  var body = document.getElementById('stageInsightsBody');
+  if(blockHidden('stages', 'stageInsights')) return;
+  var pid = currentProjectId;
+  markInsightsLoading(body);
+  loadInsights().then(function(d){
+    if(!d || pid !== currentProjectId) return;
+    body.classList.remove('insight-loading');
+    body.innerHTML = d.stages.length ? d.stages.map(function(st, i){
+      var epics = stageEpics(d, st);
+      return '<div class="insight-stage" id="stageInsight-' + i + '"><div class="insight-stage-head">' + statusBadge(st.status) +
+        ' <b>' + escapeHtml(st.name) + '</b><span class="insight-meta">' + seriesMeta(st) + '</span></div>' + findingsList(st.findings) +
+        '<div class="insight-epic-chips">' + epics.map(function(e){
+          return '<button type="button" class="insight-chip insight-chip-' + e.status + '" data-epic="' + e.id + '" title="' +
+            escapeAttr(e.headline ? e.headline.text : '') + '">' + escapeHtml(e.name) + '</button>';
+        }).join('') + '</div></div>';
+    }).join('') : '<p class="insight-empty">В проекте нет несданных эпиков.</p>';
+    body.querySelectorAll('.insight-chip').forEach(function(b){
+      b.addEventListener('click', function(){ showEpicOnDashboard(parseInt(b.dataset.epic, 10)); });
+    });
+  }).catch(function(){ insightsFailed(body); });
+}
+
+/* ── Портфель проектов ───────────────────────────────────────── */
+function portfolioFact(p, label){
+  var f = (p.summary.facts || []).find(function(x){ return x.label === label; });
+  return f ? f.value : '—';
+}
+function renderPortfolioView(){
+  var body = document.getElementById('portfolioBody');
+  api('/api/portfolio').then(function(d){
+    if(currentView !== 'portfolio') return;
+    var status = d.counts.danger ? 'danger' : (d.counts.risk ? 'risk' : (d.counts.ok ? 'ok' : 'unknown'));
+    var html = '<div class="insight-head insight-head-' + status + '"><div class="insight-headline">' + escapeHtml(d.headline) + '</div>' +
+      '<div class="insight-facts">' + [['Не успевают', d.counts.danger], ['С рисками', d.counts.risk], ['В порядке', d.counts.ok], ['Нет данных', d.counts.unknown]].map(function(c){
+        return '<div class="insight-fact"><div class="insight-fact-label">' + c[0] + '</div><div class="insight-fact-value">' + c[1] + '</div></div>';
+      }).join('') + '</div></div>';
+    html += '<div class="table-scroll"><table class="data-table portfolio-table"><thead><tr><th>Проект</th><th>Статус</th><th>Главное</th>' +
+      '<th>Прогноз завершения</th><th class="num">Остаток</th><th>Первоочередные риски</th></tr></thead><tbody>' +
+      d.projects.map(function(p){
+        var top = p.summary.top.slice(0, 2).map(function(f){ return '<div class="portfolio-risk insight-' + f.severity + '"><b>' + escapeHtml(f.subject) + ':</b> ' + escapeHtml(f.text) + '</div>'; }).join('');
+        return '<tr class="clickable-row" data-project="' + p.id + '" tabindex="0"><td><b>' + escapeHtml(p.name) + '</b><div class="muted-cell">' +
+          p.epics + ' ' + (p.epics % 10 === 1 && p.epics % 100 !== 11 ? 'эпик' : (p.epics % 10 >= 2 && p.epics % 10 <= 4 && (p.epics % 100 < 12 || p.epics % 100 > 14) ? 'эпика' : 'эпиков')) +
+          '</div></td><td>' + statusBadge(p.summary.status) + '</td><td>' + escapeHtml(p.summary.headline) + '</td><td class="nowrap">' +
+          escapeHtml(portfolioFact(p, 'Прогноз завершения')) + '</td><td class="num nowrap">' + escapeHtml(portfolioFact(p, 'Остаток')) + '</td><td>' +
+          (top || '<span class="muted-cell">—</span>') + '</td></tr>';
+      }).join('') + '</tbody></table></div>';
+    body.innerHTML = d.projects.length ? html : '<p class="insight-empty">Нет доступных проектов.</p>';
+    body.querySelectorAll('tr[data-project]').forEach(function(tr){
+      var open = function(){ switchProject(parseInt(tr.dataset.project, 10)); };
+      tr.addEventListener('click', open);
+      tr.addEventListener('keydown', function(e){ if(e.key === 'Enter') open(); });
+    });
+  }).catch(function(){ body.innerHTML = '<p class="insight-empty">Не удалось загрузить портфель.</p>'; });
+}
+document.getElementById('portfolioRefresh').addEventListener('click', function(){
+  document.getElementById('portfolioBody').innerHTML = '<p class="insight-empty">Считаем выводы по проектам…</p>';
+  renderPortfolioView();
+});
+
+/* ── Вид дашборда и свода: какие блоки показывать (личная настройка) ── */
+var VIEW_BLOCKS = {
+  dashboard: [['insights', 'Выводы'], ['kpis', 'Ключевые показатели'], ['epic', 'Динамика по выбранному эпику'],
+    ['epicExtra', 'Затраченное время и оценка эпика'], ['drift', 'Дрейф прогноза'], ['burnup', 'Объём и выполнение по задачам Jira (эпик)'],
+    ['allEpics', 'Графики по всем выбранным эпикам'], ['composition', 'Задачи Jira по эпикам'], ['summary', 'Сводка по всем эпикам'],
+    ['burnRate', 'Burn rate по эпикам']],
+  stages: [['stageInsights', 'Выводы по этапам'], ['stageKpis', 'Карточки этапов'], ['stageCharts', 'Графики этапов'],
+    ['stageSummary', 'Сводка по этапам'], ['stageJira', 'Задачи Jira по этапам'], ['stageBurnup', 'Объём и выполнение по задачам Jira (этап)'],
+    ['stageBurnRate', 'Burn rate по этапам']]
+};
+function hiddenBlocks(view){
+  var prefs = (currentUser && currentUser.prefs) || {};
+  return ((prefs.hiddenBlocks || {})[view]) || [];
+}
+function blockHidden(view, key){ return hiddenBlocks(view).indexOf(key) !== -1; }
+function applyBlockPrefs(){
+  Object.keys(VIEW_BLOCKS).forEach(function(view){
+    document.querySelectorAll('#view-' + view + ' [data-block]').forEach(function(el){
+      el.classList.toggle('block-off', blockHidden(view, el.dataset.block));
+    });
+  });
+}
+function openBlocksModal(view){
+  var hidden = hiddenBlocks(view);
+  openModal({title: view === 'dashboard' ? 'Вид дашборда' : 'Вид свода по этапам', okLabel: 'Сохранить',
+    html: '<p class="bulk-intro">Отметьте блоки, которые нужно показывать. Настройка личная: другие пользователи видят свой вид.</p>' +
+      '<div class="blocks-list">' + VIEW_BLOCKS[view].map(function(b){
+        return '<label class="checkbox-row"><input type="checkbox" data-block-key="' + b[0] + '"' + (hidden.indexOf(b[0]) === -1 ? ' checked' : '') + '> ' + b[1] + '</label>';
+      }).join('') + '</div>',
+    onOk: function(){
+      var all = {};
+      Object.keys(VIEW_BLOCKS).forEach(function(v){ all[v] = hiddenBlocks(v).slice(); });
+      all[view] = Array.prototype.filter.call(confirmBody.querySelectorAll('[data-block-key]'), function(cb){ return !cb.checked; })
+        .map(function(cb){ return cb.dataset.blockKey; });
+      apiPut('/api/profile/prefs', {hiddenBlocks: all}).then(function(r){
+        currentUser.prefs = r.prefs;
+        closeModal();
+        applyBlockPrefs();
+        navigate(currentView);
+      }).catch(function(){});
+    }});
+}
+document.querySelectorAll('.view-blocks-btn').forEach(function(btn){
+  btn.addEventListener('click', function(){ openBlocksModal(btn.dataset.blocks); });
+});
 
 /* ── Быстрые фильтры дашборда и свода ────────────────────────── */
 function renderDashboardFilterBar(){
@@ -1934,6 +2325,7 @@ document.getElementById('stageShowDone').addEventListener('change', function(e){
 document.getElementById('chartServiceSelect').addEventListener('change', function(){
   updateEpicTargetInput();
   renderEpicCharts();
+  renderEpicInsights();
 });
 document.getElementById('epicTargetDate').addEventListener('change', function(e){
   var sid = parseInt(document.getElementById('chartServiceSelect').value, 10);
@@ -2492,10 +2884,10 @@ function burnupForecast(hist){
     var windowed = hist.filter(function(p){ return p.date >= cutoff; });
     pts = windowed.length >= 2 ? windowed : hist.slice(-2);
   }
-  var base = pts[0].date;
-  if(daysBetween(base, pts[pts.length-1].date) <= 0) return null;
+  var base = pts[0].date, cal = workCalendar();
+  if(cal.span(base, pts[pts.length-1].date) <= 0) return null;
   var slope = function(f){
-    var reg = linearForecast(pts.map(function(p){ return {x: daysBetween(base, p.date), y: p[f]}; }));
+    var reg = linearForecast(pts.map(function(p){ return {x: cal.span(base, p.date), y: p[f]}; }));
     return reg ? reg.slope : null;
   };
   var doneRate = slope('done'), scopeRate = slope('scope');
@@ -2507,11 +2899,11 @@ function burnupForecast(hist){
   var speed = doneRate - scopeRate;
   if(speed <= 0) return res;
   var days = gap / speed;
-  if(days > MC_HORIZON_DAYS) return Object.assign(res, {tooFar: true});
-  return Object.assign(res, {converges: true, date: addDays(last.date, Math.ceil(days)), finish: last.scope + scopeRate * days, days: days});
+  if(days > cal.horizon) return Object.assign(res, {tooFar: true});
+  return Object.assign(res, {converges: true, date: cal.shift(last.date, Math.ceil(days)), finish: last.scope + scopeRate * days, days: days});
 }
 function burnupRatesText(f){
-  return 'выполнение ' + fmtNum(Math.round(f.doneRate * 100) / 100) + ' ч/день, рост объёма ' + fmtNum(Math.round(f.scopeRate * 100) / 100) + ' ч/день';
+  return 'выполнение ' + fmtWorkNum(f.doneRate) + ' ' + rateUnit() + ', рост объёма ' + fmtWorkNum(f.scopeRate) + ' ' + rateUnit();
 }
 function burnupForecastText(f){
   if(!f) return 'Для прогноза по задачам нужны срезы минимум в два разных дня.';
@@ -2572,7 +2964,7 @@ function compositionRowHtml(o){
     var prev = hist[hist.length - 2];
     var d = Math.round((l.scope - prev.scope) * 100) / 100;
     var cls = d > 0 ? 'delta-up' : (d < 0 ? 'delta-down' : 'muted-cell');
-    var text = (d > 0 ? '+' : '') + fmtNum(d) + ' ч';
+    var text = signedWork(d);
     delta = o.changesSid ? '<button type="button" class="link-btn '+cls+'" data-changes="'+o.changesSid+'" title="Что изменилось с '+fmtDate(prev.date)+'">'+text+'</button>' :
       '<span class="'+cls+'" title="С '+fmtDate(prev.date)+'">'+text+'</span>';
   }
@@ -2587,7 +2979,7 @@ function compositionRowHtml(o){
     '<td class="mono nowrap">'+fmtDate(l.date)+'</td></tr>';
 }
 var COMPOSITION_HEAD = '<th class="comp-col">Состав задач</th><th class="num">Выполнено объёма</th><th class="num">Задач готово</th>'+
-  '<th class="num">Объём, ч</th><th class="num" title="Изменение объёма с прошлого среза">Δ объёма</th>'+
+  '<th class="num">Объём, '+unitSuffix()+'</th><th class="num" title="Изменение объёма с прошлого среза">Δ объёма</th>'+
   '<th title="Дата, когда «Выполнено» догонит «Объём» при текущих темпах (burn-up). Зелёным — не позже цели">Прогноз по задачам</th>'+
   '<th>Данные</th><th>Срез</th>';
 
@@ -2640,7 +3032,7 @@ function drawBurnup(key, canvasId, legendId, noteId, hist){
   }
   renderLegend(legendId, datasets);
   document.getElementById(noteId).innerHTML = burnupForecastText(f);
-  var opts = baseChartOptions('Часы');
+  var opts = baseChartOptions(unitAxisTitle());
   opts.plugins.tooltip.callbacks.afterLabel = function(ctx){
     if(ctx.dataset.isForecast) return '';
     var raw = ctx.raw || {};
@@ -2669,7 +3061,7 @@ function forecastDrift(sid){
     var sub = rows.slice(0, i + 1);
     var st = computeStatus(sub.map(function(r){ return r.date; }), sub.map(function(r){ return r.remaining; }), target);
     points.push({date: rows[i].date, forecast: st.forecastZeroDate, noBurn: st.noBurn,
-                 p15: st.mc ? st.mc.p15 : null, p50: st.mc ? st.mc.p50 : null, p85: st.mc ? st.mc.p85 : null});
+                 lo: st.mc ? st.mc.lo : null, p50: st.mc ? st.mc.p50 : null, hi: st.mc ? st.mc.hi : null});
   }
   return {points: points, target: target};
 }
@@ -2709,9 +3101,9 @@ function renderDriftChart(){
      data: pts.map(function(p){ return {x: p.date, y: v(p.forecast)}; }), borderColor: color, borderDash: [3, 3], borderWidth: 2, pointRadius: 3, tension: 0},
     {label: 'Медиана (P50)', data: pts.map(function(p){ return {x: p.date, y: v(p.p50)}; }),
      borderColor: getCss('--color-primary'), borderWidth: 2.5, pointRadius: 4, tension: 0},
-    {label: 'Диапазон 70%', data: pts.map(function(p){ return {x: p.date, y: v(p.p15)}; }),
+    {label: 'Диапазон ' + rangeConfidence() + '%', data: pts.map(function(p){ return {x: p.date, y: v(p.lo)}; }),
      borderColor: color + '55', backgroundColor: color + '1f', borderWidth: 1, pointRadius: 0, tension: 0, isRange: true},
-    {label: '', data: pts.map(function(p){ return {x: p.date, y: v(p.p85)}; }), borderColor: color + '55', backgroundColor: color + '1f',
+    {label: '', data: pts.map(function(p){ return {x: p.date, y: v(p.hi)}; }), borderColor: color + '55', backgroundColor: color + '1f',
      borderWidth: 1, pointRadius: 0, tension: 0, fill: '-1', isRange: true, hideInLegend: true}
   ];
   if(drift.target){
@@ -2734,7 +3126,7 @@ function renderDriftChart(){
       callbacks: {
         title: function(items){ return items.length ? 'На замер ' + fmtDate(items[0].raw.x) : ''; },
         label: function(ctx){
-          if(ctx.dataset.isRange) return (ctx.dataset.hideInLegend ? 'P85 (пессимистично)' : 'P15 (оптимистично)') + ': ' + fmtDate(ctx.raw.y);
+          if(ctx.dataset.isRange) return (ctx.dataset.hideInLegend ? 'Пессимистично' : 'Оптимистично') + ': ' + fmtDate(ctx.raw.y);
           return (ctx.dataset.label || '').replace(/: .*/, '') + ': ' + fmtDate(ctx.raw.y);
         }
       }}},
@@ -2796,7 +3188,7 @@ function jiraIssueLink(baseUrl, key){
   if(!baseUrl) return '<span class="mono">'+escapeHtml(key)+'</span>';
   return '<a class="mono" href="'+escapeAttr(baseUrl + '/browse/' + encodeURIComponent(key))+'" target="_blank" rel="noopener">'+escapeHtml(key)+'</a>';
 }
-function signedHours(v){ return (v > 0 ? '+' : '') + fmtNum(v) + ' ч'; }
+function signedHours(v){ return signedWork(v); }
 
 /* Что изменилось в задачах эпика между двумя срезами: каскад объёма и списки задач */
 var CHANGE_GROUPS = [
@@ -2830,11 +3222,11 @@ function openJiraChanges(sid, from, to){
       var grp = c[g[0]];
       if(!grp.count) return '';
       return '<details class="change-group"'+(g[0] === 'added' || g[0] === 'reestimated' ? ' open' : '')+'><summary><b>'+g[1]+'</b> · '+grp.count+
-        (g[0] === 'closed' || g[0] === 'reopened' ? ' · ' + fmtNum(grp.volume) + ' ч' : ' · ' + signedHours(grp.volume))+
+        (g[0] === 'closed' || g[0] === 'reopened' ? ' · ' + hoursToStr(grp.volume) : ' · ' + signedHours(grp.volume))+
         ' <span class="muted-cell">'+g[2]+'</span></summary><table class="data-table compact-table"><tbody>'+
         grp.issues.map(function(i){
           var value = i.delta !== undefined ? fmtNum(i.before) + ' → ' + fmtNum(i.volume) + ' ч (' + signedHours(i.delta) + ')' :
-            fmtNum(i.volume) + ' ч';
+            hoursToStr(i.volume);
           return '<tr><td class="nowrap">'+jiraIssueLink(c.baseUrl, i.key)+'</td><td>'+escapeHtml(i.summary)+'</td>'+
             '<td class="nowrap"><span class="badge '+CATEGORY_BADGE[i.category]+'">'+escapeHtml(i.status || CATEGORY_LABELS[i.category])+'</span></td>'+
             '<td class="num nowrap">'+value+'</td></tr>';
@@ -2845,7 +3237,7 @@ function openJiraChanges(sid, from, to){
       html: '<div class="changes-period"><label class="small" for="chFrom">С</label><select id="chFrom">'+options(c.from, function(d){ return d < c.to; })+'</select>'+
           '<label class="small" for="chTo">по</label><select id="chTo">'+options(c.to, function(d){ return d > c.from; })+'</select>'+
           '<span class="muted-cell">даты срезов задач</span></div>'+
-        '<p class="bulk-intro">Объём эпика: <b>'+fmtNum(c.scopeFrom)+' ч</b> → <b>'+fmtNum(c.scopeTo)+' ч</b> ('+signedHours(Math.round((c.scopeTo - c.scopeFrom) * 100) / 100)+'). '+
+        '<p class="bulk-intro">Объём эпика: <b>'+hoursToStr(c.scopeFrom)+'</b> → <b>'+hoursToStr(c.scopeTo)+'</b> ('+signedHours(Math.round((c.scopeTo - c.scopeFrom) * 100) / 100)+'). '+
           'Выполнено: '+fmtNum(c.doneFrom)+' → '+fmtNum(c.doneTo)+' ч.</p>'+
         '<div class="chart-wrap chart-wrap-sm"><canvas id="chartScopeChanges" aria-label="Каскад изменения объёма"></canvas></div>'+
         '<div class="changes-lists">'+CHANGE_GROUPS.map(groupList).join('')+
@@ -2879,11 +3271,11 @@ function renderScopeWaterfall(c){
     options: {responsive: true, maintainAspectRatio: false, plugins: {legend: {display: false},
       tooltip: {callbacks: {label: function(ctx){
         var st = steps[ctx.dataIndex];
-        return st[3] === 'base' && st[1] === 0 ? fmtNum(st[2]) + ' ч' : signedHours(Math.round((st[2] - st[1]) * 100) / 100);
+        return st[3] === 'base' && st[1] === 0 ? hoursToStr(st[2]) : signedHours(Math.round((st[2] - st[1]) * 100) / 100);
       }}}},
       scales: {x: {grid: {display: false}, ticks: {color: getCss('--color-text-muted')}},
-               y: {beginAtZero: true, title: {display: true, text: 'Часы', color: getCss('--color-text-muted')},
-                   grid: {color: getCss('--color-divider')}, ticks: {color: getCss('--color-text-muted')}}}}
+               y: {beginAtZero: true, title: {display: true, text: unitAxisTitle(), color: getCss('--color-text-muted')},
+                   grid: {color: getCss('--color-divider')}, ticks: {color: getCss('--color-text-muted'), callback: function(v){ return fmtWorkNum(v); }}}}}
   });
 }
 
@@ -3558,6 +3950,7 @@ document.getElementById('btnAddProject').addEventListener('click', function(){ o
 ════════════════════════════════════════════════════════════════ */
 function renderProjectsNav(){
   var nav = document.getElementById('projectsNav');
+  document.getElementById('overviewNav').hidden = projects.length < 2;  /* портфель — когда проектов несколько */
   var html = '<div class="nav-label">Проекты</div>';
   if(!projects.length){
     nav.innerHTML = html + '<div class="nav-empty">Нет доступных проектов</div>';
@@ -3577,7 +3970,7 @@ function renderProjectsNav(){
 }
 
 function switchProject(pid){
-  if(pid === currentProjectId){ if(ADMIN_VIEWS.indexOf(currentView) !== -1) navigate('dashboard'); return; }
+  if(pid === currentProjectId){ if(GLOBAL_VIEWS.indexOf(currentView) !== -1) navigate('dashboard'); return; }
   var proj = projects.find(function(p){ return p.id === pid; });
   currentProjectId = pid;
   currentProjectRole = proj ? proj.role : null;
@@ -3590,7 +3983,7 @@ function switchProject(pid){
   renderProjectsNav();
   updateRoleUI();
   /* из админ-разделов переходим к данным выбранного проекта */
-  loadProjectData(pid, ADMIN_VIEWS.indexOf(currentView) !== -1 ? 'dashboard' : currentView);
+  loadProjectData(pid, GLOBAL_VIEWS.indexOf(currentView) !== -1 ? 'dashboard' : currentView);
 }
 
 function loadProjectData(pid, view){
@@ -3660,7 +4053,10 @@ var auditFieldLabels = {
   autofill: 'Расписание', result: 'Результат',
   smtpHost: 'SMTP-сервер', smtpPort: 'Порт SMTP', smtpSecurity: 'Защита SMTP', smtpLogin: 'Логин SMTP', smtpFrom: 'Отправитель',
   smtpPassword: 'Пароль SMTP', telegramToken: 'Токен Telegram-бота', publicUrl: 'Адрес Burndown',
-  forecastMethod: 'Метод прогноза', riskBufferDays: 'Буфер риска', burnrateMethod: 'Метод burn rate', burnrateWindowDays: 'Окно burn rate'
+  forecastMethod: 'Метод прогноза', riskBufferDays: 'Буфер риска', burnrateMethod: 'Метод burn rate', burnrateWindowDays: 'Окно burn rate',
+  rangeConfidence: 'Уровень доверия диапазона', workdays: 'Рабочие дни', holidays: 'Праздники', extraWorkdays: 'Рабочие выходные',
+  units: 'Единицы', hoursPerDay: 'Часов в рабочем дне', staleDays: 'Замер устарел, дней', scopeThreshold: 'Рост объёма, %',
+  slipThreshold: 'Сдвиг прогноза, дней', chanceThreshold: 'Порог шанса, %', insightWindowDays: 'Период сравнения, дней'
 };
 /* В БД время хранится в UTC (CURRENT_TIMESTAMP) — показываем в локальном часовом поясе */
 function fmtDateTime(ts){

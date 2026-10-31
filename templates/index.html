@@ -33,6 +33,11 @@
       </div>
     </div>
 
+    <nav class="nav-group" id="overviewNav" hidden>
+      <div class="nav-label">Обзор</div>
+      <a href="#" class="nav-item" data-view="portfolio" id="navPortfolio">Портфель проектов</a>
+    </nav>
+
     <nav class="nav-group" id="projectsNav">
       <div class="nav-label">Проекты</div>
     </nav>
@@ -108,10 +113,20 @@
             <button type="button" class="btn btn-ghost btn-sm" id="dashEpicAll">Все</button>
             <button type="button" class="btn btn-ghost btn-sm" id="dashEpicNone">Снять все</button>
           </div>
+          <button type="button" class="btn btn-ghost btn-sm view-blocks-btn" data-blocks="dashboard" title="Какие блоки показывать на дашборде">⚙ Вид</button>
         </div>
       </div>
-      <div class="kpi-grid" id="kpiGrid"></div>
-      <div class="panel">
+      <div class="panel insights-panel" id="insightsPanel" data-block="insights">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Выводы</div>
+            <div class="section-note">Что происходит со сроками и почему — по всем несданным эпикам проекта на сегодня. Пороги выводов — в настройках проекта.</div>
+          </div>
+        </div>
+        <div id="insightsBody" aria-live="polite"><p class="insight-empty">Считаем выводы…</p></div>
+      </div>
+      <div class="kpi-grid" id="kpiGrid" data-block="kpis"></div>
+      <div class="panel" data-block="epic">
         <div class="panel-head">
           <div>
             <div class="panel-title">Динамика по выбранному эпику</div>
@@ -126,8 +141,9 @@
         </div>
         <div class="legend-row" id="legendRemaining"></div>
         <div class="chart-wrap"><canvas id="chartRemaining"></canvas></div>
+        <div class="epic-insights" id="epicInsights" hidden></div>
       </div>
-      <div class="chart-grid">
+      <div class="chart-grid" data-block="epicExtra">
         <div class="panel">
           <div class="panel-head"><div class="panel-title">Затраченное время (эпик)</div></div>
           <div class="legend-row" id="legendSpentEpic"></div>
@@ -139,7 +155,7 @@
           <div class="chart-wrap chart-wrap-sm"><canvas id="chartEstimateEpic"></canvas></div>
         </div>
       </div>
-      <div class="panel" id="driftPanel" hidden>
+      <div class="panel" id="driftPanel" data-block="drift" hidden>
         <div class="panel-head">
           <div>
             <div class="panel-title">Дрейф прогноза (эпик)</div>
@@ -150,7 +166,7 @@
         <div class="legend-row" id="legendDrift"></div>
         <div class="chart-wrap chart-wrap-sm"><canvas id="chartDrift"></canvas></div>
       </div>
-      <div class="panel" id="jiraBurnupPanel" hidden>
+      <div class="panel" id="jiraBurnupPanel" data-block="burnup" hidden>
         <div class="panel-head">
           <div>
             <div class="panel-title">Объём и выполнение по задачам Jira (эпик)</div>
@@ -165,7 +181,7 @@
         <div class="legend-row" id="legendBurnup"></div>
         <div class="chart-wrap chart-wrap-sm"><canvas id="chartBurnup"></canvas></div>
       </div>
-      <details class="collapsible" id="allEpicsBlock" open>
+      <details class="collapsible" id="allEpicsBlock" data-block="allEpics" open>
         <summary class="collapsible-summary">Графики по всем выбранным эпикам <span class="collapsible-hint">остаток, затраченное время и оценка</span></summary>
         <div class="view-stack">
           <div class="panel">
@@ -192,7 +208,7 @@
           </div>
         </div>
       </details>
-      <div class="panel" id="jiraCompPanel" hidden>
+      <div class="panel" id="jiraCompPanel" data-block="composition" hidden>
         <div class="panel-head">
           <div>
             <div class="panel-title">Задачи Jira по эпикам</div>
@@ -201,14 +217,14 @@
         </div>
         <div class="table-scroll"><table class="data-table" id="jiraCompTable"></table></div>
       </div>
-      <div class="panel">
+      <div class="panel" data-block="summary">
         <div class="panel-head"><div class="panel-title">Сводка по всем эпикам</div></div>
         <div class="table-scroll"><table class="data-table" id="summaryTable"></table></div>
       </div>
-      <div class="panel">
+      <div class="panel" data-block="burnRate">
         <div class="panel-head">
           <div>
-            <div class="panel-title">Burn rate по эпикам, ч/день</div>
+            <div class="panel-title">Burn rate по эпикам, <span class="rate-unit">ч/день</span></div>
             <div class="section-note">Дневная скорость сгорания остатка. По умолчанию — последние 5 дат замеров.</div>
           </div>
           <div class="panel-controls">
@@ -228,15 +244,25 @@
       <div class="panel quick-filter">
         <div class="quick-filter-row">
           <label class="quick-filter-item" title="По умолчанию сданные эпики не учитываются в своде по этапам"><input type="checkbox" id="stageShowDone"> Учитывать сданные эпики</label>
+          <button type="button" class="btn btn-ghost btn-sm view-blocks-btn" data-blocks="stages" title="Какие блоки показывать в своде">⚙ Вид</button>
         </div>
       </div>
-      <div class="kpi-grid" id="stageKpiGrid"></div>
-      <div class="view-stack" id="stageChartsContainer"></div>
-      <div class="panel">
+      <div class="panel insights-panel" id="stageInsightsPanel" data-block="stageInsights">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Выводы по этапам</div>
+            <div class="section-note">Статус и причины по каждому этапу: кто определяет срок, сколько эпиков под угрозой, как меняются темп и объём. Сданные эпики не учитываются.</div>
+          </div>
+        </div>
+        <div id="stageInsightsBody" aria-live="polite"><p class="insight-empty">Считаем выводы…</p></div>
+      </div>
+      <div class="kpi-grid" id="stageKpiGrid" data-block="stageKpis"></div>
+      <div class="view-stack" id="stageChartsContainer" data-block="stageCharts"></div>
+      <div class="panel" data-block="stageSummary">
         <div class="panel-head"><div class="panel-title">Сводка по этапам</div></div>
         <div class="table-scroll"><table class="data-table" id="stageSummaryTable"></table></div>
       </div>
-      <div class="panel" id="stageJiraPanel" hidden>
+      <div class="panel" id="stageJiraPanel" data-block="stageJira" hidden>
         <div class="panel-head">
           <div>
             <div class="panel-title">Задачи Jira по этапам</div>
@@ -245,7 +271,7 @@
         </div>
         <div class="table-scroll"><table class="data-table" id="stageJiraTable"></table></div>
       </div>
-      <div class="panel" id="stageBurnupPanel" hidden>
+      <div class="panel" id="stageBurnupPanel" data-block="stageBurnup" hidden>
         <div class="panel-head">
           <div>
             <div class="panel-title">Объём и выполнение по задачам Jira</div>
@@ -260,10 +286,10 @@
         <div class="legend-row" id="legendStageBurnup"></div>
         <div class="chart-wrap chart-wrap-sm"><canvas id="chartStageBurnup"></canvas></div>
       </div>
-      <div class="panel">
+      <div class="panel" data-block="stageBurnRate">
         <div class="panel-head">
           <div>
-            <div class="panel-title">Burn rate по этапам, ч/день</div>
+            <div class="panel-title">Burn rate по этапам, <span class="rate-unit">ч/день</span></div>
             <div class="section-note">Сумма дневных burn rate эпиков этапа. По умолчанию — последние 5 дат замеров.</div>
           </div>
           <div class="panel-controls">
@@ -275,6 +301,20 @@
           </div>
         </div>
         <div class="table-scroll"><table class="data-table" id="stageBurnRateTable"></table></div>
+      </div>
+    </section>
+
+    <!-- PORTFOLIO -->
+    <section class="view" id="view-portfolio">
+      <div class="panel insights-panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Портфель проектов</div>
+            <div class="section-note">Все доступные вам проекты — от самых острых к благополучным: статус, главное, прогноз завершения и первоочередные риски. Щелчок по проекту — его дашборд.</div>
+          </div>
+          <button type="button" class="btn btn-ghost btn-sm" id="portfolioRefresh">Обновить</button>
+        </div>
+        <div id="portfolioBody" aria-live="polite"><p class="insight-empty">Считаем выводы по проектам…</p></div>
       </div>
     </section>
 
@@ -321,7 +361,7 @@
         <div class="panel-head">
           <div>
             <div class="panel-title">Настройки проекта</div>
-            <div class="section-note">Целевые даты задаются по каждому эпику («Эпики (блоки задач)») и этапу («Свод по этапам»). Здесь — общие параметры прогноза и burn rate.</div>
+            <div class="section-note">Целевые даты задаются по каждому эпику («Эпики (блоки задач)») и этапу («Свод по этапам»). Здесь — параметры прогноза и burn rate, календарь, единицы и пороги выводов.</div>
           </div>
         </div>
         <div class="settings-grid" id="settingsGrid"></div>
@@ -329,11 +369,11 @@
       <div class="panel">
         <div class="panel-head"><div class="panel-title">Как считаются метрики</div></div>
         <ul class="metrics-help">
-          <li><b>Burn rate</b> — средняя дневная скорость сгорания остатка: по всей истории или по скользящему окну.</li>
+          <li><b>Burn rate</b> — средняя дневная скорость сгорания остатка: по всей истории или по скользящему окну; при расчёте в рабочих днях — за рабочий день.</li>
           <li><b>Прогноз</b> — линейная регрессия по факту либо продолжение текущего burn rate.</li>
           <li><b>Целевая линия</b> — прямая от последнего заполненного остатка к нулю на целевую дату.</li>
           <li><b>Статус</b>: прогноз достигает нуля к цели — «успеваем», в пределах буфера — «риск», позже — «не успеваем».</li>
-          <li><b>Шанс успеть</b> — вероятность обнулить остаток к цели: 2000 сценариев будущего, собранных из реальных интервалов между замерами (с учётом метода burn rate). На графике эпика — диапазон 70%: между оптимистичной (P15) и пессимистичной (P85) датой.</li>
+          <li><b>Шанс успеть</b> — вероятность обнулить остаток к цели: 2000 сценариев будущего, собранных из реальных интервалов между замерами (с учётом метода burn rate). На графике эпика — диапазон прогноза: между оптимистичной и пессимистичной датой с уровнем доверия из настроек (по умолчанию 70%).</li>
         </ul>
       </div>
     </section>

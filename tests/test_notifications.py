@@ -206,7 +206,7 @@ def test_digest_schedule_once_per_day(admin, flask_app, fake_smtp, mail_ready):
     admin.post('/api/projects/1/measurements', json={'date': '2026-08-03', 'items': [
         {'serviceId': 1, 'remaining': 300, 'spent': 300, 'estimate': 420}]})
     assert run(flask_app, app_module.run_due_digests, datetime(2026, 11, 9, 6, 30, tzinfo=timezone.utc)) == 1
-    assert 'остаток -46 ч' in fake_smtp.sent[-1].get_body(('plain',)).get_content()
+    assert 'остаток -46\xa0ч' in fake_smtp.sent[-1].get_body(('plain',)).get_content()
 
 
 def test_digest_skipped_without_access(admin, flask_app, fake_smtp, make_user, mail_ready):

@@ -255,7 +255,7 @@ def test_burnup_forecast():
     assert burnup_forecast([pt('2026-11-01', 20, 0), pt('2026-11-01', 20, 5)]) is None
     # скользящее окно: учитываются только срезы последних 7 дней (рывок в начале не влияет)
     hist = [pt('2026-10-01', 20, 0), pt('2026-10-02', 20, 9), pt('2026-10-20', 20, 10), pt('2026-10-27', 20, 12)]
-    f = burnup_forecast(hist, {'burnrate_method': 'rolling', 'burnrate_window_days': 7})
+    f = burnup_forecast(hist, {'burnrateMethod': 'rolling', 'burnrateWindowDays': 7})
     assert f['date'] == '2026-11-24'  # 8 ч при 2/7 ч в день = 28 дней после 27.10
 
 

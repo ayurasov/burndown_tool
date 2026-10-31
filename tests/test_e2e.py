@@ -14,12 +14,13 @@ from conftest import ADMIN
 
 sync_api = pytest.importorskip('playwright.sync_api')
 
-VIEWS = ['dashboard', 'stages', 'data', 'services', 'settings', 'users', 'projects', 'audit']
+VIEWS = ['dashboard', 'stages', 'data', 'services', 'settings', 'users', 'projects', 'audit', 'portfolio']
 # Разделы, которые при открытии загружают данные с сервера: ждём ответа, а не «тишины в сети»
 VIEW_REQUESTS = {
     'users': ('/api/users', '#usersTable tbody tr'),
     'projects': ('/api/projects', '#projectsMgmtTable tbody tr'),
     'audit': ('/api/audit', '#auditLogTable tbody tr'),
+    'portfolio': ('/api/portfolio', '#portfolioBody tr[data-project]'),
 }
 
 # Счётчик показов уведомлений: позволяет отличить новое уведомление от ещё не скрытого старого
@@ -1331,3 +1332,107 @@ def test_notify_view_for_read_only_user(ui, make_user):
     ui.page.wait_for_selector('#nfDays [data-day]')
     assert 'не настроил' in ui.text('#nfEmailState')
     assert not ui.errors
+
+
+# ─── Выводы, портфель, вид, настройки (1.7.0) ─────────────────────
+
+def test_insights_panel_links_to_epic(admin_ui):
+    page = admin_ui.page
+    page.wait_for_selector('#insightsBody .insight-headline')
+    assert admin_ui.text('#insightsBody .insight-headline')
+    assert page.locator('#insightsBody .insight-fact').count() >= 3
+    link = page.locator('#insightsBody .insight-subject[data-level="epic"]').first
+    sid = link.get_attribute('data-ref')
+    link.click()
+    page.wait_for_function('sid => document.getElementById("chartServiceSelect").value === sid', arg=sid)
+    page.wait_for_selector('#epicInsights:not([hidden]) .insight')
+    assert 'Почему такой прогноз' in admin_ui.text('#epicInsights')
+    page.click('#insightsBody .insight-details > summary')
+    assert page.locator('#insightsBody .insight-stage').count() == 2
+    page.locator('#insightsBody .insight-epic > summary').first.click()
+    assert page.locator('#insightsBody .insight-epic[open] .insight').count() >= 1
+
+
+def test_stage_insights_open_epic(admin_ui):
+    page = admin_ui.page
+    admin_ui.go('stages')
+    page.wait_for_selector('#stageInsightsBody .insight-stage')
+    assert page.locator('#stageInsightsBody .insight-stage').count() == 2
+    assert 'Этап 4' in admin_ui.text('#stageInsightsBody .insight-stage:first-child .insight-stage-head')
+    page.click('#stageInsightsBody .insight-chip[data-epic="4"]')
+    page.wait_for_selector('#view-dashboard.active')
+    page.wait_for_function('document.getElementById("chartServiceSelect").value === "4"')
+
+
+def test_dashboard_stage_link_scrolls_to_stage(admin_ui):
+    page = admin_ui.page
+    page.wait_for_selector('#insightsBody .insight-subject')
+    stage = page.locator('#insightsBody .insight-subject[data-level="stage"]')
+    if not stage.count():
+        pytest.skip('в главных рисках нет этапа')
+    stage.first.click()
+    page.wait_for_selector('#view-stages.active #stageInsightsBody .insight-stage')
+
+
+def test_portfolio_switches_project(admin_ui):
+    page = admin_ui.page
+    assert page.is_visible('#navPortfolio')
+    admin_ui.go('portfolio')
+    rows = page.locator('#portfolioBody tr[data-project]')
+    assert rows.count() == 2 and 'АИСУЗ' in rows.first.text_content()
+    assert admin_ui.text('#pageSub') == 'Сводка по всем доступным проектам'
+    page.click('#portfolioBody tr[data-project="2"]')
+    page.wait_for_function('document.getElementById("pageSub").textContent.endsWith(" · ИСУП")')
+    assert page.is_visible('#view-dashboard.active, #view-empty.active') or page.is_visible('#view-dashboard')
+
+
+def test_view_blocks_are_personal_and_saved(admin_ui):
+    page = admin_ui.page
+    page.click('.view-blocks-btn[data-blocks="dashboard"]')
+    page.uncheck('#confirmBody [data-block-key="kpis"]')
+    page.uncheck('#confirmBody [data-block-key="burnRate"]')
+    page.click('#confirmOk')
+    page.wait_for_selector('#kpiGrid.block-off', state='attached')
+    assert not page.is_visible('#kpiGrid') and not page.is_visible('#burnRateTable')
+    page.reload()
+    page.wait_for_selector('#summaryTable tbody tr')
+    assert not page.is_visible('#kpiGrid')
+    admin_ui.go('stages')
+    page.click('.view-blocks-btn[data-blocks="stages"]')
+    page.uncheck('#confirmBody [data-block-key="stageCharts"]')
+    page.click('#confirmOk')
+    page.wait_for_selector('#stageChartsContainer.block-off', state='attached')
+    admin_ui.go('dashboard')
+    page.click('.view-blocks-btn[data-blocks="dashboard"]')
+    page.check('#confirmBody [data-block-key="kpis"]')
+    page.click('#confirmOk')
+    page.wait_for_selector('#kpiGrid:not(.block-off) .kpi-card')
+
+
+def test_settings_units_confidence_and_calendar(admin_ui):
+    page = admin_ui.page
+    admin_ui.go('settings')
+    page.select_option('#setUnits', 'days')
+    admin_ui.expect_toast('Настройки сохранены')
+    assert page.is_enabled('#setHoursPerDay')
+    page.select_option('#setConfidence', '90')
+    admin_ui.expect_toast('Настройки сохранены')
+    admin_ui.go('dashboard')
+    assert admin_ui.cells('#kpiGrid .kpi-value')[4] == '154,29 чел.-дн.'
+    assert 'Burn rate, чел.-дн./день' in admin_ui.text('#summaryTable thead')
+    assert 'Диапазон прогноза 90%' in admin_ui.text('#legendRemaining')
+    page.wait_for_selector('#insightsBody:not(.insight-loading) .insight-fact')
+    assert 'чел.-дн.' in admin_ui.text('#insightsBody .insight-facts')
+    admin_ui.go('settings')
+    page.check('#setWorkdays')
+    admin_ui.expect_toast('Настройки сохранены')
+    page.fill('#setHolidays', '01.01.2027 - 03.01.2027, 23.02.2027')
+    page.locator('#setHolidays').blur()
+    admin_ui.expect_toast('Настройки сохранены')
+    assert page.input_value('#setHolidays') == '01.01.2027 – 03.01.2027\n23.02.2027'
+    page.fill('#setExtraWorkdays', '31.02.2027')
+    page.locator('#setExtraWorkdays').blur()
+    admin_ui.expect_toast('Не распознаны даты: 31.02.2027 — формат ДД.ММ.ГГГГ или диапазон через «–»')
+    admin_ui.go('dashboard')
+    assert 'чел.-дн./раб. день' in admin_ui.text('#summaryTable thead')
+    assert 'чел.-дн./раб. день' in admin_ui.text('#view-dashboard [data-block="burnRate"] .panel-title')
