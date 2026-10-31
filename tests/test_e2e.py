@@ -14,13 +14,15 @@ from conftest import ADMIN
 
 sync_api = pytest.importorskip('playwright.sync_api')
 
-VIEWS = ['dashboard', 'stages', 'data', 'services', 'settings', 'users', 'projects', 'audit', 'portfolio']
+VIEWS = ['dashboard', 'stages', 'data', 'services', 'settings', 'users', 'projects', 'audit', 'portfolio', 'calendar', 'health']
 # Разделы, которые при открытии загружают данные с сервера: ждём ответа, а не «тишины в сети»
 VIEW_REQUESTS = {
     'users': ('/api/users', '#usersTable tbody tr'),
     'projects': ('/api/projects', '#projectsMgmtTable tbody tr'),
     'audit': ('/api/audit', '#auditLogTable tbody tr'),
     'portfolio': ('/api/portfolio', '#portfolioBody tr[data-project]'),
+    'calendar': ('/api/admin/calendar', '#calPresets button'),
+    'health': ('/api/admin/health', '.health-item'),
 }
 
 # Счётчик показов уведомлений: позволяет отличить новое уведомление от ещё не скрытого старого
@@ -1436,3 +1438,96 @@ def test_settings_units_confidence_and_calendar(admin_ui):
     admin_ui.go('dashboard')
     assert 'чел.-дн./раб. день' in admin_ui.text('#summaryTable thead')
     assert 'чел.-дн./раб. день' in admin_ui.text('#view-dashboard [data-block="burnRate"] .panel-title')
+
+
+# ─── Мастер подключения, эпики из Jira, календарь, состояние системы (1.8.0) ───
+
+def _connect_api(admin, fake):
+    assert admin.put('/api/admin/jira-connection', json={'baseUrl': fake.url, 'instanceType': 'server', 'login': '',
+                                                         'token': 'secret-pat'}).status_code == 200
+
+
+def test_onboarding_wizard(admin_ui, admin, fake_jira, flask_app, monkeypatch):
+    import importlib
+    fj = importlib.import_module('fake_jira')
+    monkeypatch.setitem(fj.ISSUES[101], 'duedate', '2026-12-15')
+    monkeypatch.setitem(flask_app.config, 'HISTORY_SYNC', True)
+    _connect_api(admin, fake_jira)
+    page = admin_ui.page
+    admin_ui.project(2)
+    admin_ui.go('jira')
+    page.wait_for_selector('#jiraWizardCallout:not([hidden])')
+    page.click('#jiraWizardBtn')
+    page.wait_for_selector('#wzName')
+    assert page.input_value('#wzStructure') == '7'
+    page.fill('#wzStage', 'Этап 1')
+    page.click('#confirmOk')
+    page.wait_for_selector('#wzAll')
+    assert page.locator('#confirmBody [data-key]').count() == 2
+    page.uncheck('#confirmBody [data-key="ABC-4"]')
+    page.click('#confirmOk')
+    page.wait_for_selector('#wzWeeks')
+    assert 'Будет создано эпиков: 1' in admin_ui.text('#confirmBody .bulk-intro')
+    page.click('#wzBack')  # назад — выбор сохраняется
+    page.wait_for_selector('#wzAll')
+    assert not page.is_checked('#confirmBody [data-key="ABC-4"]')
+    page.click('#confirmOk')
+    page.select_option('#wzWeeks', '4')
+    page.click('#confirmOk')
+    page.wait_for_selector('.wizard-result.ok')
+    assert 'Создано эпиков: 1' in admin_ui.text('#confirmBody')
+    page.wait_for_selector('#wzHistory .history-message.ok')
+    page.click('#confirmOk')
+    page.wait_for_selector('#view-dashboard.active')
+    page.wait_for_function('document.getElementById("navServiceCount").textContent === "1"')
+    admin_ui.go('jira')
+    assert 'перед автозаполнением' in admin_ui.text('#jiraButtonsTable')
+
+
+def test_epic_sync_modal(admin_ui, admin, fake_jira, monkeypatch):
+    import importlib
+    fj = importlib.import_module('fake_jira')
+    _connect_api(admin, fake_jira)
+    r = admin.post('/api/projects/2/jira/onboard', json={'name': 'Срез', 'structureId': 7, 'epics': {'level': 0}})
+    assert r.status_code == 200
+    monkeypatch.setitem(fj.ISSUES[101], 'duedate', '2027-03-01')
+    page = admin_ui.page
+    admin_ui.project(2)
+    admin_ui.go('jira')
+    page.click('#jiraButtonsTable [data-action="epics"]')
+    page.wait_for_selector('#esCheck')
+    page.click('#esCheck')
+    page.wait_for_selector('#esPlan .plan-list')
+    assert 'цель — → 01.03.2027' in admin_ui.text('#esPlan')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Эпики из Jira — новых эпиков: 0, обновлено: 1')
+
+
+def test_org_calendar_view(admin_ui):
+    page = admin_ui.page
+    admin_ui.go('calendar')
+    assert page.locator('#calPresets button[disabled]').count() == 3  # праздники РФ уже в календаре
+    page.fill('#calHolidays', '')
+    page.click('#calPresets [data-year="2026"]')
+    assert '05.01.2026 – 09.01.2026' in page.input_value('#calHolidays')
+    page.click('#calSave')
+    admin_ui.expect_toast('Календарь сохранён')
+    page.fill('#calExtra', 'суббота')
+    page.click('#calSave')
+    admin_ui.expect_toast('Не распознаны даты: суббота — формат ДД.ММ.ГГГГ или диапазон через «–»')
+    admin_ui.go('settings')
+    assert 'нерабочих будней — 14' in admin_ui.text('#settingsGrid')
+
+
+def test_health_view_and_alert_settings(admin_ui):
+    page = admin_ui.page
+    admin_ui.go('health')
+    assert page.locator('.health-item').count() == 9
+    assert page.is_visible('#navHealthDot')  # есть замечания (устаревшие демо-замеры)
+    page.uncheck('#haEnabled')
+    page.click('#healthAlertsForm button[type=submit]')
+    admin_ui.expect_toast('Настройки оповещений сохранены')
+    page.click('#haTest')
+    admin_ui.expect_toast('Некому отправить: укажите email администратора или привяжите Telegram и подключите почту или Telegram-бота в «Интеграциях»')
+    page.click('#healthCheckJira')
+    admin_ui.expect_toast('Jira проверена')

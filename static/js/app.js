@@ -23,7 +23,7 @@ var dashboardFilter = { hideDone:false, epics:null }; /* epics: {id:bool} выб
 var stageShowDone = false; /* показывать сданные эпики в своде по этапам */
 
 var DEFAULT_SETTINGS = { forecastMethod:'linear', riskBufferDays:3, burnrateMethod:'all', burnrateWindowDays:14,
-  rangeConfidence:70, workdays:false, holidays:[], extraWorkdays:[], units:'hours', hoursPerDay:8,
+  rangeConfidence:70, workdays:false, holidays:[], extraWorkdays:[], orgHolidays:[], orgExtraWorkdays:[], units:'hours', hoursPerDay:8,
   staleDays:10, scopeThreshold:10, slipThreshold:7, chanceThreshold:50, insightWindowDays:28 };
 var charts = {};
 var currentView = 'dashboard';
@@ -251,7 +251,9 @@ function ordinalIso(o){ return new Date(o * 86400000).toISOString().slice(0, 10)
 function workCalendar(){
   var st = STATE.settings || {};
   if(!st.workdays) return CALENDAR_DAYS;
-  var holidays = st.holidays || [], extra = st.extraWorkdays || [];
+  /* общий производственный календарь (администратор) плюс даты проекта — как calendar_for в forecast.py */
+  var uniq = function(a, b){ var m = {}; (a || []).concat(b || []).forEach(function(d){ m[d] = true; }); return Object.keys(m).sort(); };
+  var holidays = uniq(st.orgHolidays, st.holidays), extra = uniq(st.orgExtraWorkdays, st.extraWorkdays);
   var signature = 'w:' + holidays.join(',') + '|' + extra.join(',');
   if(calCache.key === signature) return calCache.cal;
   var on = {}, off = {}, onList = [], offList = [];
@@ -1616,9 +1618,12 @@ function renderSettingsView(){
     '<div class="settings-divider">Календарь</div>'+
     '<div class="setting-item setting-wide"><label class="checkbox-row"><input type="checkbox" id="setWorkdays"'+(st.workdays?' checked':'')+'> Считать сроки в рабочих днях</label>'+
       '<div class="setting-hint">Прогноз, burn rate и шанс успеть — без выходных и праздников: работа идёт с понедельника по пятницу, кроме праздников, плюс рабочие выходные.</div></div>'+
-    '<div class="setting-item"><label class="small" for="setHolidays">Праздники и нерабочие дни</label><textarea id="setHolidays" rows="5" placeholder="01.01.2026 – 08.01.2026&#10;23.02.2026"'+(st.workdays?'':' disabled')+'>'+escapeHtml(formatDateList(st.holidays || []))+'</textarea>'+
+    '<div class="setting-item setting-wide setting-hint">Общий производственный календарь задаёт администратор: '+
+      ((st.orgHolidays || []).length ? 'нерабочих будней — ' + st.orgHolidays.length + ', рабочих выходных — ' + (st.orgExtraWorkdays || []).length + '. Ниже — дополнительные даты только этого проекта.' :
+        'пока пуст. Ниже — даты только этого проекта.')+'</div>'+
+    '<div class="setting-item"><label class="small" for="setHolidays">Дополнительные праздники проекта</label><textarea id="setHolidays" rows="5" placeholder="01.01.2026 – 08.01.2026&#10;23.02.2026"'+(st.workdays?'':' disabled')+'>'+escapeHtml(formatDateList(st.holidays || []))+'</textarea>'+
       '<div class="setting-hint">Даты или диапазоны, по одному в строке</div></div>'+
-    '<div class="setting-item"><label class="small" for="setExtraWorkdays">Рабочие выходные (переносы)</label><textarea id="setExtraWorkdays" rows="5" placeholder="27.12.2025"'+(st.workdays?'':' disabled')+'>'+escapeHtml(formatDateList(st.extraWorkdays || []))+'</textarea>'+
+    '<div class="setting-item"><label class="small" for="setExtraWorkdays">Дополнительные рабочие выходные проекта</label><textarea id="setExtraWorkdays" rows="5" placeholder="27.12.2025"'+(st.workdays?'':' disabled')+'>'+escapeHtml(formatDateList(st.extraWorkdays || []))+'</textarea>'+
       '<div class="setting-hint">Суббота или воскресенье, которые объявлены рабочими</div></div>'+
     '<div class="settings-divider">Единицы</div>'+
     '<div class="setting-item"><label class="small" for="setUnits">Показывать объём работ</label><select id="setUnits">'+opt('hours','В часах',st.units)+opt('days','В человеко-днях',st.units)+'</select>'+
@@ -1930,7 +1935,7 @@ function updateRoleUI(){
   var admin = isGlobalAdmin();
   document.getElementById('readonlyBanner').style.display = (!canEdit() && currentProjectId) ? '' : 'none';
   document.getElementById('adminNav').style.display = admin ? '' : 'none';
-  ['navUsers','navProjects','navAudit','navIntegrations','btnExport'].forEach(function(id){ document.getElementById(id).style.display = admin ? '' : 'none'; });
+  ['navUsers','navProjects','navAudit','navIntegrations','navCalendar','navHealth','btnExport'].forEach(function(id){ document.getElementById(id).style.display = admin ? '' : 'none'; });
   document.getElementById('navSettings').style.display = canEdit() ? '' : 'none';
   document.getElementById('navJira').style.display = canEdit() ? '' : 'none';
   document.getElementById('navAutofill').style.display = canEdit() ? '' : 'none';
@@ -1948,7 +1953,7 @@ function updateRoleUI(){
 var navItems = document.querySelectorAll('.nav-item');
 var pageTitle = document.getElementById('pageTitle');
 var pageSub = document.getElementById('pageSub');
-var ADMIN_VIEWS = ['users', 'projects', 'audit', 'integrations'];
+var ADMIN_VIEWS = ['users', 'projects', 'audit', 'integrations', 'calendar', 'health'];
 var GLOBAL_VIEWS = ADMIN_VIEWS.concat(['portfolio']);  /* не относятся к выбранному проекту */
 var PDF_VIEWS = ['dashboard', 'stages', 'data'];
 var titles = {
@@ -1964,7 +1969,9 @@ var titles = {
   integrations: ['Интеграции', 'Jira, почта, Telegram-бот и журнал отправок'],
   users: ['Управление пользователями', 'Пользователи, роли и доступ к проектам'],
   projects: ['Управление проектами', 'Создание, редактирование и удаление проектов'],
-  audit: ['Реестр изменений', 'Журнал всех изменений с фильтрами']
+  audit: ['Реестр изменений', 'Журнал всех изменений с фильтрами'],
+  calendar: ['Производственный календарь', 'Праздники и рабочие выходные для расчёта в рабочих днях'],
+  health: ['Состояние системы', 'Работа планировщика, Jira, автозаполнения и рассылок; оповещения администратору']
 };
 
 function projectTitleSuffix(){
@@ -1988,7 +1995,7 @@ function navigate(view){
   var renderers = {dashboard:renderDashboard, stages:renderStagesView, data:renderDataView, services:renderServicesView,
     settings:renderSettingsView, jira:renderJiraView, autofill:renderAutofillView, notify:renderNotifyView,
     integrations:renderIntegrationsView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); },
-    portfolio:renderPortfolioView};
+    portfolio:renderPortfolioView, calendar:renderCalendarView, health:renderHealthView};
   if(renderers[view] && (currentProjectId || GLOBAL_VIEWS.indexOf(view) !== -1)) renderers[view]();
   var reportView = PDF_VIEWS.indexOf(view) !== -1 && currentProjectId;
   document.getElementById('btnPdf').style.display = reportView ? '' : 'none';
@@ -2558,6 +2565,7 @@ function renderJiraView(){
   st.textContent = connected ? '✓ Подключение к Jira настроено'
     : 'Подключение к Jira не настроено' + (isGlobalAdmin() ? ' — настройте его в разделе «Интеграции».' : ' — обратитесь к администратору.');
   document.getElementById('jiraOpenIntegrations').hidden = !isGlobalAdmin();
+  document.getElementById('jiraWizardCallout').hidden = !connected;
   if(!cfg){ document.getElementById('jiraButtonsTable').innerHTML = ''; return; }
   renderJiraButtonsTable();
 }
@@ -2646,7 +2654,7 @@ function renderJiraButtonsTable(){
   var connected = !!(STATE.jira && STATE.jira.connected);
   document.getElementById('jiraAddButton').disabled = !STATE.services.length;
   if(!buttons.length){
-    emptyTable(table, 'Кнопок пока нет', connected ? 'Создайте кнопку: выберите структуру и укажите задачи Jira для эпиков.' : 'Кнопки заработают, когда администратор настроит подключение к Jira.');
+    emptyTable(table, 'Кнопок пока нет', connected ? 'Запустите мастер подключения — он создаст эпики и кнопку сам — или создайте кнопку вручную.' : 'Кнопки заработают, когда администратор настроит подключение к Jira.');
     return;
   }
   var serviceName = function(id){ var s = serviceById(id); return s ? s.name : '—'; };
@@ -2654,11 +2662,14 @@ function renderJiraButtonsTable(){
     buttons.map(function(b){
       var auto = b.schedule && b.schedule.enabled ? '<div class="muted-cell">автозаполнение: ' + escapeHtml(scheduleSummary(b.schedule)) + '</div>' : '';
       if(b.history) auto += '<div class="muted-cell">история: ' + escapeHtml(historyJobSummary(b.history)) + '</div>';
+      if(b.epicSync && (b.epicSync.enabled || b.epicSync.lastAt)) auto += '<div class="muted-cell">эпики из Jira: ' + (b.epicSync.enabled ? 'перед автозаполнением' : 'вручную') +
+        (b.epicSync.lastMessage ? ' · ' + escapeHtml(b.epicSync.lastMessage.replace(/^Эпики из Jira — /, '')) : '') + '</div>';
       return '<tr data-bid="'+b.id+'"><td><b>'+escapeHtml(b.name)+'</b>'+auto+'</td>'+
         '<td>'+(b.structureId ? escapeHtml(b.structureName || ('Структура ' + b.structureId)) + ' <span class="muted-cell">#'+b.structureId+'</span>' : '<span class="muted-cell">без структуры</span>')+'</td>'+
         '<td>'+b.mappings.map(function(m){ return '<div class="jira-map-line"><span>'+escapeHtml(serviceName(m.serviceId))+'</span> ← <span class="mono">'+escapeHtml(m.issueKeys)+'</span>'+(m.includeSubtree ? ' <span class="muted-cell">с вложенными</span>' : '')+'</div>'; }).join('')+'</td>'+
         '<td>'+fieldMapSummary(b.fieldMap)+'</td>'+
         '<td class="row-actions"><button type="button" class="btn btn-ghost btn-sm" data-action="snapshot"'+(connected ? '' : ' disabled title="Нет подключения к Jira"')+'>⇣ Срез</button>'+
+          '<button type="button" class="btn btn-ghost btn-sm" data-action="epics"'+(connected ? ' title="Эпики, цели и «Сдано» — из Jira"' : ' disabled title="Нет подключения к Jira"')+'>⇄ Эпики</button>'+
           '<button type="button" class="btn btn-ghost btn-sm" data-action="history"'+(!connected ? ' disabled title="Нет подключения к Jira"' :
             (b.lastSuccessAt ? ' title="Восстановить замеры на прошлые даты по журналу изменений Jira"' : ' disabled title="Доступно после первого успешного среза"'))+'>↺ История</button>'+
           actionBtn('edit','Редактировать',ICON_EDIT)+actionBtn('delete','Удалить',ICON_DELETE)+'</td></tr>';
@@ -2672,6 +2683,9 @@ function renderJiraButtonsTable(){
   });
   table.querySelectorAll('[data-action="history"]').forEach(function(el){
     el.addEventListener('click', function(){ openHistoryRestore(buttonOf(el)); });
+  });
+  table.querySelectorAll('[data-action="epics"]').forEach(function(el){
+    el.addEventListener('click', function(){ openEpicSync(buttonOf(el)); });
   });
   table.querySelectorAll('[data-action="delete"]').forEach(function(el){
     el.addEventListener('click', function(){
@@ -3414,6 +3428,342 @@ function showHistoryProgress(button, job){
 
 
 /* ════════════════════════════════════════════════════════════════
+   Мастер подключения проекта к Jira и синхронизация эпиков
+════════════════════════════════════════════════════════════════ */
+var EPIC_TARGET_OPTIONS = [['duedate', 'Срок задачи (Due date)'], ['fixVersion', 'Дата выпуска версии (Fix version)'], ['none', 'Не заполнять']];
+var EPIC_CHANGE_LABELS = {targetDate: 'цель', isDone: 'сдано', name: 'название', etap: 'этап'};
+function epicSourceFields(prefix, cfg, structures, structureId){
+  var opt = function(v, l, cur){ return '<option value="'+escapeAttr(v)+'"'+(String(cur) === String(v) ? ' selected' : '')+'>'+escapeHtml(l)+'</option>'; };
+  var html = '';
+  if(structures){
+    html += field('Структура Jira', '<select id="'+prefix+'Structure">'+opt('', 'Без структуры — найти эпики запросом JQL', structureId)+
+      structures.map(function(s){ return opt(s.id, s.name + ' (#' + s.id + ')', structureId); }).join('')+'</select>');
+  }
+  html += '<div class="setting-item" id="'+prefix+'LevelBox"><span class="field-label">Где в структуре эпики</span>'+
+    '<label class="checkbox-row"><input type="radio" name="'+prefix+'Level" value="0"'+(cfg.level === 0 ? ' checked' : '')+'> Задачи верхнего уровня</label>'+
+    '<label class="checkbox-row"><input type="radio" name="'+prefix+'Level" value="1"'+(cfg.level === 1 ? ' checked' : '')+'> Задачи второго уровня — задачи верхнего уровня станут этапами</label></div>';
+  html += '<div class="setting-item" id="'+prefix+'JqlBox"><label class="small" for="'+prefix+'Jql">Запрос JQL</label><textarea id="'+prefix+'Jql" rows="2" placeholder="project = ABC AND issuetype = Epic AND resolution = Unresolved">'+escapeHtml(cfg.jql || '')+'</textarea></div>';
+  html += field('Этап для эпиков', '<input type="text" id="'+prefix+'Stage" value="'+escapeAttr(cfg.stage || '')+'" placeholder="например, Этап 1" maxlength="300">');
+  html += field('Целевая дата эпика', '<select id="'+prefix+'Target">'+EPIC_TARGET_OPTIONS.map(function(o){ return opt(o[0], o[1], cfg.target); }).join('')+'</select>');
+  html += '<label class="checkbox-row"><input type="checkbox" id="'+prefix+'Done"'+(cfg.done ? ' checked' : '')+'> Отмечать эпик «Сдано», когда задача в Jira закрыта (и снимать отметку, если её переоткрыли)</label>';
+  return html;
+}
+function bindEpicSourceFields(prefix, hasStructure){
+  var sel = document.getElementById(prefix + 'Structure');
+  var update = function(){
+    var withStructure = sel ? !!sel.value : hasStructure;
+    var level = (confirmBody.querySelector('input[name="'+prefix+'Level"]:checked') || {}).value;
+    document.getElementById(prefix + 'LevelBox').hidden = !withStructure;
+    document.getElementById(prefix + 'JqlBox').hidden = withStructure;
+    document.getElementById(prefix + 'Stage').closest('.setting-item').hidden = withStructure && level === '1';
+  };
+  if(sel) sel.addEventListener('change', update);
+  confirmBody.querySelectorAll('input[name="'+prefix+'Level"]').forEach(function(r){ r.addEventListener('change', update); });
+  update();
+}
+function readEpicSource(prefix, hasStructure){
+  var sel = document.getElementById(prefix + 'Structure');
+  var structureId = sel ? sel.value : (hasStructure ? 'keep' : '');
+  var withStructure = !!structureId;
+  var levelEl = confirmBody.querySelector('input[name="'+prefix+'Level"]:checked');
+  return {structureId: structureId, structureName: sel && sel.value ? sel.options[sel.selectedIndex].text.replace(/ \(#\d+\)$/, '') : '',
+    config: {level: withStructure && levelEl ? parseInt(levelEl.value, 10) : 0, jql: withStructure ? '' : document.getElementById(prefix + 'Jql').value.trim(),
+      stage: document.getElementById(prefix + 'Stage').value.trim(), target: document.getElementById(prefix + 'Target').value,
+      done: document.getElementById(prefix + 'Done').checked}};
+}
+function epicPlanHtml(plan){
+  var parts = [];
+  if(plan.create.length) parts.push('<div class="insight-col-title">Новые эпики — ' + plan.create.length + '</div><ul class="plan-list">' + plan.create.map(function(c){
+    return '<li><span class="mono">'+escapeHtml(c.key)+'</span> '+escapeHtml(c.name)+(c.etap ? ' <span class="muted-cell">· '+escapeHtml(c.etap)+'</span>' : '')+
+      (c.target ? ' <span class="muted-cell">· цель '+fmtDate(c.target)+'</span>' : '')+(c.done ? ' <span class="badge badge-ok">сдано</span>' : '')+'</li>';
+  }).join('') + '</ul>');
+  if(plan.update.length) parts.push('<div class="insight-col-title">Изменения — ' + plan.update.length + '</div><ul class="plan-list">' + plan.update.map(function(u){
+    return '<li><b>'+escapeHtml(u.name)+'</b>: '+u.changes.map(function(ch){
+      var v = function(x){ return ch.field === 'isDone' ? (x ? 'да' : 'нет') : (ch.field === 'targetDate' ? fmtDate(x) : escapeHtml(x || '—')); };
+      return EPIC_CHANGE_LABELS[ch.field] + ' ' + v(ch.old) + ' → ' + v(ch.new);
+    }).join('; ')+'</li>';
+  }).join('') + '</ul>');
+  if(plan.link && plan.link.length) parts.push('<div class="insight-col-title">Связать с кнопкой — ' + plan.link.length + '</div><ul class="plan-list">' +
+    plan.link.map(function(l){ return '<li>'+escapeHtml(l.name)+' ← <span class="mono">'+escapeHtml(l.key)+'</span></li>'; }).join('') + '</ul>');
+  if(plan.missing.length) parts.push('<div class="insight-col-title">Нет в Jira — ' + plan.missing.length + '</div><p class="bulk-note">Эти эпики проекта связаны с задачами, которых больше нет в структуре или запросе. Burndown их не удаляет — проверьте и при необходимости отметьте «Сдано».</p><ul class="plan-list">' +
+    plan.missing.map(function(m){ return '<li>'+escapeHtml(m.name)+' <span class="mono muted-cell">'+escapeHtml(m.keys)+'</span></li>'; }).join('') + '</ul>');
+  if(!parts.length) return '<p class="insight-empty">Изменений нет: эпики проекта совпадают с Jira (' + plan.unchanged + ').</p>';
+  return parts.join('') + (plan.unchanged ? '<p class="bulk-note">Без изменений: ' + plan.unchanged + '.</p>' : '');
+}
+
+function openJiraWizard(){
+  var pid = currentProjectId;
+  var browserTz = '';
+  try { browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch(e){}
+  var wz = {structures: null, src: {structureId: '', structureName: '', config: {level: 0, jql: '', stage: '', target: 'duedate', done: true}},
+    name: 'Срез из Jira', epics: [], picked: {}, weeks: 8, auto: true,
+    schedule: {enabled: true, days: [1, 2, 3, 4, 5], time: '09:00', timezone: TIMEZONES.indexOf(browserTz) !== -1 ? browserTz : 'Europe/Moscow'}};
+  var steps = ['Откуда эпики', 'Эпики', 'Замеры и расписание', 'Готово'];
+  var head = function(n){
+    confirmTitle.textContent = 'Мастер подключения к Jira';
+    return '<ol class="wizard-steps">' + steps.map(function(t, i){ return '<li class="'+(i + 1 === n ? 'active' : (i + 1 < n ? 'done' : ''))+'">'+t+'</li>'; }).join('') + '</ol>';
+  };
+  var back = function(fn){ var b = document.getElementById('wzBack'); if(b) b.addEventListener('click', fn); };
+  function step1(){
+    confirmBody.innerHTML = head(1) + '<div class="form-grid wizard-form">' + field('Название кнопки среза', '<input type="text" id="wzName" maxlength="200" value="'+escapeAttr(wz.name)+'">') +
+      epicSourceFields('wz', wz.src.config, wz.structures || [], wz.src.structureId) + '</div>';
+    bindEpicSourceFields('wz', false);
+    confirmOk.textContent = 'Найти эпики';
+    confirmOk.disabled = false;
+    confirmCancel.hidden = false;
+    modalOkHandler = function(){
+      wz.name = document.getElementById('wzName').value.trim() || 'Срез из Jira';
+      wz.src = readEpicSource('wz', false);
+      if(!wz.src.structureId && !wz.src.config.jql){ toast('Выберите структуру или укажите запрос JQL'); return false; }
+      confirmOk.disabled = true;
+      confirmOk.textContent = 'Ищем эпики…';
+      apiPost('/api/projects/'+pid+'/jira/epics/preview', Object.assign({structureId: wz.src.structureId}, wz.src.config)).then(function(r){
+        wz.epics = r.epics;
+        wz.picked = {};
+        r.epics.forEach(function(e){ wz.picked[e.key] = true; });
+        if(!r.epics.length){ toast('Эпиков не найдено — выберите другой уровень структуры или запрос'); step1(); return; }
+        step2();
+      }).catch(function(){ step1(); });
+      return false;
+    };
+  }
+  function step2(){
+    var rows = wz.epics.map(function(e){
+      return '<tr><td><input type="checkbox" data-key="'+escapeAttr(e.key)+'"'+(wz.picked[e.key] ? ' checked' : '')+' aria-label="Подключить '+escapeAttr(e.key)+'"></td>'+
+        '<td class="mono nowrap">'+escapeHtml(e.key)+'</td><td>'+escapeHtml(e.summary)+(e.serviceId ? ' <span class="badge badge-muted" title="Эпик уже есть в проекте — он будет связан с кнопкой">в проекте</span>' : '')+'</td>'+
+        '<td>'+escapeHtml(e.stage || wz.src.config.stage || '—')+'</td><td class="nowrap">'+(e.target ? fmtDate(e.target) : '—')+'</td>'+
+        '<td>'+escapeHtml(e.status)+(e.done ? ' <span class="badge badge-ok">закрыта</span>' : '')+'</td></tr>';
+    }).join('');
+    confirmBody.innerHTML = head(2) + '<p class="bulk-intro">Найдено задач-эпиков: <b>'+wz.epics.length+'</b>. Отметьте, какие подключить к проекту. Новые эпики будут созданы, уже существующие — связаны с кнопкой.</p>'+
+      '<div class="table-scroll wizard-table"><table class="data-table compact-table"><thead><tr><th><input type="checkbox" id="wzAll" checked aria-label="Все"></th><th>Задача</th><th>Название</th><th>Этап</th><th>Цель</th><th>Статус в Jira</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
+      '<div class="form-actions wizard-back"><button type="button" class="btn btn-ghost btn-sm" id="wzBack">← Назад</button></div>';
+    var boxes = confirmBody.querySelectorAll('[data-key]');
+    document.getElementById('wzAll').checked = Array.prototype.every.call(boxes, function(b){ return b.checked; });
+    document.getElementById('wzAll').addEventListener('change', function(e){ boxes.forEach(function(b){ b.checked = e.target.checked; wz.picked[b.dataset.key] = b.checked; }); });
+    boxes.forEach(function(b){ b.addEventListener('change', function(){ wz.picked[b.dataset.key] = b.checked; }); });
+    back(step1);
+    confirmOk.textContent = 'Далее';
+    confirmOk.disabled = false;
+    modalOkHandler = function(){
+      if(!wz.epics.some(function(e){ return wz.picked[e.key]; })){ toast('Отметьте хотя бы один эпик'); return false; }
+      step3();
+      return false;
+    };
+  }
+  function step3(){
+    var s = wz.schedule;
+    var picked = wz.epics.filter(function(e){ return wz.picked[e.key]; });
+    var fresh = picked.filter(function(e){ return !e.serviceId; }).length;
+    var zones = TIMEZONES.slice();
+    if(zones.indexOf(s.timezone) === -1) zones.push(s.timezone);
+    confirmBody.innerHTML = head(3) + '<p class="bulk-intro">Будет создано эпиков: <b>'+fresh+'</b>, связано существующих: <b>'+(picked.length - fresh)+'</b>. Остаток, затраченное время и оценка — из стандартного учёта времени Jira; поля можно изменить позже в редакторе кнопки.</p>'+
+      '<div class="form-grid wizard-form">'+
+      field('Восстановить историю', '<select id="wzWeeks">'+[[0, 'Не восстанавливать'], [4, 'За 4 недели'], [8, 'За 8 недель'], [12, 'За 12 недель'], [26, 'За полгода']].map(function(o){
+        return '<option value="'+o[0]+'"'+(o[0] === wz.weeks ? ' selected' : '')+'>'+o[1]+'</option>'; }).join('')+'</select>')+
+      '<label class="checkbox-row"><input type="checkbox" id="wzAuto"'+(wz.auto ? ' checked' : '')+'> Перед каждым автозаполнением сверять эпики с Jira: новые — добавлять, цели и «Сдано» — обновлять</label>'+
+      '<label class="checkbox-row"><input type="checkbox" id="wzSched"'+(s.enabled ? ' checked' : '')+'> Автозаполнение замеров по расписанию</label>'+
+      '<div class="setting-item"><span class="field-label">Дни недели</span><div class="weekday-picker" id="wzDays">'+WEEKDAYS.map(function(d){
+        return '<label><input type="checkbox" data-day="'+d[0]+'"'+(s.days.indexOf(d[0]) !== -1 ? ' checked' : '')+'><span>'+d[1]+'</span></label>'; }).join('')+'</div></div>'+
+      field('Время', '<input type="time" id="wzTime" value="'+escapeAttr(s.time)+'">')+
+      field('Часовой пояс', '<select id="wzTz">'+zones.map(function(z){ return '<option'+(z === s.timezone ? ' selected' : '')+'>'+escapeHtml(z)+'</option>'; }).join('')+'</select>')+
+      '</div><div class="form-actions wizard-back"><button type="button" class="btn btn-ghost btn-sm" id="wzBack">← Назад</button></div>';
+    var read = function(){
+      wz.weeks = parseInt(document.getElementById('wzWeeks').value, 10);
+      wz.auto = document.getElementById('wzAuto').checked;
+      wz.schedule = {enabled: document.getElementById('wzSched').checked, time: document.getElementById('wzTime').value || '09:00',
+        timezone: document.getElementById('wzTz').value,
+        days: Array.prototype.filter.call(confirmBody.querySelectorAll('#wzDays input'), function(c){ return c.checked; }).map(function(c){ return parseInt(c.dataset.day, 10); })};
+    };
+    back(function(){ read(); step2(); });
+    confirmOk.textContent = 'Подключить';
+    confirmOk.disabled = false;
+    modalOkHandler = function(){
+      read();
+      if(wz.schedule.enabled && !wz.schedule.days.length){ toast('Выберите дни недели для автозаполнения'); return false; }
+      confirmOk.disabled = true;
+      confirmOk.textContent = 'Подключаем…';
+      apiPost('/api/projects/'+pid+'/jira/onboard', {name: wz.name, structureId: wz.src.structureId, structureName: wz.src.structureName,
+        epics: Object.assign({}, wz.src.config, {enabled: wz.auto}), keys: wz.epics.filter(function(e){ return wz.picked[e.key]; }).map(function(e){ return e.key; }),
+        historyWeeks: wz.weeks, schedule: wz.schedule}).then(step4).catch(function(){ step3(); });
+      return false;
+    };
+  }
+  function step4(res){
+    var ok = res.snapshot.status === 'ok';
+    var render = function(job){
+      var hist = '';
+      if(job){
+        var finished = job.status !== 'running';
+        var pct = job.total ? Math.round(job.progress / job.total * 100) : 0;
+        hist = '<div class="history-progress" id="wzHistory"><div class="field-label">История за прошлые недели</div><div class="progress-bar'+(finished ? '' : ' active')+'"><span style="width:'+(finished && job.status === 'done' ? 100 : pct)+'%"></span></div>'+
+          '<p class="history-message '+(job.status === 'done' ? 'ok' : (finished ? 'error' : ''))+'">'+escapeHtml(job.message || 'Подготовка…')+'</p></div>';
+      }
+      confirmBody.innerHTML = head(4) +
+        '<p class="wizard-result '+(ok ? 'ok' : 'error')+'">'+(ok ? '✓ Проект подключён к Jira.' : '⚠ Кнопка и эпики созданы, но срез не удался.')+'</p>'+
+        '<ul class="plan-list"><li>Создано эпиков: <b>'+res.created+'</b>, связано существующих: <b>'+res.linked+'</b>'+(res.updated ? ', обновлено: <b>'+res.updated+'</b>' : '')+'</li>'+
+        '<li>Замер на сегодня: '+escapeHtml(res.snapshot.message)+'</li>'+
+        (ok && res.button.schedule.enabled ? '<li>Автозаполнение: '+escapeHtml(scheduleSummary(res.button.schedule))+'</li>' : '')+
+        (res.button.epicSync.enabled ? '<li>Эпики сверяются с Jira перед каждым автозаполнением</li>' : '')+'</ul>'+
+        (ok ? '' : '<p class="bulk-note">Проверьте поля Jira в редакторе кнопки и выполните срез в разделе «Данные по датам».</p>') + hist;
+      confirmOk.textContent = 'Открыть дашборд';
+      confirmOk.disabled = false;
+      confirmCancel.hidden = true;
+      modalOkHandler = function(){ closeModal(); loadProjectData(pid, 'dashboard'); return false; };
+    };
+    render(res.history);
+    loadProjectData(pid, currentView);
+    if(res.history && res.history.status === 'running'){
+      var timer = setInterval(function(){
+        if(!document.getElementById('wzHistory')){ clearInterval(timer); return; }
+        api('/api/jira/history-jobs/'+res.history.id).then(function(j){ render(j); if(j.status !== 'running'){ clearInterval(timer); loadProjectData(pid, currentView); } })
+          .catch(function(){ clearInterval(timer); });
+      }, 1000);
+    }
+  }
+  openModal({title: 'Мастер подключения к Jira', html: '<p class="insight-empty">Загружаем структуры Jira…</p>', okLabel: 'Найти эпики', wide: true});
+  confirmOk.disabled = true;
+  api('/api/projects/'+pid+'/jira/structures').then(function(list){ wz.structures = list; if(list.length) wz.src.structureId = String(list[0].id); step1(); })
+    .catch(function(){ wz.structures = []; step1(); });
+}
+document.getElementById('jiraWizardBtn').addEventListener('click', openJiraWizard);
+
+/* Эпики из Jira для существующей кнопки: настройки, предпросмотр изменений, синхронизация */
+function openEpicSync(button){
+  var cfg = Object.assign({}, button.epicSync);
+  var hasStructure = !!button.structureId;
+  openModal({title: 'Эпики из Jira — «' + button.name + '»', okLabel: 'Сохранить и синхронизировать', wide: true,
+    html: '<p class="bulk-intro">Список эпиков проекта, их целевые даты и признак «Сдано» берутся из Jira: новые задачи-эпики становятся эпиками проекта и связываются с этой кнопкой, у существующих обновляются цели и «Сдано».' +
+      (button.epicSync.lastAt ? ' Последняя синхронизация — ' + fmtDateTime(button.epicSync.lastAt) + ': ' + escapeHtml(button.epicSync.lastMessage || '') + '.' : '') + '</p>' +
+      '<div class="form-grid wizard-form">' + epicSourceFields('es', cfg, null, null) +
+      '<label class="checkbox-row"><input type="checkbox" id="esNames"'+(cfg.names ? ' checked' : '')+'> Обновлять названия эпиков по темам задач</label>'+
+      '<label class="checkbox-row"><input type="checkbox" id="esEnabled"'+(cfg.enabled ? ' checked' : '')+'> Синхронизировать автоматически перед каждым автозаполнением</label></div>'+
+      '<div class="form-actions"><button type="button" class="btn btn-ghost btn-sm" id="esCheck">Показать изменения</button></div><div id="esPlan"></div>',
+    onOk: function(){
+      var body = Object.assign(readEpicSource('es', hasStructure).config, {names: document.getElementById('esNames').checked, enabled: document.getElementById('esEnabled').checked});
+      confirmOk.disabled = true;
+      apiPut('/api/jira/buttons/'+button.id+'/epic-sync', body).then(function(){
+        return apiPost('/api/jira/buttons/'+button.id+'/epic-sync/run', {});
+      }).then(function(r){
+        replaceJiraButton(r.button);
+        closeModal();
+        toast(r.message);
+        loadProjectData(currentProjectId, currentView);
+      }).catch(function(){ confirmOk.disabled = false; });
+      return false;
+    }});
+  bindEpicSourceFields('es', hasStructure);
+  document.getElementById('esCheck').addEventListener('click', function(){
+    var box = document.getElementById('esPlan');
+    var body = Object.assign(readEpicSource('es', hasStructure).config, {names: document.getElementById('esNames').checked, enabled: document.getElementById('esEnabled').checked});
+    box.innerHTML = '<p class="insight-empty">Сверяем с Jira…</p>';
+    /* предпросмотр по введённым настройкам: сохраняем их, затем считаем изменения без записи */
+    apiPut('/api/jira/buttons/'+button.id+'/epic-sync', body).then(function(b){
+      replaceJiraButton(b);
+      return apiPost('/api/jira/buttons/'+button.id+'/epic-sync/run', {dryRun: true});
+    }).then(function(r){ box.innerHTML = epicPlanHtml(r.plan); }).catch(function(){ box.innerHTML = ''; });
+  });
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Администратор: производственный календарь и состояние системы
+════════════════════════════════════════════════════════════════ */
+var orgCalendar = null;
+function renderCalendarView(){
+  api('/api/admin/calendar').then(function(c){
+    orgCalendar = c;
+    document.getElementById('calHolidays').value = formatDateList(c.holidays);
+    document.getElementById('calExtra').value = formatDateList(c.extraWorkdays);
+    renderCalendarPresets();
+  }).catch(function(){});
+}
+function renderCalendarPresets(){
+  var box = document.getElementById('calPresets');
+  box.innerHTML = '<span class="field-label">Праздники РФ</span>' + orgCalendar.presets.map(function(p){
+    return '<button type="button" class="btn btn-ghost btn-sm" data-year="'+p.year+'" title="'+escapeAttr(p.source)+'"></button>';
+  }).join('') + '<span class="setting-hint">По постановлениям Правительства РФ о переносе выходных дней. Новый год добавляется кнопкой, когда выйдет постановление и обновление Burndown.</span>';
+  box.querySelectorAll('[data-year]').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var p = orgCalendar.presets.find(function(x){ return String(x.year) === btn.dataset.year; });
+      var merge = function(id, add){ var cur = parseDateList(document.getElementById(id).value).dates; document.getElementById(id).value = formatDateList(cur.concat(add.filter(function(d){ return cur.indexOf(d) === -1; })).sort()); };
+      merge('calHolidays', p.holidays);
+      merge('calExtra', p.extraWorkdays);
+      refreshCalendarPresets();
+      toast('Добавлены праздники ' + p.year + ' — сохраните календарь');
+    });
+  });
+  refreshCalendarPresets();
+}
+/* состояние кнопок — на месте, без пересоздания: щелчок по кнопке сразу после правки поля не теряется */
+function refreshCalendarPresets(){
+  if(!orgCalendar) return;
+  var current = parseDateList(document.getElementById('calHolidays').value).dates;
+  document.querySelectorAll('#calPresets [data-year]').forEach(function(btn){
+    var p = orgCalendar.presets.find(function(x){ return String(x.year) === btn.dataset.year; });
+    var has = p.holidays.every(function(d){ return current.indexOf(d) !== -1; });
+    btn.disabled = has;
+    btn.textContent = (has ? '✓ ' : '+ ') + p.year;
+  });
+}
+document.getElementById('calHolidays').addEventListener('input', refreshCalendarPresets);
+document.getElementById('calSave').addEventListener('click', function(){
+  var h = parseDateList(document.getElementById('calHolidays').value), x = parseDateList(document.getElementById('calExtra').value);
+  var bad = h.bad.concat(x.bad);
+  if(bad.length){ toast('Не распознаны даты: ' + bad.slice(0, 3).join(', ') + ' — формат ДД.ММ.ГГГГ или диапазон через «–»'); return; }
+  apiPut('/api/admin/calendar', {holidays: h.dates, extraWorkdays: x.dates}).then(function(c){
+    orgCalendar = c;
+    document.getElementById('calHolidays').value = formatDateList(c.holidays);
+    document.getElementById('calExtra').value = formatDateList(c.extraWorkdays);
+    refreshCalendarPresets();
+    if(currentProjectId) loadProjectData(currentProjectId, currentView);
+    toast('Календарь сохранён');
+  }).catch(function(){});
+});
+
+var HEALTH_BADGES = {ok: '<span class="badge badge-ok">✓ В порядке</span>', warn: '<span class="badge badge-risk">⚠ Требует внимания</span>',
+  error: '<span class="badge badge-danger">✗ Ошибка</span>', off: '<span class="badge badge-muted">Не настроено</span>'};
+var HEALTH_HEADLINES = {ok: 'Всё работает', warn: 'Есть замечания', error: 'Есть неполадки'};
+function setHealthDot(status){
+  var dot = document.getElementById('navHealthDot');
+  dot.hidden = status === 'ok';
+  dot.className = 'health-dot health-' + status;
+  dot.title = HEALTH_HEADLINES[status] || '';
+}
+function renderHealth(h){
+  setHealthDot(h.status);
+  document.getElementById('healthBody').innerHTML =
+    '<div class="insight-head insight-head-'+(h.status === 'warn' ? 'risk' : (h.status === 'error' ? 'danger' : 'ok'))+'"><div class="insight-headline">'+HEALTH_HEADLINES[h.status]+'</div>'+
+    '<div class="insight-fact-hint">Проверено '+fmtDateTime(h.checkedAt)+'</div></div>'+
+    '<div class="health-list">' + h.items.map(function(i){
+      return '<div class="health-item health-'+i.status+'" data-key="'+i.key+'"><div class="health-item-head"><b>'+escapeHtml(i.title)+'</b>'+HEALTH_BADGES[i.status]+'</div>'+
+        '<div class="health-summary">'+escapeHtml(i.summary)+'</div>'+
+        (i.details.length ? '<ul class="health-details">'+i.details.map(function(d){ return '<li>'+escapeHtml(d)+'</li>'; }).join('')+'</ul>' : '')+'</div>';
+    }).join('') + '</div>';
+  document.getElementById('haEnabled').checked = h.alerts.enabled;
+  document.getElementById('haEmail').checked = h.alerts.email;
+  document.getElementById('haTelegram').checked = h.alerts.telegram;
+  document.getElementById('haRecipients').textContent = h.recipients.length ?
+    'Получатели: ' + h.recipients.map(function(r){ return r.name + ' (' + r.channels.map(function(c){ return c === 'email' ? 'почта' : 'Telegram'; }).join(', ') + ')'; }).join('; ') :
+    'Получателей нет: укажите email администратора в «Пользователях» или привяжите Telegram в профиле, а почту и бота подключите в «Интеграциях».';
+}
+function renderHealthView(){
+  api('/api/admin/health').then(renderHealth).catch(function(){ document.getElementById('healthBody').innerHTML = '<p class="insight-empty">Не удалось проверить состояние.</p>'; });
+}
+document.getElementById('healthRefresh').addEventListener('click', renderHealthView);
+document.getElementById('healthCheckJira').addEventListener('click', function(e){
+  e.target.disabled = true;
+  apiPost('/api/admin/health/check-jira', {}).then(function(h){ renderHealth(h); toast('Jira проверена'); })
+    .catch(function(){}).then(function(){ e.target.disabled = false; });
+});
+document.getElementById('healthAlertsForm').addEventListener('submit', function(e){
+  e.preventDefault();
+  apiPut('/api/admin/health/alerts', {enabled: document.getElementById('haEnabled').checked, email: document.getElementById('haEmail').checked,
+    telegram: document.getElementById('haTelegram').checked}).then(function(h){ renderHealth(h); toast('Настройки оповещений сохранены'); }).catch(function(){});
+});
+document.getElementById('haTest').addEventListener('click', function(){
+  apiPost('/api/admin/health/test-alert', {}).then(function(r){ toast(r.sent ? 'Отправлено сообщений: ' + r.sent : 'Не удалось отправить — см. журнал отправок в «Интеграциях»'); }).catch(function(){});
+});
+
+/* ════════════════════════════════════════════════════════════════
    Уведомления: подписка пользователя на проект (дайджест и оповещения)
 ════════════════════════════════════════════════════════════════ */
 var notifyState = null;
@@ -4028,6 +4378,7 @@ function init(){
     currentUser.defaultPassword = !!data.defaultPassword;
     updateRoleUI();
     loadProjects();
+    if(isGlobalAdmin()) api('/api/admin/health').then(function(h){ setHealthDot(h.status); }).catch(function(){});
   }).catch(function(){
     window.location.href = '/login';
   });
@@ -4039,12 +4390,14 @@ function init(){
 var auditPageLabels = {
   dashboard: 'Дашборд', stages: 'Свод по этапам', data: 'Данные по датам',
   services: 'Эпики', settings: 'Настройки', users: 'Пользователи',
-  projects: 'Проекты', profile: 'Профиль', jira: 'Связь с Jira', notify: 'Рассылки', integrations: 'Интеграции'
+  projects: 'Проекты', profile: 'Профиль', jira: 'Связь с Jira', notify: 'Рассылки', integrations: 'Интеграции',
+  calendar: 'Производственный календарь', health: 'Состояние системы'
 };
-var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление', autofill: 'Автозаполнение', restore: 'Восстановление истории' };
+var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление', autofill: 'Автозаполнение', restore: 'Восстановление истории',
+  sync: 'Синхронизация с Jira' };
 var auditEntityLabels = { project: 'Проект', service: 'Эпик', entry: 'Замер', user: 'Пользователь', stage_target: 'Цель этапа', settings: 'Настройки',
   jira_connection: 'Подключение к Jira', jira_button: 'Кнопка среза', jira_schedule: 'Расписание автозаполнения',
-  notify_settings: 'Почта и Telegram' };
+  notify_settings: 'Почта и Telegram', org_calendar: 'Производственный календарь', admin_alerts: 'Оповещения администратору' };
 var auditFieldLabels = {
   name: 'Название', description: 'Описание', etap: 'Этап', targetDate: 'Целевая дата', isDone: 'Сдано', stageGroup: 'Группа в своде',
   date: 'Дата', remaining: 'Остаток', spent: 'Затрачено', estimate: 'Оценка',
@@ -4056,7 +4409,8 @@ var auditFieldLabels = {
   forecastMethod: 'Метод прогноза', riskBufferDays: 'Буфер риска', burnrateMethod: 'Метод burn rate', burnrateWindowDays: 'Окно burn rate',
   rangeConfidence: 'Уровень доверия диапазона', workdays: 'Рабочие дни', holidays: 'Праздники', extraWorkdays: 'Рабочие выходные',
   units: 'Единицы', hoursPerDay: 'Часов в рабочем дне', staleDays: 'Замер устарел, дней', scopeThreshold: 'Рост объёма, %',
-  slipThreshold: 'Сдвиг прогноза, дней', chanceThreshold: 'Порог шанса, %', insightWindowDays: 'Период сравнения, дней'
+  slipThreshold: 'Сдвиг прогноза, дней', chanceThreshold: 'Порог шанса, %', insightWindowDays: 'Период сравнения, дней',
+  epicSync: 'Эпики из Jira', adminAlerts: 'Оповещения администратору'
 };
 /* В БД время хранится в UTC (CURRENT_TIMESTAMP) — показываем в локальном часовом поясе */
 function fmtDateTime(ts){

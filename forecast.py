@@ -47,6 +47,7 @@ def is_num(v):
 DEFAULT_SETTINGS = {
     'forecastMethod': 'linear', 'riskBufferDays': 3, 'burnrateMethod': 'all', 'burnrateWindowDays': 14,
     'rangeConfidence': 70, 'workdays': False, 'holidays': [], 'extraWorkdays': [],
+    'orgHolidays': [], 'orgExtraWorkdays': [],  # общий производственный календарь (задаёт администратор)
     'units': 'hours', 'hoursPerDay': 8,
     'staleDays': 10, 'scopeThreshold': 10, 'slipThreshold': 7, 'chanceThreshold': 50, 'insightWindowDays': 28,
 }
@@ -70,7 +71,7 @@ def parse_date_list(text):
 
 def settings_dict(row):
     """Строка settings → настройки как в интерфейсе (DEFAULT_SETTINGS; пустые значения — по умолчанию)."""
-    out = dict(DEFAULT_SETTINGS, holidays=[], extraWorkdays=[])
+    out = dict(DEFAULT_SETTINGS, holidays=[], extraWorkdays=[], orgHolidays=[], orgExtraWorkdays=[])
     if not row:
         return out
     keys = row.keys()
@@ -168,9 +169,12 @@ class WorkCalendar:
 
 
 def calendar_for(settings):
+    """Календарь расчёта: календарные дни или рабочие — общий производственный календарь плюс даты проекта."""
     if not settings.get('workdays'):
         return CALENDAR_DAYS
-    return WorkCalendar(list(settings.get('holidays') or []), list(settings.get('extraWorkdays') or []))
+    holidays = sorted(set(settings.get('orgHolidays') or []) | set(settings.get('holidays') or []))
+    extra = sorted(set(settings.get('orgExtraWorkdays') or []) | set(settings.get('extraWorkdays') or []))
+    return WorkCalendar(holidays, extra)
 
 
 def avg_burn_rate(dates, rems, settings, cal=None):

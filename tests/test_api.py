@@ -64,7 +64,9 @@ def test_project_data_shape(admin):
     assert len(data['entries']) == 24
     assert data['stageTargets'] == {'Этап 3': '2026-08-24', 'Этап 4': '2026-08-31'}
     import forecast
-    assert data['settings'] == forecast.DEFAULT_SETTINGS  # пустые настройки — значения по умолчанию
+    import holidays_ru
+    holidays, extra = holidays_ru.all_dates()  # общий производственный календарь — праздники РФ при первом запуске
+    assert data['settings'] == dict(forecast.DEFAULT_SETTINGS, orgHolidays=holidays, orgExtraWorkdays=extra)
     svc = data['services'][0]
     assert set(svc) == {'id', 'project_id', 'etap', 'name', 'targetDate', 'sortOrder', 'isDone', 'stageGroup'}
 

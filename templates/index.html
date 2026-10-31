@@ -60,6 +60,8 @@
       <a href="#" class="nav-item" data-view="projects" id="navProjects">Проекты</a>
       <a href="#" class="nav-item" data-view="audit" id="navAudit">Реестр изменений</a>
       <a href="#" class="nav-item" data-view="integrations" id="navIntegrations">Интеграции</a>
+      <a href="#" class="nav-item" data-view="calendar" id="navCalendar">Производственный календарь</a>
+      <a href="#" class="nav-item" data-view="health" id="navHealth">Состояние системы <span class="health-dot" id="navHealthDot" hidden></span></a>
     </nav>
 
     <div class="sidebar-actions">
@@ -389,6 +391,13 @@
           <button type="button" class="btn btn-ghost btn-sm" id="jiraOpenIntegrations" hidden>Открыть «Интеграции»</button>
         </div>
         <div class="jira-status" id="jiraProjectStatus" role="status"></div>
+        <div class="wizard-callout" id="jiraWizardCallout" hidden>
+          <div>
+            <b>Мастер подключения проекта</b>
+            <div class="section-note">Выберите структуру Jira — эпики проекта создадутся сами, вместе с целевыми датами и признаком «Сдано»; затем замер на сегодня, история за прошлые недели и автозаполнение по расписанию.</div>
+          </div>
+          <button type="button" class="btn btn-primary btn-sm" id="jiraWizardBtn">Запустить мастер</button>
+        </div>
       </div>
       <div class="panel">
         <div class="panel-head">
@@ -399,6 +408,61 @@
           <button type="button" class="btn btn-primary btn-sm" id="jiraAddButton">+ Новая кнопка</button>
         </div>
         <div class="table-scroll"><table class="data-table" id="jiraButtonsTable"></table></div>
+      </div>
+    </section>
+
+    <!-- ПРОИЗВОДСТВЕННЫЙ КАЛЕНДАРЬ (администратор) -->
+    <section class="view" id="view-calendar">
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Производственный календарь</div>
+            <div class="section-note">Общий для всех проектов: праздники и перенесённые выходные, а также субботы и воскресенья, объявленные рабочими. Применяется в проектах, где в настройках включён расчёт сроков в рабочих днях; в проекте можно добавить свои даты.</div>
+          </div>
+        </div>
+        <div class="calendar-presets" id="calPresets"></div>
+        <div class="settings-grid">
+          <div class="setting-item"><label class="small" for="calHolidays">Нерабочие будни: праздники и переносы</label><textarea id="calHolidays" rows="12" placeholder="01.01.2027 – 08.01.2027"></textarea>
+            <div class="setting-hint">Даты или диапазоны, по одному в строке</div></div>
+          <div class="setting-item"><label class="small" for="calExtra">Рабочие субботы и воскресенья</label><textarea id="calExtra" rows="12" placeholder="20.02.2027"></textarea>
+            <div class="setting-hint">Выходные дни, объявленные рабочими</div></div>
+        </div>
+        <div class="form-actions"><button type="button" class="btn btn-primary btn-sm" id="calSave">Сохранить календарь</button></div>
+      </div>
+    </section>
+
+    <!-- СОСТОЯНИЕ СИСТЕМЫ (администратор) -->
+    <section class="view" id="view-health">
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Состояние системы</div>
+            <div class="section-note">Работает ли всё, от чего зависят данные проектов: планировщик, подключение к Jira, автозаполнение, восстановление истории, почта и Telegram, свежесть замеров, место на диске.</div>
+          </div>
+          <div class="panel-controls">
+            <button type="button" class="btn btn-ghost btn-sm" id="healthCheckJira">Проверить Jira</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="healthRefresh">Обновить</button>
+          </div>
+        </div>
+        <div id="healthBody" aria-live="polite"><p class="insight-empty">Проверяем…</p></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Оповещения администратору</div>
+            <div class="section-note">Когда компонент переходит в состояние «Ошибка» — например, Jira не отвечает, автозаполнение не выполнилось или перестал работать планировщик, — администраторы получают сообщение; когда неполадка устранена — тоже. Об одной и той же ошибке повторно не пишем.</div>
+          </div>
+        </div>
+        <form id="healthAlertsForm" class="health-alerts" novalidate>
+          <label class="switch"><input type="checkbox" id="haEnabled"> <span>Оповещать администраторов о сбоях</span></label>
+          <label class="checkbox-row"><input type="checkbox" id="haEmail"> Почта</label>
+          <label class="checkbox-row"><input type="checkbox" id="haTelegram"> Telegram</label>
+          <div class="setting-hint" id="haRecipients"></div>
+          <div class="form-actions">
+            <button type="button" class="btn btn-ghost btn-sm" id="haTest">Отправить проверочное</button>
+            <button type="submit" class="btn btn-primary btn-sm">Сохранить</button>
+          </div>
+        </form>
       </div>
     </section>
 

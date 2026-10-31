@@ -13,6 +13,7 @@ import re
 import math
 import hashlib
 import secrets
+import shutil
 import sqlite3
 import json
 import logging
@@ -29,8 +30,10 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from init_db import create_auth_tables, create_indexes, create_jira_tables, create_notify_tables, upgrade_settings
+from init_db import (create_auth_tables, create_indexes, create_jira_tables, create_notify_tables, ensure_org_calendar,
+                     upgrade_settings)
 import forecast as fc
+import holidays_ru
 import insights as ins
 import jira_integration as jira
 import notify
@@ -120,6 +123,7 @@ def migrate_db():
         create_notify_tables(conn)
         create_auth_tables(conn)
         upgrade_settings(conn)
+        ensure_org_calendar(conn)
         create_indexes(conn)
         conn.commit()
         adopt_project_jira_connection(conn)
@@ -783,6 +787,57 @@ def api_delete_project(pid):
     return jsonify({'success': True})
 
 
+def org_calendar(db):
+    """Общий производственный календарь организации (задаёт администратор) → {'holidays', 'extraWorkdays'}."""
+    row = db.execute("SELECT value FROM app_settings WHERE key = 'org_calendar'").fetchone()
+    try:
+        data = json.loads(row['value']) if row else {}
+    except (ValueError, TypeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return {k: fc.parse_date_list(','.join(v for v in data.get(k) or [] if isinstance(v, str)))
+            for k in ('holidays', 'extraWorkdays')}
+
+
+def project_settings(db, pid, row=None):
+    """Настройки проекта для расчётов (как в интерфейсе) вместе с общим производственным календарём."""
+    if row is None:
+        row = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
+    settings = fc.settings_dict(row)
+    cal = org_calendar(db)
+    settings.update(orgHolidays=cal['holidays'], orgExtraWorkdays=cal['extraWorkdays'])
+    return settings
+
+
+@app.route('/api/admin/calendar')
+@admin_required
+def api_get_org_calendar():
+    return jsonify(dict(org_calendar(get_db()), presets=holidays_ru.presets_json()))
+
+
+@app.route('/api/admin/calendar', methods=['PUT'])
+@admin_required
+def api_save_org_calendar():
+    """Общий производственный календарь: праздники и рабочие выходные для всех проектов с расчётом в рабочих днях."""
+    data = json_body()
+    out = {}
+    for key, title in (('holidays', 'Праздники'), ('extraWorkdays', 'Рабочие выходные')):
+        value = data.get(key) or []
+        if not isinstance(value, list) or len(value) > CALENDAR_MAX_DATES:
+            raise ValidationError(f'Поле «{title}»: список дат (не больше {CALENDAR_MAX_DATES})')
+        out[key] = sorted({parse_date(d, title) for d in value})
+    db = get_db()
+    old = org_calendar(db)
+    _set_setting(db, 'org_calendar', json.dumps(out))
+    db.commit()
+    changes = [{'field': key, 'old': f'{len(old[key])} дат', 'new': f'{len(out[key])} дат'}
+               for key in out if old[key] != out[key]]
+    if changes:
+        audit_log('calendar', 'update', 'org_calendar', None, None, changes, entity_name='Производственный календарь')
+    return jsonify(dict(out, presets=holidays_ru.presets_json()))
+
+
 def project_payload(db, pid):
     """Эпики, замеры, цели этапов и настройки проекта в формате фронтенда (camelCase)."""
     services = db.execute('SELECT * FROM services WHERE project_id = ? ORDER BY sort_order, id', (pid,)).fetchall()
@@ -804,8 +859,8 @@ def project_payload(db, pid):
             'spent': e['spent'], 'estimate': e['estimate']
         } for e in entries],
         'stageTargets': {r['stage_name']: r['target_date'] for r in stage_targets},
-        # пустые значения в БД — значения по умолчанию
-        'settings': fc.settings_dict(settings),
+        # пустые значения в БД — значения по умолчанию; общий производственный календарь — отдельными списками
+        'settings': project_settings(db, pid, settings),
     }
 
 
@@ -1154,8 +1209,7 @@ def api_update_settings(pid):
             changes.append({'field': key, 'old': None if old_val is None else str(old_val), 'new': str(values[col])})
     if changes:
         audit_log('settings', 'update', 'settings', None, pid, changes)
-    return jsonify({'success': True, 'settings': fc.settings_dict(
-        db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone())})
+    return jsonify({'success': True, 'settings': project_settings(db, pid)})
 
 
 # ─── API: Связь с Jira (срез данных из Structure) ────────────────
@@ -1175,6 +1229,7 @@ def _jira_button_json(db, row):
             'structureName': row['structure_name'] or '',
             'fieldMap': _button_field_map(row),
             'lastSuccessAt': row['last_success_at'],
+            'epicSync': dict(epic_sync_config(row), lastAt=row['epic_sync_at'], lastMessage=row['epic_sync_message']),
             'schedule': _schedule_json(sched),
             'history': _history_job_json(db.execute('SELECT * FROM jira_history_jobs WHERE button_id = ? '
                                                     'ORDER BY id DESC LIMIT 1', (row['id'],)).fetchone()),
@@ -1225,20 +1280,29 @@ def _jira_client(db, override=None, detailed=None):
 
 
 def _jira_error(e):
+    try:
+        db = get_db()
+        db.rollback()
+        record_jira_health(db, False, str(e))
+        db.commit()
+    except sqlite3.Error:  # отметка состояния не должна мешать ответу об ошибке
+        pass
     return jsonify({'error': str(e)}), 502
+
+
+def _structure_id(value):
+    if value in (None, ''):
+        return None
+    if isinstance(value, bool) or not is_int_text(str(value)):
+        raise ValidationError('ID структуры — целое число')
+    return int(value)
 
 
 def _parse_jira_button(db, pid, data):
     name = text_value(data.get('name'))
     if not name:
         raise ValidationError('Укажите название кнопки')
-    structure_id = data.get('structureId')
-    if structure_id in (None, ''):
-        structure_id = None
-    elif isinstance(structure_id, bool) or not is_int_text(str(structure_id)):
-        raise ValidationError('ID структуры — целое число')
-    else:
-        structure_id = int(structure_id)
+    structure_id = _structure_id(data.get('structureId'))
     project_services = {r['id'] for r in db.execute('SELECT id FROM services WHERE project_id = ?', (pid,))}
     mappings, bad_keys = [], []
     for m in data.get('mappings') or []:
@@ -1356,7 +1420,10 @@ def api_test_jira_connection():
     try:
         user = _jira_client(get_db(), override=data, detailed=True).myself()
     except jira.JiraError as e:
-        return _jira_error(e)
+        return _jira_error(e) if not data else (jsonify({'error': str(e)}), 502)  # форма ещё не сохранена
+    if not data:
+        record_jira_health(get_db(), True)
+        get_db().commit()
     return jsonify({'success': True, 'user': user})
 
 
@@ -1442,6 +1509,7 @@ def api_jira_snapshot(bid):
     finally:
         if client:
             jira_log.info('срез по кнопке %s: %s', bid, client.stats())
+    record_jira_health(db, True)
     store_issue_snapshots(db, row['project_id'], items, snap_date)
     if _snapshot_has_values(items):
         _mark_snapshot_success(db, bid)
@@ -1470,6 +1538,307 @@ def store_issue_snapshots(db, pid, items, snap_date, restored=False):
             [(it['serviceId'], snap_date, i['key'], i['summary'], i['status'], i['category'], i['remaining'], i['spent'],
               i['estimate'], 1 if i['container'] else 0, ','.join(i['problems']), captured, 1 if restored else 0)
              for i in issues])
+
+
+# ─── Эпики из Jira: список эпиков, целевые даты и признак «Сдано» ───
+
+EPIC_SYNC_DEFAULT = {'enabled': False, 'level': 0, 'jql': '', 'target': 'duedate', 'done': True, 'names': False,
+                     'stage': ''}
+
+
+def parse_epic_sync(data, strict=True):
+    """Настройки синхронизации эпиков кнопки. strict — ошибка ввода → 400; иначе (сохранённое значение) — по умолчанию."""
+    out = dict(EPIC_SYNC_DEFAULT)
+    data = data if isinstance(data, dict) else {}
+
+    def bad(message):
+        if strict:
+            raise ValidationError(message)
+    for key, title in (('enabled', 'Синхронизировать перед автозаполнением'), ('done', 'Отмечать «Сдано»'),
+                       ('names', 'Обновлять названия')):
+        if key in data:
+            if isinstance(data[key], bool):
+                out[key] = data[key]
+            else:
+                bad(f'Поле «{title}»: да или нет')
+    if 'level' in data:
+        if data['level'] in (0, 1) and not isinstance(data['level'], bool):
+            out['level'] = data['level']
+        else:
+            bad('Уровень эпиков в структуре — верхний (0) или вложенный (1)')
+    if 'target' in data:
+        if data['target'] in jira.EPIC_TARGETS:
+            out['target'] = data['target']
+        else:
+            bad('Целевая дата — из срока задачи, из версии или не заполнять')
+    for key, limit in (('jql', 2000), ('stage', 300)):
+        if key in data:
+            if data[key] is None or isinstance(data[key], str):
+                out[key] = text_value(data[key], limit)
+            else:
+                bad(f'Поле «{key}»: текст')
+    return out
+
+
+def epic_sync_config(row):
+    try:
+        raw = json.loads(row['epic_sync']) if row['epic_sync'] else {}
+    except (ValueError, TypeError):
+        raw = {}
+    return parse_epic_sync(raw, strict=False)
+
+
+def _project_key_index(db, pid):
+    """Ключ задачи Jira → эпик проекта по ассоциациям всех кнопок проекта (первое совпадение)."""
+    index = {}
+    for m in db.execute('SELECT m.service_id, m.issue_keys FROM jira_snapshot_mappings m JOIN jira_snapshot_buttons b '
+                        'ON b.id = m.button_id WHERE b.project_id = ? ORDER BY m.button_id, m.id', (pid,)):
+        for key in jira.parse_issue_keys(m['issue_keys'])[0]:
+            index.setdefault(key, m['service_id'])
+    return index
+
+
+def plan_epic_sync(db, pid, candidates, config, button_id=None, only_keys=None):
+    """Что изменит синхронизация: новые эпики, изменения целей, «Сдано», названий и этапов, эпики кнопки,
+    которых больше нет в Jira. only_keys — создавать только эти эпики (выбор в мастере подключения)."""
+    services = {s['id']: s for s in db.execute('SELECT * FROM services WHERE project_id = ?', (pid,))}
+    index = _project_key_index(db, pid)
+    mapped_here = {}
+    if button_id:
+        for m in db.execute('SELECT * FROM jira_snapshot_mappings WHERE button_id = ?', (button_id,)):
+            mapped_here[m['service_id']] = jira.parse_issue_keys(m['issue_keys'])[0]
+    create, update, link, unchanged = [], [], [], 0
+    for c in candidates:
+        sid = index.get(c['key'])
+        if sid not in services:
+            if only_keys is None or c['key'] in only_keys:
+                create.append({'key': c['key'], 'name': c['summary'][:300] or c['key'],
+                               'etap': (c['stage'] or config['stage'] or '')[:300],
+                               'target': c['target'] if config['target'] != 'none' else None,
+                               'done': bool(c['done'] and config['done']), 'status': c['status']})
+            continue
+        if only_keys is not None and c['key'] not in only_keys:
+            continue
+        s = services[sid]
+        if button_id is not None and c['key'] not in mapped_here.get(sid, []):
+            link.append({'serviceId': sid, 'key': c['key'], 'name': s['name']})
+        changes = []
+        if config['target'] != 'none' and c['target'] and c['target'] != (s['target_date'] or None):
+            changes.append({'field': 'targetDate', 'old': s['target_date'] or None, 'new': c['target']})
+        if config['done'] and bool(s['is_done']) != c['done']:
+            changes.append({'field': 'isDone', 'old': bool(s['is_done']), 'new': c['done']})
+        if config['names'] and c['summary'] and c['summary'][:300] != s['name']:
+            changes.append({'field': 'name', 'old': s['name'], 'new': c['summary'][:300]})
+        if config['level'] == 1 and c['stage'] and c['stage'][:300] != (s['etap'] or ''):
+            changes.append({'field': 'etap', 'old': s['etap'], 'new': c['stage'][:300]})
+        if changes:
+            update.append({'serviceId': sid, 'key': c['key'], 'name': s['name'], 'changes': changes})
+        else:
+            unchanged += 1
+    keys = {c['key'] for c in candidates}
+    missing = [{'serviceId': sid, 'name': services[sid]['name'], 'keys': ', '.join(ks)}
+               for sid, ks in mapped_here.items() if sid in services and ks and not keys & set(ks)
+               and not services[sid]['is_done']]
+    return {'create': create, 'update': update, 'link': link, 'missing': missing, 'unchanged': unchanged,
+            'total': len(candidates)}
+
+
+def _add_mapping(db, button_id, service_id, key):
+    row = db.execute('SELECT * FROM jira_snapshot_mappings WHERE button_id = ? AND service_id = ?',
+                     (button_id, service_id)).fetchone()
+    if row:
+        keys = jira.parse_issue_keys(row['issue_keys'])[0]
+        if key not in keys:
+            db.execute('UPDATE jira_snapshot_mappings SET issue_keys = ? WHERE id = ?', (', '.join(keys + [key]), row['id']))
+    else:
+        db.execute('INSERT INTO jira_snapshot_mappings (button_id, service_id, issue_keys, include_subtree) '
+                   'VALUES (?, ?, ?, 1)', (button_id, service_id, key))
+
+
+def apply_epic_sync(db, pid, button_id, plan, actor=None):
+    """Применить план синхронизации: создать эпики со связками на кнопке, обновить поля, записать в реестр.
+    Коммит — на стороне вызывающего. → текст итога."""
+    order = db.execute('SELECT COALESCE(MAX(sort_order), 0) FROM services WHERE project_id = ?', (pid,)).fetchone()[0]
+    for item in plan['create']:
+        order += 1
+        sid = db.execute('INSERT INTO services (project_id, etap, name, target_date, sort_order, is_done, stage_group) '
+                         'VALUES (?, ?, ?, ?, ?, ?, ?)', (pid, item['etap'], item['name'], item['target'] or '', order,
+                                                          1 if item['done'] else 0, '')).lastrowid
+        item['serviceId'] = sid
+        if button_id:
+            _add_mapping(db, button_id, sid, item['key'])
+        audit_log('jira', 'sync', 'service', sid, pid, [{'field': 'name', 'old': None, 'new': f"{item['name']} ({item['key']})"}],
+                  entity_name=item['name'], commit=False, actor=actor)
+    for item in plan['link']:
+        if button_id:
+            _add_mapping(db, button_id, item['serviceId'], item['key'])
+    columns = {'targetDate': 'target_date', 'isDone': 'is_done', 'name': 'name', 'etap': 'etap'}
+    for item in plan['update']:
+        for ch in item['changes']:
+            value = (1 if ch['new'] else 0) if ch['field'] == 'isDone' else ch['new']
+            db.execute(f"UPDATE services SET {columns[ch['field']]} = ? WHERE id = ?", (value, item['serviceId']))
+        audit_log('jira', 'sync', 'service', item['serviceId'], pid, item['changes'], entity_name=item['name'],
+                  commit=False, actor=actor)
+    return epic_sync_message(plan)
+
+
+def epic_sync_message(plan):
+    parts = [f"новых эпиков: {len(plan['create'])}", f"обновлено: {len(plan['update'])}"]
+    if plan['missing']:
+        parts.append(f"нет в Jira: {len(plan['missing'])}")
+    return 'Эпики из Jira — ' + ', '.join(parts)
+
+
+def run_epic_sync(db, button_row, actor=None, dry_run=False, client=None):
+    """Синхронизация эпиков по кнопке → (план, итог). Ошибки Jira — JiraError."""
+    config = epic_sync_config(button_row)
+    client = client or _jira_client(db)
+    candidates = jira.epic_candidates(client, button_row['structure_id'], config['level'], config['jql'], config['target'])
+    record_jira_health(db, True)
+    plan = plan_epic_sync(db, button_row['project_id'], candidates, config, button_row['id'])
+    if dry_run:
+        return plan, epic_sync_message(plan)
+    message = apply_epic_sync(db, button_row['project_id'], button_row['id'], plan, actor)
+    db.execute('UPDATE jira_snapshot_buttons SET epic_sync_at = ?, epic_sync_message = ? WHERE id = ?',
+               (_utc_now_iso(), message, button_row['id']))
+    return plan, message
+
+
+@app.route('/api/projects/<int:pid>/jira/epics/preview', methods=['POST'])
+@login_required
+def api_jira_epics_preview(pid):
+    """Эпики проекта в Jira (для мастера подключения): какие будут созданы, какие уже есть в проекте."""
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    data = json_body()
+    config = parse_epic_sync(data)
+    structure_id = _structure_id(data.get('structureId'))
+    db = get_db()
+    try:
+        candidates = jira.epic_candidates(_jira_client(db), structure_id, config['level'], config['jql'], config['target'])
+    except jira.JiraError as e:
+        return _jira_error(e)
+    index = _project_key_index(db, pid)
+    services = {s['id']: s['name'] for s in db.execute('SELECT id, name FROM services WHERE project_id = ?', (pid,))}
+    for c in candidates:
+        sid = index.get(c['key'])
+        c['serviceId'] = sid if sid in services else None
+        c['serviceName'] = services.get(sid)
+    return jsonify({'epics': candidates})
+
+
+@app.route('/api/jira/buttons/<int:bid>/epic-sync', methods=['PUT'])
+@login_required
+def api_save_epic_sync(bid):
+    db = get_db()
+    row, err = _jira_button_or_404(db, bid)
+    if err:
+        return err
+    config = parse_epic_sync(json_body())
+    if not row['structure_id'] and not config['jql']:
+        raise ValidationError('У кнопки нет структуры — укажите запрос JQL, по которому найти эпики')
+    old = epic_sync_config(row)
+    db.execute('UPDATE jira_snapshot_buttons SET epic_sync = ? WHERE id = ?', (json.dumps(config, ensure_ascii=False), bid))
+    db.commit()
+    changes = [{'field': 'epicSync', 'old': json.dumps(old, ensure_ascii=False), 'new': json.dumps(config, ensure_ascii=False)}]
+    audit_log('jira', 'update', 'jira_button', bid, row['project_id'], changes if old != config else None,
+              entity_name=row['name'])
+    return jsonify(_jira_button_json(db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone()))
+
+
+@app.route('/api/jira/buttons/<int:bid>/epic-sync/run', methods=['POST'])
+@login_required
+def api_run_epic_sync(bid):
+    """Синхронизировать эпики сейчас (dryRun — только показать, что изменится)."""
+    db = get_db()
+    row, err = _jira_button_or_404(db, bid)
+    if err:
+        return err
+    dry_run = bool(json_body().get('dryRun'))
+    try:
+        plan, message = run_epic_sync(db, row, dry_run=dry_run)
+    except jira.JiraError as e:
+        return _jira_error(e)
+    db.commit()
+    return jsonify({'plan': plan, 'message': message, 'button': _jira_button_json(
+        db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone())})
+
+
+@app.route('/api/projects/<int:pid>/jira/onboard', methods=['POST'])
+@login_required
+def api_jira_onboard(pid):
+    """Мастер подключения проекта к Jira за один шаг: эпики из Jira (новые создаются, существующие связываются),
+    кнопка среза, замер на сегодня, восстановление истории за выбранные недели и автозаполнение по расписанию."""
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    db = get_db()
+    if not db.execute('SELECT 1 FROM projects WHERE id = ?', (pid,)).fetchone():
+        return jsonify({'error': 'Проект не найден'}), 404
+    data = json_body()
+    name = text_value(data.get('name')) or 'Срез из Jira'
+    structure_id = _structure_id(data.get('structureId'))
+    config = parse_epic_sync(data.get('epics'))
+    if not structure_id and not config['jql']:
+        raise ValidationError('Выберите структуру или укажите запрос JQL, по которому найти эпики')
+    keys = data.get('keys')
+    if keys is not None and (not isinstance(keys, list) or not all(isinstance(k, str) for k in keys)):
+        raise ValidationError('Список эпиков — ключи задач Jira')
+    try:
+        field_map = jira.normalize_field_map(data.get('fieldMap'))
+    except ValueError as e:
+        raise ValidationError(str(e))
+    weeks = int_value(data.get('historyWeeks', 0), 'Восстановить историю, недель', 0, 52)
+    schedule = data.get('schedule') if isinstance(data.get('schedule'), dict) else {}
+    tz_name = text_value(schedule.get('timezone')) or 'Europe/Moscow'
+    tz = _zone(tz_name)
+    if schedule.get('enabled'):  # расписание проверяется до того, как что-либо создано
+        days = schedule.get('days')
+        if not isinstance(days, list) or not days or not all(isinstance(d, int) and 1 <= d <= 7 for d in days):
+            raise ValidationError('Автозаполнение: выберите дни недели')
+        if not re.fullmatch(r'([01]\d|2[0-3]):[0-5]\d', text_value(schedule.get('time'))):
+            raise ValidationError('Автозаполнение: время в формате ЧЧ:ММ')
+    try:
+        client = _jira_client(db)
+        candidates = jira.epic_candidates(client, structure_id, config['level'], config['jql'], config['target'])
+    except jira.JiraError as e:
+        return _jira_error(e)
+    order = db.execute('SELECT COALESCE(MAX(sort_order), 0) FROM jira_snapshot_buttons WHERE project_id = ?',
+                       (pid,)).fetchone()[0]
+    bid = db.execute('INSERT INTO jira_snapshot_buttons (project_id, name, structure_id, structure_name, sort_order, '
+                     'field_map, epic_sync) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                     (pid, name, structure_id, text_value(data.get('structureName')) or None, order + 1,
+                      json.dumps(field_map), json.dumps(config, ensure_ascii=False))).lastrowid
+    plan = plan_epic_sync(db, pid, candidates, config, bid, set(k.strip().upper() for k in keys) if keys is not None else None)
+    if not plan['create'] and not plan['link']:
+        db.rollback()
+        raise ValidationError('Не выбрано ни одного эпика')
+    message = apply_epic_sync(db, pid, bid, plan)
+    db.execute('UPDATE jira_snapshot_buttons SET epic_sync_at = ?, epic_sync_message = ? WHERE id = ?',
+               (_utc_now_iso(), message, bid))
+    db.commit()
+    audit_log('jira', 'create', 'jira_button', bid, pid, [{'field': 'name', 'old': None, 'new': name}], entity_name=name)
+    row = db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone()
+    today = datetime.now(timezone.utc).astimezone(tz).date()
+    try:
+        status, snap_message = run_autofill(db, row, today.isoformat(), None)
+    except Exception as e:  # noqa: BLE001 — кнопка и эпики уже созданы: итог среза показывается в мастере
+        db.rollback()
+        logger.exception('onboarding snapshot failed for button %s', bid)
+        status, snap_message = 'error', f'Внутренняя ошибка: {e}'
+    db.commit()
+    job = None
+    if status == 'ok' and weeks:
+        start = (today - timedelta(days=7 * weeks)).isoformat()
+        end = (today - timedelta(days=1)).isoformat()
+        dates = history_dates(start, end, 7)
+        job = launch_history_job(db, bid, {'from': start, 'to': end, 'step': 'week', 'timezone': tz_name,
+                                           'dates': len(dates), 'keepExisting': True})
+    row = db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone()
+    if status == 'ok' and schedule.get('enabled'):
+        save_schedule(db, row, dict(schedule, timezone=tz_name))
+    return jsonify({'button': _jira_button_json(db, row), 'created': len(plan['create']), 'linked': len(plan['link']),
+                    'updated': len(plan['update']), 'snapshot': {'status': status, 'message': snap_message},
+                    'history': job})
 
 
 VOLUME_SQL = 'COALESCE(estimate, COALESCE(spent, 0) + COALESCE(remaining, 0))'
@@ -1805,7 +2174,13 @@ def api_save_jira_schedule(bid):
     row, err = _jira_button_or_404(db, bid)
     if err:
         return err
-    data = json_body()
+    save_schedule(db, row, json_body())
+    return jsonify(_jira_button_json(db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone()))
+
+
+def save_schedule(db, row, data):
+    """Сохранить расписание автозаполнения кнопки (проверка ввода, запись, реестр)."""
+    bid = row['id']
     enabled = bool(data.get('enabled'))
     days = data.get('days') or []
     if not isinstance(days, list) or not all(isinstance(d, int) and 1 <= d <= 7 for d in days):
@@ -1839,7 +2214,6 @@ def api_save_jira_schedule(bid):
               [{'field': 'autofill', 'old': None,
                 'new': (f"{','.join(str(d) for d in days)} в {run_time} ({tz_name})" if enabled else 'выключено')}],
               entity_name=row['name'])
-    return jsonify(_jira_button_json(db, db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (bid,)).fetchone()))
 
 
 def run_autofill(db, button_row, local_date, actor, overwrite=True):
@@ -1851,10 +2225,12 @@ def run_autofill(db, button_row, local_date, actor, overwrite=True):
         client = _jira_client(db)
         items = jira.compute_snapshot(client, button_row['structure_id'], button['mappings'], button['fieldMap'])
     except jira.JiraError as e:
+        record_jira_health(db, False, str(e))
         return 'error', str(e)
     finally:
         if client:
             jira_log.info('автозаполнение по кнопке %s: %s', button_row['id'], client.stats())
+    record_jira_health(db, True)
     store_issue_snapshots(db, pid, items, local_date)
     services = {s['id']: s for s in db.execute('SELECT * FROM services WHERE project_id = ?', (pid,)).fetchall()}
     parsed = []
@@ -1879,6 +2255,29 @@ def run_autofill(db, button_row, local_date, actor, overwrite=True):
     if warnings:
         message += f'; предупреждений: {warnings}'
     return 'ok', message
+
+
+def auto_epic_sync(db, button_row):
+    """Синхронизация эпиков перед автозаполнением (если включена у кнопки) → примечание для итога запуска или None.
+    Сбой синхронизации не отменяет автозаполнение."""
+    if not epic_sync_config(button_row)['enabled']:
+        return None
+    try:
+        plan, message = run_epic_sync(db, button_row, actor=AUTOFILL_ACTOR)
+        db.commit()
+    except jira.JiraError as e:
+        db.rollback()
+        record_jira_health(db, False, str(e))
+        message = f'Эпики из Jira не синхронизированы: {e}'
+        db.execute('UPDATE jira_snapshot_buttons SET epic_sync_at = ?, epic_sync_message = ? WHERE id = ?',
+                   (_utc_now_iso(), message, button_row['id']))
+        db.commit()
+        return message
+    except Exception as e:  # noqa: BLE001 — сбой синхронизации не должен мешать автозаполнению
+        db.rollback()
+        logger.exception('epic sync failed for button %s', button_row['id'])
+        return f'Эпики из Jira не синхронизированы: внутренняя ошибка ({e})'
+    return message if plan['create'] or plan['update'] or plan['missing'] else None
 
 
 def _finish_autofill(db, button_row, status, message, actor):
@@ -1983,18 +2382,23 @@ def api_start_jira_history(bid):
         return jsonify({'error': 'Восстановление по этой кнопке уже выполняется', 'job': running}), 409
     params = {'from': date_from, 'to': date_to, 'step': step, 'timezone': tz_name, 'dates': len(dates),
               'keepExisting': bool(data.get('keepExisting', True))}
+    return jsonify(launch_history_job(db, bid, params)), 202
+
+
+def launch_history_job(db, bid, params):
+    """Запустить восстановление истории по кнопке в фоне → задача (JSON)."""
     now = _utc_now_iso()
     user = get_current_user()
     jid = db.execute('INSERT INTO jira_history_jobs (button_id, status, message, params, created_by, created_at, '
                      "updated_at) VALUES (?, 'running', ?, ?, ?, ?, ?)",
-                     (bid, 'Подготовка…', json.dumps(params), user['username'], now, now)).lastrowid
+                     (bid, 'Подготовка…', json.dumps(params), user['username'] if user else AUTOFILL_ACTOR, now,
+                      now)).lastrowid
     db.commit()
     if app.config.get('HISTORY_SYNC'):  # тесты: выполнить сразу, без потока
         run_history_job(jid)
     else:
         threading.Thread(target=_history_thread, args=(jid,), name=f'jira-history-{jid}', daemon=True).start()
-    job = db.execute('SELECT * FROM jira_history_jobs WHERE id = ?', (jid,)).fetchone()
-    return jsonify(_history_job_json(job)), 202
+    return _history_job_json(db.execute('SELECT * FROM jira_history_jobs WHERE id = ?', (jid,)).fetchone())
 
 
 @app.route('/api/jira/history-jobs/<int:jid>')
@@ -2084,9 +2488,11 @@ def run_history_job(jid):
                   [{'field': 'result', 'old': None,
                     'new': f"{_fmt_date(params['from'])} — {_fmt_date(params['to'])}: {message}"}],
                   entity_name=button_row['name'], commit=False, actor=actor)
+        record_jira_health(db, True)
         _history_update(db, jid, status='done', message=message, finished_at=_utc_now_iso())
     except jira.JiraError as e:
         db.rollback()
+        record_jira_health(db, False, str(e))
         _history_update(db, jid, status='error', message=str(e), finished_at=_utc_now_iso())
     except Exception as e:  # noqa: BLE001 — ошибка фоновой задачи показывается пользователю
         db.rollback()
@@ -2119,8 +2525,11 @@ def run_due_schedules(now_utc=None):
         if not claimed:
             continue
         button = db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (sched['button_id'],)).fetchone()
+        sync_note = auto_epic_sync(db, button)
         try:
             status, message = run_autofill(db, button, today, AUTOFILL_ACTOR, overwrite=bool(sched['overwrite']))
+            if sync_note:
+                message = f'{sync_note}. {message}'
         except Exception as e:  # noqa: BLE001 — сбой одного запуска не должен останавливать планировщик
             db.rollback()
             logger.exception('autofill failed for button %s', sched['button_id'])
@@ -2496,8 +2905,7 @@ def api_digest_test(pid):
 
 def project_overview(db, pid, today=None):
     project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
-    settings_row = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
-    settings = fc.settings_dict(settings_row)
+    settings = project_settings(db, pid)
     services = db.execute('SELECT * FROM services WHERE project_id = ? AND NOT COALESCE(is_done, 0) '
                           'ORDER BY sort_order, id', (pid,)).fetchall()
     rows = {s['id']: [dict(r) for r in db.execute('SELECT date, remaining, spent, estimate FROM entries WHERE '
@@ -2554,7 +2962,7 @@ def project_insights(db, pid, today=None):
     """«Выводы» по проекту (insights.py): эпики и этапы с драйверами прогноза и сводка для руководителя.
     Учитываются несданные эпики; today — дата, относительно которой оценивается свежесть данных и прошедшие цели."""
     project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
-    settings = fc.settings_dict(db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone())
+    settings = project_settings(db, pid)
     today = today or datetime.now().date().isoformat()
     services = db.execute('SELECT * FROM services WHERE project_id = ? AND NOT COALESCE(is_done, 0) '
                           'ORDER BY sort_order, id', (pid,)).fetchall()
@@ -2975,9 +3383,328 @@ def deliver_outbox():
     return done
 
 
+# ─── Состояние системы и оповещения администратору ───────────────
+
+APP_STARTED = datetime.now(timezone.utc)
+HEALTH_ORDER = {'ok': 0, 'off': 0, 'warn': 1, 'error': 2}
+HEALTH_TITLES = {'ok': 'В порядке', 'off': 'Не настроено', 'warn': 'Требует внимания', 'error': 'Ошибка'}
+SCHEDULER_STALE = timedelta(minutes=5)
+ADMIN_ALERTS_DEFAULT = {'enabled': True, 'email': True, 'telegram': True}
+
+
+def _json_setting(db, key, default):
+    row = db.execute('SELECT value FROM app_settings WHERE key = ?', (key,)).fetchone()
+    try:
+        value = json.loads(row['value']) if row else None
+    except (ValueError, TypeError):
+        value = None
+    return value if isinstance(value, type(default)) else default
+
+
+def record_jira_health(db, ok, message=None):
+    """Итог обращения к Jira для «Состояния системы» (без коммита). «Не настроено» — не сбой Jira."""
+    if not ok and message == JIRA_NOT_CONFIGURED:
+        return
+    state = _json_setting(db, 'jira_health', {})
+    now = _utc_now_iso()
+    if ok:
+        state.update(lastOkAt=now, last='ok')
+    else:
+        state.update(lastErrorAt=now, lastError=(message or '')[:300], last='error')
+    _set_setting(db, 'jira_health', json.dumps(state, ensure_ascii=False))
+
+
+def _ago(iso, now):
+    if not iso:
+        return 'никогда'
+    try:
+        moment = datetime.strptime(iso[:19].replace('T', ' '), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+    except ValueError:
+        return iso
+    minutes = int((now - moment).total_seconds() // 60)
+    if minutes < 1:
+        return 'только что'
+    if minutes < 60:
+        return f'{minutes} мин назад'
+    if minutes < 48 * 60:
+        return f'{minutes // 60} ч назад'
+    return f'{minutes // (24 * 60)} дн. назад'
+
+
+def _health_item(key, title, status, summary, details=()):
+    return {'key': key, 'title': title, 'status': status, 'summary': summary, 'details': list(details)}
+
+
+def _fmt_bytes(n):
+    for unit in ('Б', 'КБ', 'МБ', 'ГБ', 'ТБ'):
+        if n < 1024 or unit == 'ТБ':
+            return f"{ins.ru_num(n, 1)} {unit}"
+        n /= 1024
+
+
+def system_health(db, now=None):
+    """Состояние компонентов: приложение и диск, планировщик, Jira, автозаполнение, восстановление истории, почта,
+    Telegram, очередь уведомлений, свежесть данных проектов → {'status', 'checkedAt', 'items'}."""
+    now = now or datetime.now(timezone.utc)
+    items = []
+    # приложение и диск
+    details = [f'База данных: {DB_PATH}']
+    status = 'ok'
+    try:
+        details.append(f'Размер базы: {_fmt_bytes(os.path.getsize(DB_PATH))}')
+        usage = shutil.disk_usage(os.path.dirname(os.path.abspath(DB_PATH)))
+        details.append(f'Свободно на диске: {_fmt_bytes(usage.free)} из {_fmt_bytes(usage.total)}')
+        if usage.free < 1024 ** 3 or usage.free < usage.total * 0.05:
+            status = 'warn'
+            details.append('Места на диске мало: освободите его, иначе база перестанет сохранять изменения')
+    except OSError as e:
+        status = 'warn'
+        details.append(f'Не удалось проверить диск: {e}')
+    items.append(_health_item('app', 'Приложение', status,
+                              f'Версия {APP_VERSION}; служба запущена {_ago(APP_STARTED.strftime("%Y-%m-%d %H:%M:%S"), now)}',
+                              details))
+    # планировщик
+    if os.environ.get('BURNDOWN_SCHEDULER', '1') == '0':
+        items.append(_health_item('scheduler', 'Планировщик', 'off', 'Отключён (BURNDOWN_SCHEDULER=0): автозаполнение, '
+                                  'дайджесты и оповещения не выполняются'))
+    else:
+        tick = _app_setting(db, 'scheduler_tick')
+        last = datetime.strptime(tick, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc) if tick else None
+        if last and now - last <= SCHEDULER_STALE:
+            items.append(_health_item('scheduler', 'Планировщик', 'ok', f'Работает: последняя проверка {_ago(tick, now)}'))
+        elif not last and now - APP_STARTED <= SCHEDULER_STALE:
+            items.append(_health_item('scheduler', 'Планировщик', 'ok', 'Запускается'))
+        else:
+            items.append(_health_item('scheduler', 'Планировщик', 'error',
+                                      f'Не работает: последняя проверка {_ago(tick, now)} — перезапустите службу Burndown'))
+    # Jira
+    buttons = db.execute('SELECT COUNT(*) FROM jira_snapshot_buttons').fetchone()[0]
+    if not jira_connection(db):
+        items.append(_health_item('jira', 'Jira', 'error' if buttons else 'off',
+                                  f'Подключение не настроено, а кнопок среза — {buttons}' if buttons
+                                  else 'Подключение не настроено'))
+    else:
+        jh = _json_setting(db, 'jira_health', {})
+        if jh.get('last') == 'error':
+            items.append(_health_item('jira', 'Jira', 'error', f"Последнее обращение {_ago(jh['lastErrorAt'], now)} — "
+                                      f"ошибка: {jh.get('lastError')}",
+                                      [f"Последнее успешное обращение: {_ago(jh.get('lastOkAt'), now)}"]))
+        else:
+            items.append(_health_item('jira', 'Jira', 'ok', f"Последнее успешное обращение {_ago(jh.get('lastOkAt'), now)}"))
+    # автозаполнение
+    rows = db.execute('SELECT s.*, b.name AS button, b.project_id, p.name AS project FROM jira_schedules s '
+                      'JOIN jira_snapshot_buttons b ON b.id = s.button_id JOIN projects p ON p.id = b.project_id '
+                      'WHERE s.enabled = 1 ORDER BY p.id, b.sort_order, b.id').fetchall()
+    failed, late = [], []
+    for r in rows:
+        if r['last_status'] == 'error':
+            failed.append(f"{r['project']} — {r['button']}: {r['last_message']}")
+        try:
+            local = now.astimezone(ZoneInfo(r['timezone']))
+        except (ZoneInfoNotFoundError, ValueError):
+            continue
+        due = local.isoweekday() in _schedule_days(r['days']) and local.strftime('%H:%M') >= r['run_time']
+        overdue = (datetime.combine(local.date(), datetime.strptime(r['run_time'], '%H:%M').time(), local.tzinfo)
+                   + timedelta(hours=1)) <= local
+        if due and overdue and r['last_run_date'] != local.date().isoformat():
+            late.append(f"{r['project']} — {r['button']}: сегодня не выполнено")
+    if not rows:
+        items.append(_health_item('autofill', 'Автозаполнение', 'off', 'Расписаний нет'))
+    elif failed:
+        items.append(_health_item('autofill', 'Автозаполнение', 'error', f'Ошибки в {len(failed)} из {len(rows)} расписаний',
+                                  failed + late))
+    elif late:
+        items.append(_health_item('autofill', 'Автозаполнение', 'warn', f'Не выполнено вовремя: {len(late)}', late))
+    else:
+        items.append(_health_item('autofill', 'Автозаполнение', 'ok', f'Расписаний: {len(rows)}, ошибок нет'))
+    # восстановление истории
+    week_ago = (now - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+    stuck_since = (now - timedelta(hours=2)).strftime('%Y-%m-%d %H:%M:%S')
+    jobs = db.execute("SELECT j.*, b.name AS button FROM jira_history_jobs j JOIN jira_snapshot_buttons b ON b.id = j.button_id "
+                      "WHERE j.created_at >= ? OR j.status = 'running' ORDER BY j.id DESC", (week_ago,)).fetchall()
+    stuck = [j for j in jobs if j['status'] == 'running' and (j['updated_at'] or '') < stuck_since]
+    bad = [j for j in jobs if j['status'] == 'error']
+    if stuck or bad:
+        items.append(_health_item('history', 'Восстановление истории', 'warn',
+                                  (f'Зависло: {len(stuck)}; ' if stuck else '') + f'с ошибкой за неделю: {len(bad)}',
+                                  [f"{j['button']}: {j['message']}" for j in (stuck + bad)[:5]]))
+    else:
+        items.append(_health_item('history', 'Восстановление истории', 'ok',
+                                  f"Запусков за неделю: {len(jobs)}" if jobs else 'Запусков за неделю не было'))
+    # почта и Telegram: настроены ли и были ли сбои отправки за неделю
+    cfg = notify_settings(db)
+    for key, title, configured in (('email', 'Почта', bool(cfg.get('smtp_host'))),
+                                   ('telegram', 'Telegram', bool(cfg.get('telegram_token')))):
+        if not configured:
+            items.append(_health_item(key, title, 'off', 'Не настроено'))
+            continue
+        errors = db.execute("SELECT * FROM notification_log WHERE channel = ? AND status = 'error' AND created_at >= ? "
+                            'ORDER BY id DESC', (key, week_ago)).fetchall()
+        sent = db.execute("SELECT COUNT(*) FROM notification_log WHERE channel = ? AND status = 'ok' AND created_at >= ?",
+                          (key, week_ago)).fetchone()[0]
+        last = db.execute('SELECT * FROM notification_log WHERE channel = ? ORDER BY id DESC LIMIT 1', (key,)).fetchone()
+        if last and last['status'] == 'error':
+            items.append(_health_item(key, title, 'error', f"Последняя отправка не удалась: {last['message']}",
+                                      [f'Ошибок за неделю: {len(errors)}, отправлено: {sent}']))
+        elif errors:
+            items.append(_health_item(key, title, 'warn', f'Ошибок за неделю: {len(errors)}, отправлено: {sent}',
+                                      [f"Последняя ошибка: {errors[0]['message']}"]))
+        else:
+            items.append(_health_item(key, title, 'ok', f'Отправлено за неделю: {sent}'))
+    hour_ago = (now - timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+    queued = db.execute("SELECT COUNT(*) FROM notification_outbox WHERE status IN ('pending', 'sending') AND created_at < ?",
+                        (hour_ago,)).fetchone()[0]
+    items.append(_health_item('outbox', 'Очередь оповещений', 'warn' if queued else 'ok',
+                              f'Не доставлено больше часа: {queued}' if queued else 'Очередь пуста'))
+    # свежесть данных проектов
+    stale = []
+    today = now.date()
+    for p in db.execute('SELECT * FROM projects ORDER BY id').fetchall():
+        limit = project_settings(db, p['id'])['staleDays']
+        old = db.execute('SELECT s.name, MAX(e.date) AS last FROM services s JOIN entries e ON e.service_id = s.id '
+                         'WHERE s.project_id = ? AND NOT COALESCE(s.is_done, 0) AND e.remaining IS NOT NULL '
+                         'GROUP BY s.id HAVING MAX(e.date) < ?',
+                         (p['id'], (today - timedelta(days=limit)).isoformat())).fetchall()
+        if old:
+            stale.append(f"{p['name']}: {len(old)} {ins.plural(len(old), 'эпик', 'эпика', 'эпиков')} без замеров "
+                         f"дольше {limit} дн.")
+    items.append(_health_item('data', 'Свежесть данных', 'warn' if stale else 'ok',
+                              f'Проектов с устаревшими замерами: {len(stale)}' if stale else 'Замеры свежие', stale))
+    worst = max((HEALTH_ORDER[i['status']] for i in items), default=0)
+    return {'status': {0: 'ok', 1: 'warn', 2: 'error'}[worst], 'checkedAt': now.strftime('%Y-%m-%d %H:%M:%S'), 'items': items}
+
+
+def _app_setting(db, key):
+    row = db.execute('SELECT value FROM app_settings WHERE key = ?', (key,)).fetchone()
+    return row['value'] if row else None
+
+
+def admin_alerts_config(db):
+    cfg = dict(ADMIN_ALERTS_DEFAULT)
+    cfg.update({k: v for k, v in _json_setting(db, 'admin_alerts', {}).items() if k in cfg and isinstance(v, bool)})
+    return cfg
+
+
+def _admin_recipients(db, alerts):
+    cfg = notify_settings(db)
+    out = []
+    for u in db.execute("SELECT * FROM users WHERE role = 'admin' ORDER BY id").fetchall():
+        channels = []
+        if alerts['email'] and cfg.get('smtp_host') and u['email']:
+            channels.append('email')
+        if alerts['telegram'] and cfg.get('telegram_token') and u['telegram_chat_id']:
+            channels.append('telegram')
+        if channels:
+            out.append((u, channels))
+    return cfg, out
+
+
+def send_admin_alert(db, subject, lines):
+    """Оповещение администраторам по почте и в Telegram → число успешных отправок. Каждая попытка — в журнал."""
+    alerts = admin_alerts_config(db)
+    cfg, recipients = _admin_recipients(db, alerts)
+    url = cfg.get('public_url')
+    text = '\n'.join(lines + ([f'\nСостояние системы: {url}'] if url else []))
+    html = ('<div style="font-family:Arial,sans-serif">' + ''.join(f'<p>{notify.esc(line)}</p>' for line in lines)
+            + (f'<p><a href="{notify.esc(url)}">Открыть Burndown</a> → «Состояние системы»</p>' if url else '') + '</div>')
+    sent = 0
+    for user, channels in recipients:
+        for channel in channels:
+            try:
+                if channel == 'email':
+                    notify.send_email(smtp_config(cfg), user['email'], subject, text, html)
+                else:
+                    telegram_client(cfg).send_message(user['telegram_chat_id'],
+                                                      f'<b>{notify.esc(subject)}</b>\n' + notify.esc('\n'.join(lines)))
+                notify_log(db, user, None, 'admin', channel, 'ok', subject)
+                sent += 1
+            except notify.NotifyError as e:
+                notify_log(db, user, None, 'admin', channel, 'error', str(e))
+    db.commit()
+    return sent
+
+
+def run_admin_alerts(now=None):
+    """Шаг планировщика: компонент перешёл в «Ошибка» или его ошибка изменилась — оповестить администраторов;
+    восстановился — сообщить, что всё в порядке. Повторно об одной и той же ошибке не пишем."""
+    db = get_db()
+    alerts = admin_alerts_config(db)
+    health = system_health(db, now)
+    old = _json_setting(db, 'admin_alert_state', {})
+    new = {i['key']: {'status': i['status'], 'summary': i['summary']} for i in health['items'] if i['status'] == 'error'}
+    _set_setting(db, 'admin_alert_state', json.dumps(new, ensure_ascii=False))
+    db.commit()
+    if not alerts['enabled']:
+        return 0
+    titles = {i['key']: i['title'] for i in health['items']}
+    problems = [f"⛔ {titles[k]}: {v['summary']}" for k, v in new.items() if old.get(k) != v]
+    fixed = [f"✅ {titles.get(k, k)}: снова в порядке" for k in old if k not in new]
+    if not problems and not fixed:
+        return 0
+    subject = ('Burndown: ' + ('проблема — ' + ', '.join(titles[k] for k, v in new.items() if old.get(k) != v)
+                               if problems else 'неполадки устранены'))
+    return send_admin_alert(db, subject, problems + fixed)
+
+
+@app.route('/api/admin/health')
+@admin_required
+def api_admin_health():
+    db = get_db()
+    alerts = admin_alerts_config(db)
+    _cfg, recipients = _admin_recipients(db, alerts)
+    return jsonify(dict(system_health(db), alerts=alerts,
+                        recipients=[{'name': u['display_name'] or u['username'], 'channels': ch} for u, ch in recipients]))
+
+
+@app.route('/api/admin/health/alerts', methods=['PUT'])
+@admin_required
+def api_admin_health_alerts():
+    data = json_body()
+    db = get_db()
+    cfg = admin_alerts_config(db)
+    for key in cfg:
+        if key in data:
+            if not isinstance(data[key], bool):
+                raise ValidationError('Настройки оповещений — да или нет')
+            cfg[key] = data[key]
+    _set_setting(db, 'admin_alerts', json.dumps(cfg))
+    db.commit()
+    audit_log('health', 'update', 'admin_alerts', None, None,
+              [{'field': 'adminAlerts', 'old': None, 'new': ('включены' if cfg['enabled'] else 'выключены')}],
+              entity_name='Оповещения администратору')
+    return api_admin_health()
+
+
+@app.route('/api/admin/health/check-jira', methods=['POST'])
+@admin_required
+def api_admin_health_check_jira():
+    """Проверить подключение к Jira сейчас (результат попадает в «Состояние системы»)."""
+    db = get_db()
+    try:
+        _jira_client(db, detailed=True).myself()
+        record_jira_health(db, True)
+    except jira.JiraError as e:
+        record_jira_health(db, False, str(e))
+    db.commit()
+    return api_admin_health()
+
+
+@app.route('/api/admin/health/test-alert', methods=['POST'])
+@admin_required
+def api_admin_health_test_alert():
+    db = get_db()
+    _cfg, recipients = _admin_recipients(db, admin_alerts_config(db))
+    if not recipients:
+        raise ValidationError('Некому отправить: укажите email администратора или привяжите Telegram и подключите '
+                              'почту или Telegram-бота в «Интеграциях»')
+    sent = send_admin_alert(db, 'Burndown: проверка оповещений администратору',
+                            ['Это проверочное оповещение. Если вы его получили, оповещения о сбоях будут приходить сюда.'])
+    return jsonify({'sent': sent})
+
+
 def run_notifications(now_utc=None):
     """Шаг планировщика: оповещения, дайджесты, доставка очереди. Сбой одной части не мешает остальным."""
-    for step in (run_alert_checks, lambda: run_due_digests(now_utc), deliver_outbox):
+    for step in (run_alert_checks, lambda: run_due_digests(now_utc), deliver_outbox, run_admin_alerts):
         try:
             step()
         except Exception:  # noqa: BLE001
@@ -2985,11 +3712,19 @@ def run_notifications(now_utc=None):
             logger.exception('notifications step failed')
 
 
+def mark_scheduler_tick():
+    """Отметка «планировщик жив» для «Состояния системы»."""
+    db = get_db()
+    _set_setting(db, 'scheduler_tick', _utc_now_iso())
+    db.commit()
+
+
 def _scheduler_loop():
     while True:
         time.sleep(SCHEDULER_INTERVAL)
         try:
             with app.app_context():
+                mark_scheduler_tick()
                 run_due_schedules()
                 run_notifications()
         except Exception:  # noqa: BLE001
@@ -3370,7 +4105,7 @@ def build_project_pdf(db, project, page_type, epics_arg=None, show_done=False):
 
     page_title = PDF_PAGES[page_type][0]
     now_str = datetime.now().strftime('%d.%m.%Y %H:%M')
-    settings = fc.settings_dict(db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone())
+    settings = project_settings(db, pid)
     cal = fc.calendar_for(settings)
     unit = ins.unit_label(settings)
 

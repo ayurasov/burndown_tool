@@ -700,3 +700,38 @@ textarea:disabled{opacity:0.55;cursor:not-allowed;}
 .setting-item .checkbox-row input,.blocks-list input{width:auto;flex:0 0 auto;}
 .insight-loading{opacity:.5;transition:opacity var(--transition-interactive);}
 .portfolio-table td:nth-child(3){min-width:14rem;} .portfolio-table td:first-child .muted-cell{white-space:nowrap;}
+
+/* ── Мастер подключения, эпики из Jira, календарь, состояние системы (1.8.0) ── */
+.wizard-callout{display:flex;align-items:center;justify-content:space-between;gap:var(--space-4);flex-wrap:wrap;margin-top:var(--space-4);padding:var(--space-3) var(--space-4);border:1px solid var(--color-primary-highlight);background:oklch(from var(--color-primary) l c h / 0.06);border-radius:var(--radius-md);}
+.wizard-callout > div{flex:1 1 20rem;min-width:0;}
+.wizard-steps{list-style:none;display:flex;flex-wrap:wrap;gap:var(--space-2);margin:0 0 var(--space-4);padding:0;counter-reset:step;}
+.wizard-steps li{counter-increment:step;font-size:var(--text-xs);color:var(--color-text-faint);padding:2px var(--space-3) 2px var(--space-2);border:1px solid var(--color-divider);border-radius:var(--radius-full);}
+.wizard-steps li::before{content:counter(step) ". ";}
+.wizard-steps li.active{color:var(--color-primary);border-color:var(--color-primary);font-weight:600;}
+.wizard-steps li.done{color:var(--color-success);border-color:var(--color-success-highlight);}
+.wizard-form{grid-template-columns:1fr;}
+.wizard-form .checkbox-row{align-items:flex-start;}
+.wizard-form .checkbox-row input{margin-top:0.2em;}
+.wizard-table{max-height:min(50vh,26rem);overflow:auto;}
+.wizard-back{justify-content:flex-start;margin-top:var(--space-3);}
+.wizard-result{font-weight:600;font-size:var(--text-base);}
+.wizard-result.ok{color:var(--color-success);}
+.wizard-result.error{color:var(--color-warning);}
+.plan-list{margin:0 0 var(--space-3);padding-left:1.2rem;font-size:var(--text-sm);display:flex;flex-direction:column;gap:2px;}
+#esPlan{margin-top:var(--space-3);}
+.calendar-presets{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-2);margin-bottom:var(--space-4);}
+.calendar-presets .setting-hint{flex-basis:100%;}
+.health-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(20rem,100%),1fr));gap:var(--space-3);}
+.health-item{border:1px solid var(--color-divider);border-left:4px solid var(--color-border);border-radius:var(--radius-md);padding:var(--space-3);min-width:0;}
+.health-item.health-ok{border-left-color:var(--color-success);}
+.health-item.health-warn{border-left-color:var(--color-warning);}
+.health-item.health-error{border-left-color:var(--color-error);}
+.health-item-head{display:flex;justify-content:space-between;align-items:center;gap:var(--space-2);flex-wrap:wrap;margin-bottom:var(--space-1);}
+.health-summary{font-size:var(--text-sm);overflow-wrap:anywhere;}
+.health-details{margin:var(--space-2) 0 0;padding-left:1.1rem;font-size:var(--text-xs);color:var(--color-text-muted);overflow-wrap:anywhere;}
+.health-dot{display:inline-block;width:0.55rem;height:0.55rem;border-radius:var(--radius-full);margin-left:var(--space-1);vertical-align:middle;}
+.health-dot.health-warn{background:var(--color-warning);}
+.health-dot.health-error{background:var(--color-error);}
+.health-alerts{display:flex;flex-direction:column;gap:var(--space-2);}
+.health-alerts .checkbox-row input{width:auto;}
+.wizard-table td:nth-child(4),.wizard-table td:nth-child(5){white-space:nowrap;}

@@ -766,3 +766,67 @@ def compute_history(client, structure_id, mappings, field_map, moments, progress
         if fid not in TIME_FIELDS.values() and fid not in with_history:
             warnings.append(f'По полю {fid} изменений в журнале Jira не найдено — для прошлых дат взято текущее значение')
     return out, warnings
+
+
+# ─── Эпики проекта из Jira: кандидаты для синхронизации и мастера подключения ───
+
+EPIC_FIELDS = ('summary', 'status', 'duedate', 'fixVersions')
+EPIC_TARGETS = ('duedate', 'fixVersion', 'none')
+EPIC_LIMIT = 300  # эпиков в одном проекте — с запасом; больше — вероятно, выбран не тот уровень структуры
+
+
+def epic_target(fields, source):
+    """Целевая дата эпика из Jira: срок задачи (duedate) или самая поздняя дата выпуска её версий (fixVersions)."""
+    if source == 'duedate':
+        due = fields.get('duedate')
+        return due[:10] if isinstance(due, str) and len(due) >= 10 else None
+    if source == 'fixVersion':
+        dates = [v.get('releaseDate') for v in fields.get('fixVersions') or [] if isinstance(v, dict)]
+        dates = [d[:10] for d in dates if isinstance(d, str) and len(d) >= 10]
+        return max(dates) if dates else None
+    return None
+
+
+def _epic_item(issue, source, stage=None):
+    f = issue.get('fields') or {}
+    status = f.get('status') if isinstance(f.get('status'), dict) else {}
+    category = (status.get('statusCategory') or {}).get('key') or 'new'
+    return {'key': issue.get('key'), 'id': int(issue['id']), 'summary': (f.get('summary') or issue.get('key') or '').strip(),
+            'status': status.get('name') or '', 'done': category == 'done', 'target': epic_target(f, source),
+            'stage': stage}
+
+
+def epic_candidates(client, structure_id=None, level=0, jql=None, target='duedate'):
+    """Задачи-эпики проекта в Jira → [{key, id, summary, status, done, target, stage}] в порядке структуры.
+
+    Из структуры берутся задачи на уровне level (0 — верхний; 1 — вложенные в задачи верхнего уровня, тогда задача
+    верхнего уровня — этап эпика). Без структуры — задачи по JQL. Папки и прочие элементы Structure пропускаются.
+    """
+    if target not in EPIC_TARGETS:
+        raise JiraError('Источник целевой даты — срок задачи, версия или «не заполнять»')
+    if structure_id:
+        rows = client.forest_rows(structure_id)
+        picked, parents, parent = [], {}, None
+        for depth, issue_id in rows:
+            if depth == 0:
+                parent = issue_id
+            if depth == level and issue_id is not None and issue_id not in parents:
+                parents[issue_id] = parent if level else None
+                picked.append(issue_id)
+        if len(picked) > EPIC_LIMIT:
+            raise JiraError(f'На этом уровне структуры {len(picked)} задач — больше {EPIC_LIMIT}. '
+                            'Выберите другой уровень эпиков')
+        need = set(picked) | {p for p in parents.values() if p is not None}
+        issues = {int(i['id']): i for i in client.issues_by_ids(need, EPIC_FIELDS)} if need else {}
+        stage_names = {i: (issues[i].get('fields') or {}).get('summary') for i in issues}
+        return [_epic_item(issues[i], target, stage_names.get(parents[i]) if parents[i] else None)
+                for i in picked if i in issues]
+    jql = (jql or '').strip()
+    if not jql:
+        raise JiraError('Укажите структуру или запрос JQL, по которому найти эпики')
+    out = []
+    for issue in client._search_issues(jql, EPIC_FIELDS):
+        out.append(_epic_item(issue, target))
+        if len(out) > EPIC_LIMIT:
+            raise JiraError(f'Запрос нашёл больше {EPIC_LIMIT} задач — уточните JQL (например, добавьте issuetype = Epic)')
+    return out
