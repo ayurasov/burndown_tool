@@ -41,6 +41,12 @@ class _DemoDatetime(datetime):
 
 
 app_module.datetime = _DemoDatetime
+
+# Выводы на дашборде — на день после последнего замера демо-данных (29.07.2026): тогда цели ещё впереди и выводы
+# показывают обычную рабочую картину, а не «все цели прошли».
+INSIGHTS_DAY = '2026-07-31'
+_project_insights = app_module.project_insights
+app_module.project_insights = lambda db, pid, today=None: _project_insights(db, pid, today or INSIGHTS_DAY)
 import fake_jira  # noqa: E402
 import notify  # noqa: E402
 from fake_notify import FakeSMTP, FakeTelegram  # noqa: E402
@@ -209,11 +215,24 @@ def main():
         pg.wait_for_timeout(300)
         shot(pg, 'user/01-login.png')
         login(pg, 'admin', ADMIN_PASSWORD)
+        pg.wait_for_selector('#insightsBody:not(.insight-loading) .insight-headline')
+        pg.wait_for_timeout(300)
         shot(pg, 'user/02-dashboard.png')
+        # выводы: сводка проекта, подробности по этапам и эпикам, вид дашборда
+        shot(pg.locator('#insightsPanel'), 'user/50-insights.png')
+        pg.click('#insightsBody .insight-details > summary')
+        pg.locator('#insightsBody .insight-epic > summary').nth(1).click()
+        pg.wait_for_timeout(300)
+        shot(pg.locator('#insightsBody .insight-details'), 'user/51-insights-details.png')
+        pg.click('#insightsBody .insight-details > summary')
+        pg.click('.view-blocks-btn[data-blocks="dashboard"]')
+        modal('user/54-view-blocks.png')
+        pg.keyboard.press('Escape')
+        pg.wait_for_timeout(200)
         shot(pg.locator('.sidebar'), 'user/03-sidebar.png')
         shot(pg.locator('#view-dashboard .quick-filter'), 'user/04-quick-filter.png')
         shot(pg.locator('#kpiGrid'), 'user/05-kpi.png')
-        epic_panel = pg.locator('#view-dashboard > .panel').nth(1)
+        epic_panel = pg.locator('#view-dashboard [data-block="epic"]')
         shot(epic_panel, 'user/06-epic-chart.png')
         pt = pg.evaluate("(() => { const c = Chart.getChart('chartRemaining'); const p = c.getDatasetMeta(0).data[1];"
                          " const r = c.canvas.getBoundingClientRect(); return {x: r.left + p.x, y: r.top + p.y}; })()")
@@ -254,7 +273,9 @@ def main():
 
         # ── Свод по этапам
         go('stages', '#stageSummaryTable tbody tr')
+        pg.wait_for_selector('#stageInsightsBody:not(.insight-loading) .insight-stage')
         shot(pg, 'user/11-stages.png')
+        shot(pg.locator('#stageInsightsPanel'), 'user/52-stage-insights.png')
         shot(pg.locator('#stageChartsContainer .panel').first, 'user/12-stage-chart.png')
         shot(pg.locator('#stageSummaryTable').locator('xpath=ancestor::div[contains(@class,"panel")]'),
              'user/13-stage-summary.png')
@@ -263,6 +284,10 @@ def main():
         pg.select_option('#stageBurnupSelect', '__project')
         pg.wait_for_timeout(400)
         shot(pg.locator('#stageBurnupPanel'), 'user/44-project-burnup.png')
+
+        # ── Портфель проектов (до срезов «на сегодня»: выводы — на день после последнего демо-замера)
+        go('portfolio', '#portfolioBody tr[data-project]')
+        shot(pg.locator('#view-portfolio'), 'user/53-portfolio.png')
 
         # ── Рассылки (администратор) и уведомления по проекту
         go('integrations', '#notifyLogTable thead')
