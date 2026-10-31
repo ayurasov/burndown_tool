@@ -395,3 +395,50 @@ def test_manager_errors_do_not_reveal_connection(admin, make_user):
         assert 'Не удалось подключиться к Jira' in error and 'администратор' in error
     error = admin.post('/api/admin/jira-connection/test', json=body).get_json()['error']
     assert 'http://127.0.0.1:9' in error  # администратору — с адресом и причиной
+
+
+# ─── Эффективность запросов ──────────────────────────────────────
+
+def _calls(server):
+    return [path for _method, path in server.state['requests']]
+
+
+def test_snapshot_requests_are_batched_for_whole_button(fake):
+    """Срез кнопки — пакетами на всю кнопку: корни одним поиском, структура один раз, вложенные — одним поиском."""
+    client = jira.JiraClient(fake.url, 'server', '', 'secret-pat')
+    maps = [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True},
+            {'serviceId': 2, 'issueKeys': 'ABC-4', 'includeSubtree': True},
+            {'serviceId': 3, 'issueKeys': 'ABC-5, ABC-2', 'includeSubtree': False}]
+    items = jira.compute_snapshot(client, 7, maps)
+    assert [it['issueCount'] for it in items] == [3, 1, 2]
+    calls = _calls(fake)
+    assert calls.count('/rest/structure/2.0/forest/latest') == 1
+    assert len(calls) == 3 and not [c for c in calls if '/issue/' in c]  # ни одного запроса «по задаче»
+    # без структуры: корни и подзадачи всех эпиков — двумя поисками
+    fake.state['requests'].clear()
+    items = jira.compute_snapshot(client, None, maps[:2])
+    assert [it['issueCount'] for it in items] == [2, 1] and len(_calls(fake)) == 2
+
+
+def test_missing_key_falls_back_to_single_request_in_cloud():
+    """Jira Cloud не пропускает несуществующий ключ в JQL — такие пакеты догружаются по одной задаче."""
+    server = FakeJira(mode='cloud', login='u@corp.ru', token='t')
+    try:
+        client = jira.JiraClient(server.url, 'cloud', 'u@corp.ru', 't')
+        items = jira.compute_snapshot(client, None, [{'serviceId': 1, 'issueKeys': 'ABC-1, ABC-404', 'includeSubtree': False}])
+        assert items[0]['issueCount'] == 1 and items[0]['remaining'] == 10
+        assert 'ABC-404: задача не найдена или нет прав на просмотр' in items[0]['warnings']
+        assert '/rest/api/3/issue/ABC-1' in _calls(server) and '/rest/api/3/issue/ABC-404' in _calls(server)
+    finally:
+        server.stop()
+
+
+def test_history_loads_issues_once(fake):
+    """Восстановление истории: задачи загружаются один раз — сразу с журналом изменений."""
+    from datetime import datetime, timezone
+    client = jira.JiraClient(fake.url, 'server', '', 'secret-pat')
+    moments = {'2026-10-19': datetime(2026, 10, 19, 23, 59, tzinfo=timezone.utc)}
+    jira.compute_history(client, 7, [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}], None, moments)
+    searches = fake.state['search_bodies']
+    assert searches and all(b.get('expand') == ['changelog'] for b in searches)
+    assert len(_calls(fake)) == 4  # корни, структура, вложенные задачи, статусы

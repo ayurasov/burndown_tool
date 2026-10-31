@@ -2,3 +2,6 @@ __pycache__/
 .secret_key
 *.db
 docs/manuals/*.build.html
+.coverage
+.coverage.*
+htmlcov/

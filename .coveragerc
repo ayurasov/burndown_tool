@@ -1,0 +1,14 @@
+# Покрытие серверного кода тестами: python -m coverage run -m pytest tests/ && python -m coverage report
+[run]
+branch = True
+source = .
+omit =
+    tests/*
+    tools/*
+    .claude/*
+
+[report]
+# порог проверяется в CI; ниже него сборка падает
+fail_under = 95
+show_missing = True
+skip_covered = True

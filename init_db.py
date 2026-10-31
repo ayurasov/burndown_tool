@@ -104,6 +104,10 @@ def create_jira_tables(conn):
         conn.execute('ALTER TABLE jira_snapshot_buttons ADD COLUMN field_map TEXT')
     if 'last_success_at' not in cols:
         conn.execute('ALTER TABLE jira_snapshot_buttons ADD COLUMN last_success_at TEXT')
+    # срез восстановлен по журналу изменений (1), а не получен из Jira на этот день (0) — восстановленный можно заменить
+    snap_cols = {r[1] for r in conn.execute('PRAGMA table_info(jira_issue_snapshots)')}
+    if 'restored' not in snap_cols:
+        conn.execute('ALTER TABLE jira_issue_snapshots ADD COLUMN restored INTEGER DEFAULT 0')
 
 
 def create_notify_tables(conn):
@@ -196,6 +200,27 @@ def create_auth_tables(conn):
     """Неудачные попытки входа — для ограничения подбора пароля."""
     conn.execute('CREATE TABLE IF NOT EXISTS login_failures (username TEXT, ip TEXT, at TEXT)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_login_failures ON login_failures(username, ip, at)')
+
+
+# Настройки проекта, добавленные в 1.7.0: календарь и единицы, диапазон прогноза, пороги выводов.
+# Пустое значение (NULL) — значение по умолчанию (forecast.DEFAULT_SETTINGS).
+SETTINGS_COLUMNS_V17 = [
+    ('range_confidence', 'INTEGER'), ('workdays', 'INTEGER'), ('holidays', 'TEXT'), ('extra_workdays', 'TEXT'),
+    ('units', 'TEXT'), ('hours_per_day', 'REAL'), ('stale_days', 'INTEGER'), ('scope_threshold', 'INTEGER'),
+    ('slip_threshold', 'INTEGER'), ('chance_threshold', 'INTEGER'), ('insight_window_days', 'INTEGER'),
+]
+
+
+def upgrade_settings(conn):
+    """Новые столбцы настроек проекта и личные настройки пользователя (вид дашборда). Существующие значения
+    не меняются: новые столбцы пусты, а пустое значение означает «по умолчанию»."""
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(settings)')}
+    for name, kind in SETTINGS_COLUMNS_V17:
+        if name not in cols:
+            conn.execute(f'ALTER TABLE settings ADD COLUMN {name} {kind}')
+    user_cols = {r[1] for r in conn.execute('PRAGMA table_info(users)')}
+    if 'prefs' not in user_cols:
+        conn.execute('ALTER TABLE users ADD COLUMN prefs TEXT')
 
 
 def _iso_date(value):
@@ -456,6 +481,7 @@ def init_db():
     create_jira_tables(conn)
     create_notify_tables(conn)
     create_auth_tables(conn)
+    upgrade_settings(conn)
     create_indexes(conn)
 
     conn.commit()

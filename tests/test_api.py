@@ -63,8 +63,8 @@ def test_project_data_shape(admin):
     assert len(data['services']) == 6
     assert len(data['entries']) == 24
     assert data['stageTargets'] == {'Этап 3': '2026-08-24', 'Этап 4': '2026-08-31'}
-    assert data['settings'] == {'forecastMethod': 'linear', 'riskBufferDays': 3,
-                                'burnrateMethod': 'all', 'burnrateWindowDays': 14}
+    import forecast
+    assert data['settings'] == forecast.DEFAULT_SETTINGS  # пустые настройки — значения по умолчанию
     svc = data['services'][0]
     assert set(svc) == {'id', 'project_id', 'etap', 'name', 'targetDate', 'sortOrder', 'isDone', 'stageGroup'}
 
@@ -354,9 +354,39 @@ def test_service_target_date_validation(admin):
     {'riskBufferDays': -1},
     {'riskBufferDays': 'три'},
     {'burnrateWindowDays': 0},
+    {'rangeConfidence': 75},
+    {'units': 'weeks'},
+    {'hoursPerDay': 0},
+    {'hoursPerDay': True},
+    {'workdays': 'да'},
+    {'holidays': '2026-01-01'},
+    {'holidays': ['01.01.2026']},
+    {'extraWorkdays': ['2026-02-30']},
+    {'chanceThreshold': 100},
+    {'staleDays': 0},
+    {'insightWindowDays': 3},
+    {'scopeThreshold': 2.5},
 ])
 def test_settings_validation(admin, payload):
     assert admin.put('/api/projects/1/settings', json=payload).status_code == 400
+
+
+def test_new_settings_are_saved_and_logged(admin):
+    body = {'rangeConfidence': 90, 'workdays': True, 'holidays': ['2026-11-04', '2026-01-01', '2026-11-04'],
+            'extraWorkdays': ['2026-11-07'], 'units': 'days', 'hoursPerDay': 7.5, 'staleDays': 14, 'scopeThreshold': 15,
+            'slipThreshold': 5, 'chanceThreshold': 60, 'insightWindowDays': 21, 'unknown': 1}
+    r = admin.put('/api/projects/1/settings', json=body)
+    assert r.status_code == 200
+    st = admin.get('/api/projects/1/data').get_json()['settings']
+    assert st['holidays'] == ['2026-01-01', '2026-11-04'] and st['workdays'] is True and st['hoursPerDay'] == 7.5
+    assert {k: st[k] for k in ('rangeConfidence', 'units', 'staleDays', 'chanceThreshold', 'insightWindowDays')} == \
+        {'rangeConfidence': 90, 'units': 'days', 'staleDays': 14, 'chanceThreshold': 60, 'insightWindowDays': 21}
+    assert r.get_json()['settings'] == st
+    fields = {e['fieldName'] for e in audit(admin, page='settings')}
+    assert {'holidays', 'workdays', 'rangeConfidence', 'units'} <= fields
+    admin.put('/api/projects/1/settings', json={'workdays': False, 'holidays': []})
+    st = admin.get('/api/projects/1/data').get_json()['settings']
+    assert st['workdays'] is False and st['holidays'] == [] and st['units'] == 'days'
 
 
 # ─── Замер по всем эпикам ────────────────────────────────────────
@@ -529,8 +559,8 @@ def test_settings_null_values_are_ignored(admin, db_path):
     conn.execute('UPDATE settings SET risk_buffer_days = NULL WHERE project_id = 1')
     conn.commit()
     conn.close()
-    # пустое значение из БД не отдаётся фронтенду (там подставится значение по умолчанию)
-    assert 'riskBufferDays' not in admin.get('/api/projects/1/data').get_json()['settings']
+    # пустое значение из БД — значение по умолчанию
+    assert admin.get('/api/projects/1/data').get_json()['settings']['riskBufferDays'] == 3
     # и null в запросе не ломает сохранение остальных настроек
     r = admin.put('/api/projects/1/settings', json={'forecastMethod': 'average', 'riskBufferDays': None})
     assert r.status_code == 200
