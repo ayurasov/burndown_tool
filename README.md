@@ -378,6 +378,7 @@ pip install -r requirements-dev.txt
 playwright install chromium   # браузер для e2e-тестов (один раз)
 pytest                        # все тесты
 pytest tests/test_api.py tests/test_pdf.py   # только API и PDF, без браузера
+python -m coverage run -m pytest && python -m coverage report   # покрытие кода тестами
 ```
 
 - `tests/test_api.py` — API: авторизация, права доступа, CRUD, валидация, реестр изменений.
@@ -386,7 +387,13 @@ pytest tests/test_api.py tests/test_pdf.py   # только API и PDF, без �
   режим просмотра, модальные окна, профиль, администрирование, мобильная вёрстка.
   Если браузер не установлен, тесты пропускаются; путь к уже установленному Chromium
   можно задать переменной `CHROMIUM_PATH`.
+- `tests/test_forecast.py` — серверный прогноз совпадает с прогнозом интерфейса (сверка с `static/js/app.js` через Node.js).
+- `tests/test_analytics.py` — корректность аналитики в редких случаях: ровный и обнулившийся остаток, этапы с разными датами замеров, дайджест и PDF.
+- `tests/test_robustness.py` — отказоустойчивость: сбои Jira, почты, Telegram и планировщика, отказ в доступе.
+- `tests/test_jira.py`, `test_autofill.py`, `test_history.py`, `test_composition.py` — связь с Jira (поддельный сервер Jira), автозаполнение, восстановление истории, состав задач.
+- `tests/test_notifications.py`, `test_hardening.py`, `test_about.py` — уведомления, защита, «О программе» и руководства.
 
-Тесты автоматически запускаются в GitHub Actions на каждый push и pull request (`.github/workflows/tests.yml`).
+Тесты автоматически запускаются в GitHub Actions на каждый push и pull request (`.github/workflows/tests.yml`);
+сборка падает, если покрытие серверного кода тестами ниже порога из `.coveragerc` (95 %).
 
 Тесты используют временную копию демо-базы из `init_db.py` и не затрагивают рабочую `burndown.db`.
