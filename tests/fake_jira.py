@@ -141,6 +141,12 @@ def create_app(state):
         elif by_keys:
             keys = {k.strip() for k in by_keys.group(1).split(',')}
             ids = [i for i, d in ISSUES.items() if d['key'] in keys]
+            visible = {ISSUES[i]['key'] for i in ids if not ISSUES[i].get('hidden')}
+            # как настоящая Jira: ключ, которого нет или который не виден, — ошибка всего запроса,
+            # если не отключена проверка JQL (validateQuery: false, только Server/DC)
+            if keys - visible and body.get('validateQuery') is not False:
+                bad = sorted(keys - visible)[0]
+                return jsonify({'errorMessages': [f"An issue with key '{bad}' does not exist for field 'key'."]}), 400
         else:
             ids = [int(x) for x in re.findall(r'\d+', body['jql'])]
         expand = body.get('expand') or []
@@ -149,7 +155,13 @@ def create_app(state):
         issues = [_issue_json(i, body['fields'], changelog, truncate=state['mode'] == 'cloud')
                   for i in ids if i in ISSUES and not ISSUES[i].get('hidden')]
         state['search_bodies'].append(body)
-        return jsonify({'issues': issues, 'total': len(issues)})
+        # постранично, как Jira: startAt и maxResults (Server/DC), nextPageToken (Cloud)
+        start = int(body.get('nextPageToken') or body.get('startAt') or 0)
+        size = int(body.get('maxResults') or 50)
+        page = issues[start:start + size]
+        more = start + size < len(issues)
+        return jsonify({'issues': page, 'total': len(issues), 'startAt': start,
+                        **({'nextPageToken': str(start + size)} if more else {})})
 
     @app.post('/rest/api/2/search')
     def search_server():

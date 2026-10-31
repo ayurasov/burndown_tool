@@ -37,6 +37,7 @@ import notify
 app = Flask(__name__, static_folder='static', template_folder='templates')
 DB_PATH = os.environ.get('DB_PATH', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'burndown.db'))
 log = logging.getLogger('burndown')
+jira_log = logging.getLogger('burndown.jira')  # число и время запросов к Jira по каждому срезу — для разбора медленной работы
 MIN_SECRET_KEY = 32  # короче — ключ подбирается или взят из примера (например, «замените-это» из README)
 
 
@@ -1379,11 +1380,15 @@ def api_jira_snapshot(bid):
     snap_date = parse_date((request.get_json(silent=True) or {}).get('date'), 'Дата среза', required=False) \
         or datetime.now().date().isoformat()
     button = _jira_button_json(db, row)
+    client = None
     try:
-        items = jira.compute_snapshot(_jira_client(db), row['structure_id'], button['mappings'],
-                                      button['fieldMap'])
+        client = _jira_client(db)
+        items = jira.compute_snapshot(client, row['structure_id'], button['mappings'], button['fieldMap'])
     except jira.JiraError as e:
         return _jira_error(e)
+    finally:
+        if client:
+            jira_log.info('срез по кнопке %s: %s', bid, client.stats())
     store_issue_snapshots(db, row['project_id'], items, snap_date)
     if _snapshot_has_values(items):
         _mark_snapshot_success(db, bid)
@@ -1779,12 +1784,16 @@ def api_save_jira_schedule(bid):
 def run_autofill(db, button_row, local_date, actor, overwrite=True):
     """Срез по кнопке и запись замеров на local_date → (статус, сообщение). Ошибки Jira не выбрасываются."""
     pid = button_row['project_id']
+    client = None
     try:
         button = _jira_button_json(db, button_row)
-        items = jira.compute_snapshot(_jira_client(db), button_row['structure_id'], button['mappings'],
-                                      button['fieldMap'])
+        client = _jira_client(db)
+        items = jira.compute_snapshot(client, button_row['structure_id'], button['mappings'], button['fieldMap'])
     except jira.JiraError as e:
         return 'error', str(e)
+    finally:
+        if client:
+            jira_log.info('автозаполнение по кнопке %s: %s', button_row['id'], client.stats())
     store_issue_snapshots(db, pid, items, local_date)
     services = {s['id']: s for s in db.execute('SELECT * FROM services WHERE project_id = ?', (pid,)).fetchall()}
     parsed = []
@@ -1972,8 +1981,10 @@ def run_history_job(jid):
         def progress(done, total):
             _history_update(db, jid, progress=done, total=total, message=f'Журнал изменений: {done} из {total} задач')
 
-        results, warnings = jira.compute_history(_jira_client(db), button_row['structure_id'], button['mappings'],
+        client = _jira_client(db)
+        results, warnings = jira.compute_history(client, button_row['structure_id'], button['mappings'],
                                                  button['fieldMap'], moments, progress)
+        jira_log.info('восстановление истории по кнопке %s (%s дат): %s', button_row['id'], len(moments), client.stats())
         _history_update(db, jid, message='Сохранение замеров…')
         services = {s['id']: s for s in db.execute('SELECT * FROM services WHERE project_id = ?', (pid,)).fetchall()}
         saved = skipped = 0

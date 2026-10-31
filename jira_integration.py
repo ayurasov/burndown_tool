@@ -51,7 +51,8 @@ TIME_FIELD_NAMES = {'timeestimate': 'Оставшаяся оценка', 'timesp
 UNITS = {'seconds': 1 / 3600, 'hours': 1.0}
 DEFAULT_FIELD_MAP = {m: {'field': TIME_FIELDS[m], 'unit': 'seconds'} for m in METRICS}
 FIELD_ID_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]*$')
-SEARCH_BATCH = 100
+SEARCH_BATCH = 100  # задач в одном запросе Jira Cloud
+SERVER_BATCH = 500  # Server/DC отдаёт до 1000 задач за запрос (если в Jira предел меньше — дочитываем постранично)
 HISTORY_BATCH = 50  # задач в одном запросе с журналом изменений
 SEARCH_LIMIT = 5000
 MAX_ATTEMPTS = 3
@@ -59,6 +60,10 @@ MAX_ATTEMPTS = 3
 
 class JiraError(Exception):
     """Ошибка обращения к Jira с понятным пользователю текстом."""
+
+
+class JiraQueryError(JiraError):
+    """Jira отклонила запрос (400) — например, JQL с ключом задачи, которой нет или которую не видно."""
 
 
 def check_base_url(base_url):
@@ -208,6 +213,7 @@ class JiraClient:
         """detailed=False — для пользователей без доступа к настройкам подключения (руководитель проекта): в ошибках
         нет адреса Jira и технических подробностей, только что случилось и что сообщить администратору."""
         self.detailed = detailed
+        self.calls, self.elapsed = 0, 0.0  # число запросов к Jira и их суммарное время — для журнала службы
         if instance_type not in INSTANCE_TYPES:
             raise JiraError('Неизвестный тип подключения к Jira')
         self.base_url = check_base_url(base_url)
@@ -230,6 +236,14 @@ class JiraClient:
     def cloud(self):
         return self.instance_type == 'cloud'
 
+    @property
+    def batch(self):
+        """Задач в одном поисковом запросе без журнала изменений."""
+        return SEARCH_BATCH if self.cloud else SERVER_BATCH
+
+    def stats(self):
+        return f'{self.calls} запрос(ов) к Jira за {self.elapsed:.1f} с'
+
     def api(self, path):
         return f"{self.base_url}/rest/api/{'3' if self.cloud else '2'}/{path.lstrip('/')}"
 
@@ -241,7 +255,12 @@ class JiraClient:
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 # без перенаправлений: запросы с токеном идут только на адрес, указанный в подключении
-                resp = self.session.request(method, url, timeout=self.timeout, allow_redirects=False, **kwargs)
+                started = time.monotonic()
+                self.calls += 1
+                try:
+                    resp = self.session.request(method, url, timeout=self.timeout, allow_redirects=False, **kwargs)
+                finally:
+                    self.elapsed += time.monotonic() - started
             except requests.exceptions.SSLError as e:
                 self.fail('Ошибка TLS/сертификата. Если Jira использует самоподписанный или корпоративный '
                           f'сертификат, включите «Не проверять TLS-сертификат». ({e})',
@@ -313,7 +332,8 @@ class JiraClient:
             raise JiraError('Недостаточно прав в Jira (403)' + (f': {_error_text(resp)}' if _error_text(resp) else ''))
         if resp.status_code == 404 and not_found:
             raise JiraError(not_found)
-        raise JiraError(f'Jira вернула ошибку {resp.status_code}: {_error_text(resp) or self.where(url)}')
+        error = JiraQueryError if resp.status_code == 400 else JiraError
+        raise error(f'Jira вернула ошибку {resp.status_code}: {_error_text(resp) or self.where(url)}')
 
     # ── операции ──
     def myself(self):
@@ -331,30 +351,28 @@ class JiraClient:
                          not_found=f'Структура {structure_id} не найдена или плагин Structure недоступен')
         return parse_forest_formula(str(data.get('formula') or ''))
 
-    def issue(self, key, fields):
-        """Задача по ключу; None, если её нет или нет прав на просмотр."""
+    def issue(self, key, fields, changelog=False):
+        """Задача по ключу (исходный JSON Jira); None, если её нет или нет прав на просмотр."""
         url = self.api(f'issue/{key}')
-        resp = self.request('GET', url, params={'fields': ','.join(fields)})
+        params = {'fields': ','.join(fields)}
+        if changelog:
+            params['expand'] = 'changelog'
+        resp = self.request('GET', url, params=params)
         if resp.status_code == 404:
             return None
         self.check(resp, url)
         return self.parse(resp, url)
 
-    def search(self, jql, fields):
-        """Все задачи по JQL (постранично: startAt в Server/DC, nextPageToken в Cloud) → {id: fields}.
-
-        В fields под ключом '__key' — ключ задачи (ABC-1).
-        """
-        return {int(issue['id']): dict(issue.get('fields') or {}, __key=issue.get('key'))
-                for issue in self._search_issues(jql, fields)}
-
-    def _search_issues(self, jql, fields, expand_changelog=False):
-        """Задачи по JQL в исходном виде Jira, постранично."""
+    def _search_issues(self, jql, fields, expand_changelog=False, lenient=False):
+        """Задачи по JQL в исходном виде Jira, постранично. lenient — в Server/DC ключи, которых нет или которые не видны
+        учётной записи, не превращают весь запрос в ошибку (validateQuery: false), а просто не попадают в ответ."""
         found, start_at, token = 0, 0, None
         while True:
-            body = {'jql': jql, 'fields': list(fields), 'maxResults': SEARCH_BATCH}
+            body = {'jql': jql, 'fields': list(fields), 'maxResults': HISTORY_BATCH if expand_changelog else self.batch}
             if expand_changelog:
                 body['expand'] = 'changelog' if self.cloud else ['changelog']
+            if lenient and not self.cloud:
+                body['validateQuery'] = False
             if self.cloud:
                 if token:
                     body['nextPageToken'] = token
@@ -370,21 +388,13 @@ class JiraClient:
             if not issues or not more or found >= SEARCH_LIMIT:
                 return
 
-    def issues_with_changelog(self, keys, fields, progress=None):
-        """{ключ: (поля, история изменений)} для задач по ключам; progress(сделано, всего) — после каждого пакета."""
-        out = {}
-        keys = sorted(set(keys))
-        for start in range(0, len(keys), HISTORY_BATCH):
-            batch = keys[start:start + HISTORY_BATCH]
-            for issue in self._search_issues('key in (%s)' % ', '.join(batch), fields, expand_changelog=True):
-                log = issue.get('changelog') or {}
-                histories = log.get('histories') or []
-                if (log.get('total') or 0) > len(histories):  # Cloud отдаёт в поиске только часть журнала
-                    histories = self.changelog(issue['key'])
-                out[issue['key']] = (dict(issue.get('fields') or {}, __key=issue['key']), histories)
-            if progress:
-                progress(min(start + HISTORY_BATCH, len(keys)), len(keys))
-        return out
+    def full_changelog(self, issue):
+        """Журнал изменений задачи из ответа с expand=changelog; если Jira отдала его не целиком (Cloud), — дочитать."""
+        log = issue.get('changelog') or {}
+        histories = log.get('histories') or []
+        if (log.get('total') or 0) > len(histories):
+            histories = self.changelog(issue['key'])
+        return histories
 
     def changelog(self, key):
         """Полный журнал изменений задачи."""
@@ -400,20 +410,53 @@ class JiraClient:
             if not values or data.get('isLast', True) or start_at >= (data.get('total') or 0):
                 return out
 
+    def issues_by_keys(self, keys, fields, changelog=False):
+        """{запрошенный ключ: задача} одним поиском на пакет ключей. Ключи, которых нет в ответе (задачу переименовали,
+        перенесли в другой проект, её нет или не видно), запрашиваются по одной — так переименованная задача находится
+        по старому ключу, а для недоступной будет предупреждение."""
+        out = {}
+        keys = sorted(set(keys))
+        size = HISTORY_BATCH if changelog else SEARCH_BATCH  # ключей в JQL: короткий запрос, понятная ошибка при отказе
+        for start in range(0, len(keys), size):
+            batch = keys[start:start + size]
+            try:
+                for issue in self._search_issues('key in (%s)' % ', '.join(batch), fields, changelog, lenient=True):
+                    out[issue.get('key')] = issue
+            except JiraQueryError:
+                pass  # Jira Cloud не пропускает несуществующие ключи в JQL — тогда по одной
+        for key in keys:
+            if key not in out:
+                issue = self.issue(key, fields, changelog)
+                if issue is not None:
+                    out[key] = issue
+        return {k: out[k] for k in keys if k in out}
+
+    def issues_by_ids(self, ids, fields, changelog=False, progress=None):
+        """Задачи по ID пакетами (исходный JSON Jira); недоступные учётной записи — пропускаются.
+        progress(сделано, всего) — после каждого пакета."""
+        out = []
+        ids = sorted(set(ids))
+        size = HISTORY_BATCH if changelog else self.batch
+        for start in range(0, len(ids), size):
+            batch = ids[start:start + size]
+            out.extend(self._search_issues('id in (%s)' % ','.join(str(i) for i in batch), fields, changelog))
+            if progress:
+                progress(min(start + size, len(ids)), len(ids))
+        return out
+
+    def children(self, parent_keys, fields, changelog=False):
+        """Подзадачи (parent in …) для всех задач сразу, пакетами."""
+        out = []
+        keys = sorted(set(parent_keys))
+        for start in range(0, len(keys), SEARCH_BATCH):
+            out.extend(self._search_issues('parent in (%s)' % ', '.join(keys[start:start + SEARCH_BATCH]), fields, changelog))
+        return out
+
     def statuses(self):
         """{id статуса: (название, категория)}."""
         data = self.json('GET', self.api('status'), kind=list)
         return {str(st.get('id')): (st.get('name') or '', (st.get('statusCategory') or {}).get('key') or 'new')
                 for st in data if isinstance(st, dict)}
-
-    def issues_by_ids(self, ids, fields):
-        """{id: fields} для задач по ID (пакетами); недоступные пользователю задачи пропускаются."""
-        out = {}
-        ids = sorted(set(ids))
-        for start in range(0, len(ids), SEARCH_BATCH):
-            batch = ids[start:start + SEARCH_BATCH]
-            out.update(self.search('id in (%s)' % ','.join(str(i) for i in batch), fields))
-        return out
 
     def list_fields(self):
         """Поля Jira, пригодные для среза: учёт времени и числовые (в т. ч. пользовательские)."""
@@ -451,6 +494,96 @@ def _error_text(resp):
 
 # ─── Расчёт среза ────────────────────────────────────────────────
 
+def _issue_fields(issue, key=None):
+    return dict(issue.get('fields') or {}, __key=issue.get('key') or key)
+
+
+def collect_issues(client, structure_id, mappings, fields, changelog=False, progress=None):
+    """Состав задач кнопки: запросы к Jira идут пакетами на всю кнопку, а не по эпикам —
+    задачи-корни одним поиском, дерево структуры один раз, вложенные задачи всех эпиков одним поиском.
+
+    → (группы по ассоциациям [{serviceId, keys, invalid, warnings, issues: {id: поля}}],
+       задачи-контейнеры, журналы изменений {id: [...]} при changelog=True)
+    """
+    parsed = [(m, *parse_issue_keys(m.get('issueKeys'))) for m in mappings]
+    found_roots = client.issues_by_keys({k for _m, keys, _inv in parsed for k in keys}, fields, changelog)
+    histories = {}
+
+    def take(issue, key=None):
+        issue_id = int(issue['id'])
+        if changelog and issue_id not in histories:
+            histories[issue_id] = client.full_changelog(issue)
+        return issue_id, _issue_fields(issue, key)
+
+    groups = []
+    for m, keys, invalid in parsed:
+        group = {'serviceId': m['serviceId'], 'subtree': bool(m.get('includeSubtree')), 'keys': keys, 'invalid': invalid,
+                 'warnings': [f'Некорректный ключ задачи: {k}' for k in invalid], 'roots': [], 'issues': {}}
+        for key in keys:
+            if key not in found_roots:
+                group['warnings'].append(f'{key}: задача не найдена или нет прав на просмотр')
+                continue
+            issue_id, f = take(found_roots[key], key)
+            group['roots'].append((key, issue_id, f))
+            group['issues'][issue_id] = f  # каждая задача учитывается один раз
+        groups.append(group)
+
+    containers = set()  # задачи, у которых в структуре (или по связи «подзадача») есть вложенные
+    nested = [g for g in groups if g['subtree'] and g['roots']]
+    if nested and structure_id:
+        rows = client.forest_rows(structure_id)
+        containers = parent_issue_ids(rows)
+        for g in nested:
+            g['need'] = set()
+            for key, issue_id, _f in g['roots']:
+                ids = subtree_issue_ids(rows, issue_id)
+                if ids is None:
+                    g['warnings'].append(f'{key}: задачи нет в структуре — учтена только она сама')
+                else:
+                    g['need'] |= ids
+        missing = set().union(*(g['need'] - set(g['issues']) for g in nested))
+        fetched = dict(take(issue) for issue in client.issues_by_ids(missing, fields, changelog, progress)) if missing else {}
+        for g in nested:
+            want = g['need'] - set(g['issues'])
+            g['issues'].update({i: fetched[i] for i in want if i in fetched})
+            hidden = len(want) - len(want & set(fetched))
+            if hidden:
+                g['warnings'].append(f'{hidden} задач(и) структуры недоступны для просмотра — не учтены')
+    elif nested:
+        by_parent = {}
+        for issue in client.children({f['__key'] for g in nested for _k, _i, f in g['roots']}, fields, changelog):
+            issue_id, f = take(issue)
+            parent = f.get('parent') if isinstance(f.get('parent'), dict) else {}
+            by_parent.setdefault(parent.get('key'), {})[issue_id] = f
+        for g in nested:
+            for _key, issue_id, f in g['roots']:
+                kids = by_parent.get(f['__key'], {})
+                if kids:
+                    containers.add(issue_id)
+                g['issues'].update({i: c for i, c in kids.items() if i not in g['issues']})
+    return groups, containers, histories
+
+
+def _snapshot_item(group, field_map, containers):
+    """Группа задач ассоциации → строка среза: суммы показателей, задачи и предупреждения."""
+    warnings = list(group['warnings'])
+    values = {}
+    for metric in METRICS:
+        spec = field_map[metric]
+        if not spec['field']:
+            values[metric] = None
+            continue
+        raw = [f.get(spec['field']) for f in group['issues'].values()]
+        values[metric] = sum_hours(raw, spec['unit'])
+        if values[metric] is None and any(v not in (None, '') for v in raw):
+            warnings.append(f"Поле {spec['field']} не числовое — метрика не заполнена")
+    if not group['keys'] and not group['invalid']:
+        warnings.append('Не указаны задачи')
+    issues = [issue_detail(f, field_map, issue_id in containers) for issue_id, f in group['issues'].items()]
+    issues.sort(key=lambda i: issue_sort_key(i['key']))
+    return dict(serviceId=group['serviceId'], issueCount=len(group['issues']), warnings=warnings, issues=issues, **values)
+
+
 def compute_snapshot(client, structure_id, mappings, field_map=None):
     """Срез для кнопки.
 
@@ -460,67 +593,8 @@ def compute_snapshot(client, structure_id, mappings, field_map=None):
     """
     field_map = field_map or DEFAULT_FIELD_MAP
     fields = sorted({v['field'] for v in field_map.values() if v['field']} | set(ISSUE_FIELDS))
-    rows = None  # дерево структуры загружается один раз и только если нужно
-    containers = set()  # задачи, у которых в структуре есть вложенные строки
-    results = []
-    for m in mappings:
-        keys, invalid = parse_issue_keys(m.get('issueKeys'))
-        warnings = [f'Некорректный ключ задачи: {k}' for k in invalid]
-        subtree = bool(m.get('includeSubtree'))
-        per_issue = {}  # issueId → поля, каждая задача учитывается один раз
-
-        roots = []
-        for key in keys:
-            issue = client.issue(key, fields)
-            if issue is None:
-                warnings.append(f'{key}: задача не найдена или нет прав на просмотр')
-                continue
-            roots.append((key, int(issue['id']), dict(issue.get('fields') or {}, __key=issue.get('key') or key)))
-        for _key, issue_id, root_fields in roots:
-            per_issue[issue_id] = root_fields
-
-        if subtree and roots and structure_id:
-            if rows is None:
-                rows = client.forest_rows(structure_id)
-                containers = parent_issue_ids(rows)
-            need = set()
-            for key, issue_id, _f in roots:
-                ids = subtree_issue_ids(rows, issue_id)
-                if ids is None:
-                    warnings.append(f'{key}: задачи нет в структуре — учтена только она сама')
-                else:
-                    need |= ids
-            missing = need - set(per_issue)
-            if missing:
-                found = client.issues_by_ids(missing, fields)
-                per_issue.update(found)
-                if len(found) < len(missing):
-                    warnings.append(f'{len(missing) - len(found)} задач(и) структуры недоступны для просмотра — не учтены')
-        elif subtree and roots:
-            children = client.search('parent in (%s)' % ', '.join(k for k, _i, _f in roots), fields)
-            per_issue.update({i: f for i, f in children.items() if i not in per_issue})
-            parents = {(f.get('parent') or {}).get('key') for f in children.values()
-                       if isinstance(f.get('parent'), dict)}
-            containers |= {i for _k, i, f in roots if f['__key'] in parents}
-
-        values = {}
-        for metric in METRICS:
-            spec = field_map[metric]
-            if not spec['field']:
-                values[metric] = None
-                continue
-            raw = [f.get(spec['field']) for f in per_issue.values()]
-            values[metric] = sum_hours(raw, spec['unit'])
-            if values[metric] is None and any(v not in (None, '') for v in raw):
-                warnings.append(f"Поле {spec['field']} не числовое — метрика не заполнена")
-
-        if not keys and not invalid:
-            warnings.append('Не указаны задачи')
-        issues = [issue_detail(f, field_map, issue_id in containers) for issue_id, f in per_issue.items()]
-        issues.sort(key=lambda i: issue_sort_key(i['key']))
-        results.append(dict(serviceId=m['serviceId'], issueCount=len(per_issue), warnings=warnings, issues=issues,
-                            **values))
-    return results
+    groups, containers, _histories = collect_issues(client, structure_id, mappings, fields)
+    return [_snapshot_item(g, field_map, containers) for g in groups]
 
 
 # ─── Состав эпика по задачам и качество данных ───────────────────
@@ -647,9 +721,12 @@ def compute_history(client, structure_id, mappings, field_map, moments, progress
     """
     field_map = field_map or DEFAULT_FIELD_MAP
     field_ids = sorted({v['field'] for v in field_map.values() if v['field']})
-    current = compute_snapshot(client, structure_id, mappings, field_map)
+    # текущий состав и журналы изменений — одними и теми же запросами (задачи не загружаются дважды)
+    groups, containers, histories = collect_issues(client, structure_id, mappings,
+                                                   sorted(set(field_ids) | set(ISSUE_FIELDS) | {'created'}), True, progress)
+    current = [_snapshot_item(g, field_map, containers) for g in groups]
     keys = {i['key'] for it in current for i in it['issues']}
-    data = client.issues_with_changelog(keys, set(field_ids) | {'created', 'status', 'summary'}, progress)
+    data = {f['__key']: (f, histories.get(issue_id, [])) for g in groups for issue_id, f in g['issues'].items()}
     statuses = client.statuses()
     warnings = sorted({w for it in current for w in it['warnings']})
     with_history = set()
