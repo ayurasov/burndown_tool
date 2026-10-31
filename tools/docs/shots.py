@@ -457,6 +457,49 @@ def main():
         modal('user/41-history-done.png')
         pg.click('#confirmOk')
 
+        # ── Мастер подключения: пустой проект ИСУП подключается к своей структуре (эпики верхнего уровня)
+        for root, (name, due) in {100: ('Реестр закупок', '2026-12-18'), 200: ('Личный кабинет поставщика', '2026-12-25'),
+                                  300: ('Интеграция с ЕИС', '2027-01-29'), 400: ('Отчётность', '2027-02-26'),
+                                  500: ('Миграция НСИ', '2026-12-11'), 600: ('Мобильное приложение', None)}.items():
+            fake_jira.ISSUES[root].update(summary=name, duedate=due)
+        fake_jira.ISSUES[600]['category'] = 'new'
+        fake_jira.STRUCTURES[0] = {'id': 7, 'name': 'ИСУП — релиз 2.0'}
+        pg.click('.nav-project[data-pid="2"]')
+        pg.wait_for_function('document.getElementById("pageSub").textContent.endsWith(" · ИСУП")')
+        go('jira')
+        pg.wait_for_selector('#jiraWizardCallout:not([hidden])')
+        pg.click('#jiraWizardBtn')
+        pg.wait_for_selector('#wzName')
+        pg.fill('#wzName', 'Срез релиза 2.0')
+        pg.fill('#wzStage', 'Релиз 2.0')
+        modal('user/55-wizard-source.png')
+        pg.click('#confirmOk')
+        pg.wait_for_selector('#wzAll')
+        pg.uncheck('#confirmBody [data-key="AISUZ-600"]')
+        modal('user/56-wizard-epics.png')
+        pg.click('#confirmOk')
+        pg.wait_for_selector('#wzWeeks')
+        pg.select_option('#wzWeeks', '8')
+        pg.click('#confirmOk')
+        pg.wait_for_selector('#wzHistory .history-message.ok', timeout=30000)
+        pg.wait_for_timeout(300)
+        hide_toast()
+        modal('user/57-wizard-done.png')
+        pg.click('#confirmOk')
+        pg.wait_for_selector('#view-dashboard.active')
+        # эпики из Jira: в Jira сдвинули срок и закрыли задачу — что изменится
+        fake_jira.ISSUES[100]['duedate'] = '2027-01-15'
+        fake_jira.ISSUES[500]['category'] = 'done'
+        go('jira', '#jiraButtonsTable [data-action="epics"]')
+        pg.click('#jiraButtonsTable [data-action="epics"]')
+        pg.wait_for_selector('#esCheck')
+        pg.click('#esCheck')
+        pg.wait_for_selector('#esPlan .plan-list')
+        modal('user/58-epic-sync.png')
+        pg.keyboard.press('Escape')
+        pg.click('.nav-project[data-pid="1"]')
+        pg.wait_for_function('document.getElementById("pageSub").textContent.endsWith(" · АИСУЗ")')
+
         # ── Администрирование
         go('users', '#usersTable tbody tr')
         pg.click('#usersTable tr:has-text("petrova") td:first-child')
@@ -486,6 +529,15 @@ def main():
         pg.set_viewport_size({'width': 1440, 'height': 900})
         go('autofill', '.autofill-card')
         shot(pg.locator('#view-autofill .panel'), 'admin/09-autofill.png')
+        # производственный календарь и состояние системы; на стенде планировщик выключен — показываем работающий
+        go('calendar', '#calPresets button')
+        shot(pg.locator('#view-calendar .panel'), 'admin/13-calendar.png')
+        os.environ['BURNDOWN_SCHEDULER'] = '1'
+        with app_module.app.app_context():
+            app_module.mark_scheduler_tick()
+        go('health', '.health-item')
+        shot(pg.locator('#view-health'), 'admin/14-health.png')
+        os.environ['BURNDOWN_SCHEDULER'] = '0'
 
         ctx.close()
 
