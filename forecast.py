@@ -11,6 +11,7 @@ from decimal import ROUND_HALF_UP, Decimal
 
 MC_RUNS = 2000
 MC_HORIZON_DAYS = 3 * 365
+SLOPE_EPS = 1e-9  # наклон меньше — «не сгорает»: шум округления на ровном остатке, а не скорость
 STATUS_RANK = {'ok': 0, 'risk': 1, 'danger': 2}
 _M = 0xFFFFFFFF
 
@@ -26,6 +27,15 @@ def add_days(d, n):
 def js_round(x):
     """Math.round: половина — вверх."""
     return math.floor(x + 0.5)
+
+
+def js_sum(values):
+    """Сумма слева направо, как в JavaScript (sum() в Python 3.12+ складывает float с компенсацией погрешности
+    и в последнем знаке может разойтись с интерфейсом)."""
+    total = 0
+    for v in values:
+        total += v
+    return total
 
 
 def is_num(v):
@@ -59,10 +69,10 @@ def linear_forecast(points):
     if len(pts) < 2:
         return None
     n = len(pts)
-    sum_x = sum(x for x, _ in pts)
-    sum_y = sum(y for _, y in pts)
-    sum_xy = sum(x * y for x, y in pts)
-    sum_xx = sum(x * x for x, _ in pts)
+    sum_x = js_sum(x for x, _ in pts)
+    sum_y = js_sum(y for _, y in pts)
+    sum_xy = js_sum(x * y for x, y in pts)
+    sum_xx = js_sum(x * x for x, _ in pts)
     denom = n * sum_xx - sum_x * sum_x
     if denom == 0:
         return None
@@ -116,6 +126,16 @@ def mc_key(intervals, last, target):
         f'|{last[0]}:{_fixed6(last[1])}|{target or ""}'
 
 
+def zero_reached_date(pts):
+    """Дата, когда остаток обнулился: начало последней серии замеров с остатком ≤ 0 (None, если остаток не нулевой)."""
+    if not pts or pts[-1][1] > 0:
+        return None
+    i = len(pts) - 1
+    while i > 0 and pts[i - 1][1] <= 0:
+        i -= 1
+    return pts[i][0]
+
+
 def monte_carlo(dates, rems, target, settings):
     pts = [(d, y) for d, y in zip(dates, rems) if is_num(y)]
     if len(pts) < 3:
@@ -124,9 +144,10 @@ def monte_carlo(dates, rems, target, settings):
     if len(intervals) < 2:
         return None
     last = pts[-1]
-    if last[1] <= 0:
-        return {'p15': last[0], 'p50': last[0], 'p85': last[0],
-                'probability': (1.0 if last[0] <= target else 0.0) if target else None, 'intervals': len(intervals)}
+    done = zero_reached_date(pts)
+    if done:  # остаток уже обнулён — дата завершения известна
+        return {'p15': done, 'p50': done, 'p85': done,
+                'probability': (1.0 if done <= target else 0.0) if target else None, 'intervals': len(intervals)}
     total = sum(it['len'] for it in intervals)
     rnd = _seeded_random(_hash_string(mc_key(intervals, last, target)))
     days = []
@@ -161,8 +182,8 @@ def monte_carlo(dates, rems, target, settings):
 # ─── Статус (как computeStatus в интерфейсе) ─────────────────────
 
 def compute_status(dates, rems, target, settings):
-    empty = {'status': 'unknown', 'forecastZero': None, 'noBurn': False, 'burnRate': None, 'lastRemaining': None,
-             'lastDate': None, 'mc': None}
+    empty = {'status': 'unknown', 'forecastZero': None, 'noBurn': False, 'tooFar': False, 'finished': False,
+             'burnRate': None, 'lastRemaining': None, 'lastDate': None, 'mc': None}
     if not dates:
         return empty
     base = dates[0]
@@ -171,36 +192,56 @@ def compute_status(dates, rems, target, settings):
     last_rem = pts[-1][1] if pts else None
     last_x = pts[-1][0] if pts else None
     last_date = add_days(base, last_x) if last_x is not None else dates[-1]
+    target_x = days_between(base, target) if target else None
+    status = 'notarget' if (pts and target_x is None) else 'unknown'
+    buffer = settings.get('riskBufferDays') or 0
+
+    def by_day(day):
+        return 'ok' if day <= target_x else ('risk' if day <= target_x + buffer else 'danger')
+    mc = monte_carlo(dates, rems, target, settings)
+    done = zero_reached_date([(add_days(base, x), y) for x, y in pts])
+    if done:  # работы завершены: прогноз — фактическая дата обнуления
+        return dict(empty, status='notarget' if target_x is None else by_day(days_between(base, done)), forecastZero=done,
+                    finished=True, burnRate=burn, lastRemaining=last_rem, lastDate=last_date, mc=mc)
     reg = None
     if settings.get('forecastMethod') == 'average':
         if burn is not None and last_rem is not None and last_x is not None:
             reg = (-burn, last_rem + burn * last_x)
     else:
         reg = linear_forecast(pts)
-    target_x = days_between(base, target) if target else None
-    status = 'notarget' if (pts and target_x is None) else 'unknown'
-    forecast = None
-    no_burn = bool(reg and reg[0] >= 0)
-    if reg and reg[0] < 0:
+    forecast, too_far = None, False
+    no_burn = bool(reg and reg[0] >= -SLOPE_EPS)
+    if reg and reg[0] < -SLOPE_EPS:
         zero_x = -reg[1] / reg[0]
-        forecast = add_days(base, js_round(zero_x))
-        if target_x is not None:
-            buffer = settings.get('riskBufferDays') or 0
-            status = 'ok' if zero_x <= target_x else ('risk' if zero_x <= target_x + buffer else 'danger')
+        if last_rem > 0 and zero_x < last_x:  # регрессия пересекла ноль раньше последнего замера — от последнего замера
+            zero_x = last_x + last_rem / -reg[0]
+        if zero_x - last_x > MC_HORIZON_DAYS:
+            too_far = True
+            if target_x is not None:
+                status = 'danger'
+        else:
+            zero_day = js_round(zero_x)  # статус — по той же дате, что показана
+            forecast = add_days(base, zero_day)
+            if target_x is not None:
+                status = by_day(zero_day)
     elif no_burn and target_x is not None:
         status = 'danger'
-    return {'status': status, 'forecastZero': forecast, 'noBurn': no_burn, 'burnRate': burn, 'lastRemaining': last_rem,
-            'lastDate': last_date, 'mc': monte_carlo(dates, rems, target, settings)}
+    return {'status': status, 'forecastZero': forecast, 'noBurn': no_burn, 'tooFar': too_far, 'finished': False,
+            'burnRate': burn, 'lastRemaining': last_rem, 'lastDate': last_date, 'mc': mc}
 
 
 def aggregate_series(rows_by_service):
-    """Сумма по этапу на каждую дату замеров с последним известным значением эпика (как aggregateStageSeries)."""
-    dates = sorted({r['date'] for rows in rows_by_service for r in rows})
+    """Сумма по этапу на каждую дату замеров (как aggregateSeries в интерфейсе): для эпика без замера в эту дату —
+    последнее известное значение, до первого замера — первое; дата, на которую ни у одного эпика нет значения
+    показателя, для этого показателя пропускается (None)."""
     fields = ('remaining', 'spent', 'estimate')
+    dates = sorted({r['date'] for rows in rows_by_service for r in rows if any(is_num(r[f]) for f in fields)})
     series = {f: [] for f in fields}
+    first = [{f: next((r[f] for r in rows if is_num(r[f])), None) for f in fields} for rows in rows_by_service]
     last = [{f: None for f in fields} for _ in rows_by_service]
     pos = [0] * len(rows_by_service)
     for day in dates:
+        measured = set()
         for i, rows in enumerate(rows_by_service):
             while pos[i] < len(rows) and rows[pos[i]]['date'] <= day:
                 row = rows[pos[i]]
@@ -208,7 +249,12 @@ def aggregate_series(rows_by_service):
                 for f in fields:
                     if is_num(row[f]):
                         last[i][f] = row[f]
+                        if row['date'] == day:
+                            measured.add(f)
         for f in fields:
-            vals = [lv[f] for lv in last if lv[f] is not None]
-            series[f].append(sum(vals) if vals else None)
+            if f not in measured:
+                series[f].append(None)
+                continue
+            vals = [lv[f] if lv[f] is not None else fv[f] for lv, fv in zip(last, first)]
+            series[f].append(js_sum(v for v in vals if v is not None))
     return dates, series

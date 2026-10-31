@@ -1397,10 +1397,11 @@ def api_jira_snapshot(bid):
     return jsonify({'button': button, 'items': items})
 
 
-def store_issue_snapshots(db, pid, items, snap_date):
+def store_issue_snapshots(db, pid, items, snap_date, restored=False):
     """Сохранить состав эпиков по задачам на день среза и убрать списки задач из items (ответ остаётся лёгким).
 
-    Повторный срез за тот же день заменяет состав эпика. Коммит — на стороне вызывающего.
+    Повторный срез за тот же день заменяет состав эпика. restored — состав восстановлен по журналу изменений.
+    Коммит — на стороне вызывающего.
     """
     services = {r['id'] for r in db.execute('SELECT id FROM services WHERE project_id = ?', (pid,))}
     captured = _utc_now_iso()
@@ -1411,9 +1412,11 @@ def store_issue_snapshots(db, pid, items, snap_date):
         db.execute('DELETE FROM jira_issue_snapshots WHERE service_id = ? AND snap_date = ?', (it['serviceId'], snap_date))
         db.executemany(
             'INSERT OR REPLACE INTO jira_issue_snapshots (service_id, snap_date, issue_key, summary, status, category, '
-            'remaining, spent, estimate, container, problems, captured_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'remaining, spent, estimate, container, problems, captured_at, restored) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [(it['serviceId'], snap_date, i['key'], i['summary'], i['status'], i['category'], i['remaining'], i['spent'],
-              i['estimate'], 1 if i['container'] else 0, ','.join(i['problems']), captured) for i in issues])
+              i['estimate'], 1 if i['container'] else 0, ','.join(i['problems']), captured, 1 if restored else 0)
+             for i in issues])
 
 
 VOLUME_SQL = 'COALESCE(estimate, COALESCE(spent, 0) + COALESCE(remaining, 0))'
@@ -1466,8 +1469,10 @@ def burnup_forecast(history, settings=None):
     if gap <= 0.005:
         return dict(out, converges=True, date=last['date'])
     speed = done_rate - scope_rate
-    if speed <= 0 or gap / speed > 3 * 365:
+    if speed <= 0:
         return out
+    if gap / speed > 3 * 365:
+        return dict(out, tooFar=True)  # сходится, но дальше трёх лет — «> 3 лет», как в интерфейсе
     return dict(out, converges=True, date=(datetime.strptime(last['date'], '%Y-%m-%d')
                                            + timedelta(days=math.ceil(gap / speed))).date().isoformat())
 
@@ -1483,9 +1488,7 @@ def aggregate_composition(history, latest, sids):
                'counts': {c: 0 for c in jira.STATUS_CATEGORIES}}
         for h in hists:
             known = [p for p in h if p['date'] <= day]
-            if not known:
-                continue
-            p = known[-1]
+            p = known[-1] if known else h[0]  # до первого среза эпика — его первый срез (без ложного роста объёма)
             agg['scope'] += p['scope']
             agg['done'] += p['done']
             agg['total'] += p['total']
@@ -1494,21 +1497,22 @@ def aggregate_composition(history, latest, sids):
                 agg['counts'][c] += p['counts'][c]
         agg['scope'], agg['done'] = round(agg['scope'], 2), round(agg['done'], 2)
         out.append(agg)
-    problems = {}
+    problems, problem_issues = {}, 0
     for sid in sids:
         for code, n in (latest.get(sid) or {}).get('problems', {}).items():
             problems[code] = problems.get(code, 0) + n
-    return out, dict(out[-1], problems=problems)
+        problem_issues += (latest.get(sid) or {}).get('problemIssues', 0)
+    return out, dict(out[-1], problems=problems, problemIssues=problem_issues)
 
 
 def _composition_pdf_row(label, history, latest, settings, target=None):
-    pct = f"{round(latest['done'] / latest['scope'] * 100)}%" if latest['scope'] else '—'
+    pct = f"{fc.js_round(latest['done'] / latest['scope'] * 100)}%" if latest['scope'] else '—'  # как в интерфейсе
     f = burnup_forecast(history, settings)
-    forecast = '—' if not f else (_fmt_date(f['date']) if f['converges'] else 'не сходится')
+    forecast = '—' if not f else (_fmt_date(f['date']) if f['converges'] else ('> 3 лет' if f.get('tooFar') else 'не сходится'))
     if f and f['converges'] and target and f['date'] > target:
         forecast += ' (позже)'
     return [label, str(latest['counts']['done']), str(latest['counts']['indeterminate']), str(latest['counts']['new']),
-            pct, _fmt_num(latest['scope']), forecast, str(sum(latest['problems'].values()) or '—'), _fmt_date(latest['date'])]
+            pct, _fmt_num(latest['scope']), forecast, str(latest.get('problemIssues') or '—'), _fmt_date(latest['date'])]
 
 
 COMPOSITION_PDF_HEAD = ['', 'Готово', 'В работе', 'Не начато', 'Выполнено', 'Объём, ч', 'Прогноз по задачам',
@@ -1543,9 +1547,10 @@ def jira_composition(db, pid):
             p['doneCount'] += r['cnt']
             p['done'] = round(p['done'] + (r['volume'] or 0), 2)
     for sid, points in history.items():
-        last = dict(points[-1], problems={})
+        last = dict(points[-1], problems={}, problemIssues=0)  # problemIssues — задачи с проблемами (не виды проблем)
         for pr in db.execute('SELECT problems FROM jira_issue_snapshots WHERE service_id = ? AND snap_date = ? '
                              "AND problems != ''", (sid, last['date'])):
+            last['problemIssues'] += 1
             for code in pr['problems'].split(','):
                 last['problems'][code] = last['problems'].get(code, 0) + 1
         latest[sid] = last
@@ -1990,12 +1995,13 @@ def run_history_job(jid):
         saved = skipped = 0
         days_saved = set()
         for day, items in sorted(results.items()):
-            existing = {r[0] for r in db.execute('SELECT DISTINCT service_id FROM jira_issue_snapshots WHERE snap_date = ?',
-                                                 (day,))}
+            # настоящий срез за этот день ценнее восстановленного; прежний восстановленный — заменяется новым
+            existing = {r[0] for r in db.execute('SELECT DISTINCT service_id FROM jira_issue_snapshots '
+                                                 'WHERE snap_date = ? AND NOT COALESCE(restored, 0)', (day,))}
             for it in items:
                 if it['serviceId'] in existing:
-                    it['issues'] = []  # настоящий срез за этот день ценнее восстановленного
-            store_issue_snapshots(db, pid, items, day)
+                    it['issues'] = []
+            store_issue_snapshots(db, pid, items, day, restored=True)
             parsed = []
             for it in items:
                 if it['serviceId'] not in services or all(it[m] is None for m in jira.METRICS):
@@ -2431,7 +2437,7 @@ def api_digest_test(pid):
 
 # ── Состояние проекта для писем: та же логика, что в интерфейсе (forecast.py)
 
-def project_overview(db, pid):
+def project_overview(db, pid, today=None):
     project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
     settings_row = db.execute('SELECT * FROM settings WHERE project_id = ?', (pid,)).fetchone()
     settings = fc.settings_dict(settings_row)
@@ -2449,9 +2455,9 @@ def project_overview(db, pid):
         epics.append({
             'id': s['id'], 'name': s['name'], 'etap': s['etap'], 'target': s['target_date'] or None,
             'remaining': st['lastRemaining'], 'status': st['status'], 'forecast': st['forecastZero'],
-            'noBurn': st['noBurn'], 'probability': st['mc']['probability'] if st['mc'] else None,
+            'noBurn': st['noBurn'], 'tooFar': st['tooFar'], 'probability': st['mc']['probability'] if st['mc'] else None,
             'p50': st['mc']['p50'] if st['mc'] else None, 'lastDate': st['lastDate'] if r else None,
-            'scope': comp['scope'] if comp else None, 'problems': sum(comp['problems'].values()) if comp else None,
+            'scope': comp['scope'] if comp else None, 'problems': comp['problemIssues'] if comp else None,
             'scopePrev': hist[-2]['scope'] if len(hist) >= 2 else None})
     stage_targets = {r['stage_name']: r['target_date'] for r in
                      db.execute('SELECT * FROM stage_targets WHERE project_id = ?', (pid,))}
@@ -2463,7 +2469,7 @@ def project_overview(db, pid):
         dates, series = fc.aggregate_series([rows[i] for i in ids])
         st = fc.compute_status(dates, series['remaining'], stage_targets.get(name) or None, settings)
         stages.append({'name': name, 'target': stage_targets.get(name) or None, 'remaining': st['lastRemaining'],
-                       'status': st['status'], 'forecast': st['forecastZero'], 'noBurn': st['noBurn'],
+                       'status': st['status'], 'forecast': st['forecastZero'], 'noBurn': st['noBurn'], 'tooFar': st['tooFar'],
                        'probability': st['mc']['probability'] if st['mc'] else None})
     autofill = [{'button': b['name'], 'lastStatus': b['last_status'], 'lastMessage': b['last_message'],
                  'lastRunAt': b['last_run_at']} for b in db.execute(
@@ -2471,7 +2477,7 @@ def project_overview(db, pid):
         'JOIN jira_schedules s ON s.button_id = b.id WHERE b.project_id = ? AND s.enabled = 1 ORDER BY b.sort_order, b.id',
         (pid,))]
     counts = {k: sum(1 for e in epics if e['status'] == k) for k in ('ok', 'risk', 'danger')}
-    return {'project': {'id': project['id'], 'name': project['name']}, 'date': datetime.now().date().isoformat(),
+    return {'project': {'id': project['id'], 'name': project['name']}, 'date': today or datetime.now().date().isoformat(),
             'kpi': dict(counts, epics=len(epics), remaining=round(sum(e['remaining'] or 0 for e in epics), 2)),
             'epics': epics, 'stages': stages, 'autofill': autofill}
 
@@ -2480,9 +2486,13 @@ def _pct(p):
     return '—' if p is None else f'{fc.js_round(p * 100)}%'  # как в интерфейсе: 90,5 → 91
 
 
+def _forecast_text(e):
+    return _fmt_date(e['forecast']) if e['forecast'] else ('> 3 лет' if e.get('tooFar') else ('не сгорает' if e['noBurn'] else '—'))
+
+
 def _ru_num(v):
-    """Число по-русски, как в интерфейсе: 1 188,3."""
-    text = f'{v:,.2f}'.rstrip('0').rstrip('.')
+    """Число по-русски, как в интерфейсе: 1 188,3 (до двух знаков, половина — вверх, как Math.round)."""
+    text = f'{fc.js_round(v * 100) / 100:,.2f}'.rstrip('0').rstrip('.')
     return text.replace(',', '\u00a0').replace('.', ',')
 
 
@@ -2520,7 +2530,7 @@ def render_digest(ov, prev, public_url):
     for e in ov['epics']:
         ch = change(e)
         lines.append(f"• {e['name']} — {STATUS_TITLES[e['status']]}; остаток {_hours(e['remaining'])}; "
-                     f"прогноз {_fmt_date(e['forecast']) if e['forecast'] else ('не сгорает' if e['noBurn'] else '—')}; "
+                     f"прогноз {_forecast_text(e)}; "
                      f"цель {_fmt_date(e['target'])}; шанс {_pct(e['probability'])}"
                      + (f"; с прошлого дайджеста: {ch}" if ch else ''))
     errors = [a for a in ov['autofill'] if a['lastStatus'] == 'error']
@@ -2535,7 +2545,7 @@ def render_digest(ov, prev, public_url):
     for e in ov['epics']:
         ch = change(e)
         color = STATUS_COLORS[e['status']]
-        forecast_text = _fmt_date(e['forecast']) if e['forecast'] else ('не сгорает' if e['noBurn'] else '—')
+        forecast_text = _forecast_text(e)
         row_html.append(
             f"<tr><td style='padding:6px 8px;border-bottom:1px solid #e3e7f0'>{esc(e['name'])}"
             + (f"<div style='font-size:12px;color:#964219'>{esc(ch)}</div>" if ch else '') + "</td>"
@@ -2607,12 +2617,17 @@ def deliver(db, user, sub, project, kind, subject, text, html_body, telegram_htm
 
 def send_digest(db, user, sub, save_state=True):
     project = db.execute('SELECT * FROM projects WHERE id = ?', (sub['project_id'],)).fetchone()
-    ov = project_overview(db, project['id'])
+    try:  # «Дайджест на …» — дата в часовом поясе подписчика, а не сервера
+        today = datetime.now(timezone.utc).astimezone(ZoneInfo(sub['timezone'])).date().isoformat()
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        today = None
+    ov = project_overview(db, project['id'], today)
     prev = json.loads(sub['digest_snapshot']) if sub['digest_snapshot'] else None
     msg = render_digest(ov, prev, notify_settings(db).get('public_url'))
     attachments = []
     if sub['digest_pdf']:
-        data, filename = build_project_pdf(db, project, 'dashboard')
+        # PDF — по тем же эпикам, что и письмо (без сданных)
+        data, filename = build_project_pdf(db, project, 'dashboard', ','.join(str(e['id']) for e in ov['epics']) or None)
         attachments.append((filename, data, 'application/pdf'))
     results = deliver(db, user, sub, project, 'digest', msg['subject'], msg['text'], msg['html'], msg['telegram'],
                       attachments)
@@ -2689,7 +2704,7 @@ def alert_events(old, new, sub):
             events.append(('chance', f"{label}: шанс успеть {_pct(o['probability'])} → {_pct(n['probability'])} "
                                      f"(порог {sub['chance_threshold']}%)"))
         if 'scope' in types and o['scope'] and n['scope'] is not None \
-                and (n['scope'] - o['scope']) / o['scope'] * 100 >= sub['scope_threshold']:
+                and (n['scope'] - o['scope']) / o['scope'] * 100 > sub['scope_threshold']:  # «больше чем на N %»
             events.append(('scope', f"{label}: объём задач Jira вырос на "
                                     f"{fc.js_round((n['scope'] - o['scope']) / o['scope'] * 100)}% "
                                     f"({_ru_num(o['scope'])} → {_ru_num(n['scope'])} ч)"))
@@ -3329,7 +3344,7 @@ def _fmt_num(v):
     if v is None:
         return '—'
     try:
-        return f'{float(v):.1f}'
+        return f'{fc.js_round(float(v) * 10) / 10:.1f}'  # половина — вверх, как в интерфейсе
     except (ValueError, TypeError):
         return str(v)
 

@@ -293,6 +293,32 @@ def test_epic_filter_and_hide_done(admin_ui):
     assert 'Работа с жалобами' not in admin_ui.text('#summaryTable')
 
 
+def test_edge_cases_render_with_sensible_statuses(ui, admin):
+    """Ровный дробный остаток, сданный по нулям эпик и эпик с замерами в другие дни: дашборд и свод по этапам
+    не падают, статусы и прогнозы — по смыслу, в burn rate — только даты показанных эпиков."""
+    pid = admin.post('/api/projects', json={'name': 'Края'}).get_json()['id']
+
+    def epic(name, rows, target, done=False):
+        sid = admin.post(f'/api/projects/{pid}/services', json={'name': name, 'etap': 'Этап 1', 'targetDate': target,
+                                                                'isDone': done}).get_json()['id']
+        for date, rem in rows:
+            admin.post(f'/api/services/{sid}/entries', json={'date': date, 'remaining': rem})
+    epic('Заблокирован', [('2026-09-01', 120.7), ('2026-09-08', 120.7), ('2026-09-15', 120.7)], '2026-10-01')
+    epic('Сдан по нулям', [('2026-09-01', 100), ('2026-09-08', 50), ('2026-09-15', 0), ('2026-09-22', 0)], '2026-09-19')
+    epic('Скрытый сданный', [('2026-09-03', 30), ('2026-09-10', 10)], '2026-09-30', done=True)
+    ui.login(*ADMIN)
+    ui.project(pid)
+    page = ui.page
+    page.check('#dashHideDone')
+    rows = {r[1]: r for r in (ui.cells(f'#summaryTable tbody tr:nth-child({i}) td') for i in (1, 2))}
+    assert rows['Заблокирован'][6] == 'не сгорает' and 'Не успеваем' in rows['Заблокирован'][8]
+    assert rows['Сдан по нулям'][6] == '15.09.2026' and 'Успеваем' in rows['Сдан по нулям'][8]
+    assert rows['Сдан по нулям'][7] == '100%'
+    assert ui.cells('#burnRateTable thead th')[1:] == ['01.09', '08.09', '15.09', '22.09']  # без 03.09 и 10.09 скрытого эпика
+    ui.go('stages')
+    assert ui.page.locator('#stageSummaryTable tbody tr').count() == 1
+
+
 def test_burn_rate_table_and_range(admin_ui):
     totals = admin_ui.cells('#burnRateTable tr.total-row td')
     assert totals == ['Итого по проекту', '—', '117,3', '-88,99', '228,42']

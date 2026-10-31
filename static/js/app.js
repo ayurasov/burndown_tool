@@ -253,7 +253,9 @@ function scopeCell(v){
   var r = Math.round(v*100)/100;
   return '<td class="num'+(r>0?' scope-up':'')+'"'+(r>0?' title="Оценка выросла с первого замера"':'')+'>'+(r>0?'+':'')+fmtNum(r)+' ч</td>';
 }
-function forecastText(row){ return row.forecastZero ? fmtDate(row.forecastZero) : (row.noBurn ? 'не сгорает' : '—'); }
+function forecastText(row){
+  return row.forecastZero ? fmtDate(row.forecastZero) : (row.tooFar ? '> 3 лет' : (row.noBurn ? 'не сгорает' : '—'));
+}
 var ROLE_LABELS = {admin:'Администратор', manager:'Руководитель', user:'Пользователь'};
 var ICON_EDIT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
 var ICON_DELETE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0l-1 14a2 2 0 01-2 2H7a2 2 0 01-2-2L4 6h16z"/></svg>';
@@ -403,29 +405,43 @@ function linearForecast(points){
   return {slope:slope, intercept:intercept};
 }
 
-/* Сумма по этапу на каждую дату замеров. Для эпика без замера в эту дату берётся его последнее
-   известное значение (если эпик ещё не замерялся — он не учитывается), чтобы замеры в разные дни
-   не давали ложных провалов на графике. */
+/* Сумма по этапу на каждую дату замеров — та же, что aggregate_series на сервере (forecast.py).
+   Для эпика без замера в эту дату берётся его последнее известное значение, а до первого замера — первое:
+   замеры в разные дни не дают ни ложных провалов, ни ложного «роста объёма». Дата, на которую ни у одного
+   эпика нет значения показателя (пустая «+ Новая дата»), для этого показателя пропускается. */
 function aggregateStageSeries(stageName, stageGroups){
-  var services = servicesInStage(stageName, stageGroups);
-  var rowsBySvc = services.map(function(s){ return entriesForService(s.id); });
+  return aggregateSeries(servicesInStage(stageName, stageGroups).map(function(s){ return entriesForService(s.id); }));
+}
+function aggregateSeries(rowsBySvc){
+  var fields = ['remaining', 'spent', 'estimate'];
   var dateSet = {};
-  rowsBySvc.forEach(function(rows){ rows.forEach(function(e){ dateSet[e.date] = true; }); });
+  rowsBySvc.forEach(function(rows){
+    rows.forEach(function(e){ if(fields.some(function(f){ return isNum(e[f]); })) dateSet[e.date] = true; });
+  });
   var dates = Object.keys(dateSet).sort();
   var series = {remaining:[], spent:[], estimate:[]};
+  var first = rowsBySvc.map(function(rows){
+    var res = {};
+    fields.forEach(function(f){ var r = rows.find(function(e){ return isNum(e[f]); }); res[f] = r ? r[f] : null; });
+    return res;
+  });
   var last = rowsBySvc.map(function(){ return {remaining:null, spent:null, estimate:null}; });
   var pos = rowsBySvc.map(function(){ return 0; });
   dates.forEach(function(date){
+    var measured = {remaining:false, spent:false, estimate:false};
     rowsBySvc.forEach(function(rows, i){
       while(pos[i] < rows.length && rows[pos[i]].date <= date){
         var row = rows[pos[i]++];
-        Object.keys(series).forEach(function(f){ if(isNum(row[f])) last[i][f] = row[f]; });
+        fields.forEach(function(f){
+          if(isNum(row[f])){ last[i][f] = row[f]; if(row.date === date) measured[f] = true; }
+        });
       }
     });
-    Object.keys(series).forEach(function(f){
-      var sum = 0, has = false;
-      last.forEach(function(l){ if(l[f] !== null){ sum += l[f]; has = true; } });
-      series[f].push(has ? sum : null);
+    fields.forEach(function(f){
+      if(!measured[f]){ series[f].push(null); return; }
+      var sum = 0;
+      last.forEach(function(l, i){ var v = l[f] !== null ? l[f] : first[i][f]; if(v !== null) sum += v; });
+      series[f].push(sum);
     });
   });
   return {dates:dates, remaining:series.remaining, spent:series.spent, estimate:series.estimate};
@@ -463,19 +479,29 @@ function burnIntervals(pts){
   }
   return list;
 }
+/* Дата, когда остаток обнулился: начало последней серии замеров с остатком ≤ 0 (null, если остаток не нулевой).
+   Нулевые замеры после завершения не сдвигают ни прогноз, ни статус. */
+function zeroReachedDate(pts){
+  if(!pts.length || pts[pts.length-1].y > 0) return null;
+  var i = pts.length - 1;
+  while(i > 0 && pts[i-1].y <= 0) i--;
+  return pts[i].d;
+}
+var SLOPE_EPS = 1e-9;  /* наклон меньше — «не сгорает»: шум округления на ровном остатке, а не скорость */
 function monteCarloForecast(dates, remainingVals, targetDate){
   var pts = dates.map(function(d, i){ return {d: d, y: remainingVals[i]}; }).filter(function(p){ return isNum(p.y); });
   if(pts.length < 3) return null;
   var intervals = burnIntervals(pts);
   if(intervals.length < 2) return null;
   var last = pts[pts.length-1];
+  var doneDate = zeroReachedDate(pts);
   /* ключ — тот же, что у сервера (forecast.py mc_key): цифры в письмах совпадают с дашбордом */
   var key = intervals.map(function(it){ return it.end + ':' + it.len + ':' + it.rate.toFixed(6); }).join(';') +
     '|' + last.d + ':' + last.y.toFixed(6) + '|' + (targetDate || '');
   if(mcCache[key]) return mcCache[key];
   var res;
-  if(last.y <= 0){
-    res = {p15: last.d, p50: last.d, p85: last.d, probability: targetDate ? (last.d <= targetDate ? 1 : 0) : null, intervals: intervals.length};
+  if(doneDate){  /* остаток уже обнулён — дата завершения известна */
+    res = {p15: doneDate, p50: doneDate, p85: doneDate, probability: targetDate ? (doneDate <= targetDate ? 1 : 0) : null, intervals: intervals.length};
   } else {
     var total = intervals.reduce(function(sum, it){ return sum + it.len; }, 0);
     var rnd = seededRandom(hashString(key));
@@ -520,7 +546,9 @@ function scopeChange(values){
 }
 
 function computeStatus(dates, remainingVals, targetDate){
-  if(!dates.length) return {status:'unknown', forecastZeroDate:null, noBurn:false, burnRate:null, lastRemaining:null, reg:null, baseDate:null, lastDate:null, mc:null};
+  var empty = {status:'unknown', forecastZeroDate:null, noBurn:false, tooFar:false, finished:false, burnRate:null, lastRemaining:null,
+               reg:null, zeroX:null, baseDate:null, lastDate:null, mc:null};
+  if(!dates.length) return empty;
   var baseDate = dates[0];
   var lastDate = dates[dates.length-1];
   var pts = dates.map(function(d,i){ return {x:daysBetween(baseDate, d), y:remainingVals[i]}; }).filter(function(p){ return p.y !== null && p.y !== undefined; });
@@ -529,6 +557,18 @@ function computeStatus(dates, remainingVals, targetDate){
   var lastRemaining = pts.length ? pts[pts.length-1].y : null;
   var lastX = pts.length ? pts[pts.length-1].x : null;
   if(lastX !== null) lastDate = addDays(baseDate, lastX);
+  var targetX = targetDate ? daysBetween(baseDate, targetDate) : null;
+  /* есть замеры, но нет цели — отдельный статус; «нет данных» — только когда нечего прогнозировать */
+  var status = (pts.length && targetX === null) ? 'notarget' : 'unknown';
+  var buffer = (STATE.settings && STATE.settings.riskBufferDays) || 0;
+  var byDay = function(day){ return day <= targetX ? 'ok' : (day <= targetX + buffer ? 'risk' : 'danger'); };
+  var mc = monteCarloForecast(dates, remainingVals, targetDate);
+  var doneDate = zeroReachedDate(pts.map(function(p){ return {d: addDays(baseDate, p.x), y: p.y}; }));
+  if(doneDate){  /* работы завершены: прогноз — фактическая дата обнуления */
+    var doneX = daysBetween(baseDate, doneDate);
+    return Object.assign(empty, {status: targetX === null ? 'notarget' : byDay(doneX), forecastZeroDate: doneDate, finished: true,
+      burnRate: burnRate, lastRemaining: lastRemaining, zeroX: doneX, baseDate: baseDate, lastDate: lastDate, mc: mc});
+  }
   var reg = null;
   var method = (STATE.settings && STATE.settings.forecastMethod) || 'linear';
   if(method === 'average'){
@@ -540,24 +580,25 @@ function computeStatus(dates, remainingVals, targetDate){
   } else {
     reg = linearForecast(pts);
   }
-  var targetX = targetDate ? daysBetween(baseDate, targetDate) : null;
-  /* есть замеры, но нет цели — отдельный статус; «нет данных» — только когда нечего прогнозировать */
-  var status = (pts.length && targetX === null) ? 'notarget' : 'unknown', forecastZeroDate = null;
-  var noBurn = !!(reg && reg.slope >= 0);
-  if(reg && reg.slope < 0){
-    var zeroX = -reg.intercept / reg.slope;
-    forecastZeroDate = addDays(baseDate, Math.round(zeroX));
-    if(targetX !== null){
-      var buffer = (STATE.settings && STATE.settings.riskBufferDays) || 0;
-      if(zeroX <= targetX) status = 'ok';
-      else if(zeroX <= targetX + buffer) status = 'risk';
-      else status = 'danger';
+  var forecastZeroDate = null, zeroX = null, tooFar = false;
+  var noBurn = !!(reg && reg.slope >= -SLOPE_EPS);
+  if(reg && reg.slope < -SLOPE_EPS){
+    zeroX = -reg.intercept / reg.slope;
+    /* линия регрессии пересекла ноль раньше последнего замера, а работа осталась — считаем от последнего замера */
+    if(lastRemaining > 0 && zeroX < lastX) zeroX = lastX + lastRemaining / -reg.slope;
+    if(zeroX - lastX > MC_HORIZON_DAYS){
+      tooFar = true;  /* дальше трёх лет — не дата, а «> 3 лет» */
+      if(targetX !== null) status = 'danger';
+    } else {
+      var zeroDay = Math.round(zeroX);  /* статус — по той же дате, что показана */
+      forecastZeroDate = addDays(baseDate, zeroDay);
+      if(targetX !== null) status = byDay(zeroDay);
     }
   } else if(noBurn && targetX !== null){
     status = 'danger';
   }
-  return {status:status, forecastZeroDate:forecastZeroDate, noBurn:noBurn, burnRate:burnRate, lastRemaining:lastRemaining, reg:reg, baseDate:baseDate, lastDate:lastDate,
-          mc: monteCarloForecast(dates, remainingVals, targetDate)};
+  return {status:status, forecastZeroDate:forecastZeroDate, noBurn:noBurn, tooFar:tooFar, finished:false, burnRate:burnRate,
+          lastRemaining:lastRemaining, reg:reg, zeroX:zeroX, baseDate:baseDate, lastDate:lastDate, mc:mc};
 }
 
 function computeServiceStatus(serviceId){
@@ -736,23 +777,32 @@ function targetLineDataset(lastDate, lastValue, targetDate, label){
   };
 }
 
-function forecastDataset(reg, baseDate, firstDate, lastRow, targetDate){
-  if(!reg) return null;
+function forecastDataset(stat, firstDate, lastRow, targetDate){
+  var reg = stat.reg, baseDate = stat.baseDate;
+  if(!reg || stat.finished) return null;
   var endDate = targetDate || addDays(lastRow.date, 21);
-  /* цель уже прошла или прогноз «0» позже неё — линия доводится до нуля (не дальше полугода), а не обрывается в воздухе */
-  if(reg.slope < 0){
-    var zeroDate = addDays(baseDate, Math.ceil(-reg.intercept / reg.slope));
-    var cap = addDays(lastRow.date, 180);
-    if(zeroDate > endDate) endDate = zeroDate < cap ? zeroDate : (cap > endDate ? cap : endDate);
-  }
+  /* цель уже прошла или прогноз «0» позже неё — линия доводится до прогнозной даты (не дальше полугода) */
+  var cap = addDays(lastRow.date, 180);
+  var zeroDate = stat.forecastZeroDate || (stat.tooFar ? cap : null);
+  if(zeroDate && zeroDate > endDate) endDate = zeroDate < cap ? zeroDate : (cap > endDate ? cap : endDate);
   var startX = daysBetween(baseDate, firstDate);
   var endX = Math.max(daysBetween(baseDate, endDate), startX + 1);
+  /* прогноз от последнего замера (регрессия пересекла ноль раньше него) — прямая из последней точки в дату «0» */
+  var lastX = daysBetween(baseDate, stat.lastDate);
+  var anchored = stat.zeroX !== null && reg.slope < 0 && -reg.intercept / reg.slope < lastX;
+  var lineY = function(x){
+    if(anchored) return x <= lastX ? reg.slope*x + reg.intercept : stat.lastRemaining * (1 - (x - lastX) / (stat.zeroX - lastX));
+    return reg.slope*x + reg.intercept;
+  };
   var forecastPts = [];
   var steps = 16;
   for(var i=0; i<=steps; i++){
     var x = startX + (endX-startX)*i/steps;
-    var y = Math.max(0, reg.slope*x + reg.intercept);
-    forecastPts.push({x: addDays(baseDate, Math.round(x)), y:y});
+    forecastPts.push({x: addDays(baseDate, Math.round(x)), y: Math.max(0, lineY(x))});
+  }
+  if(stat.forecastZeroDate && stat.forecastZeroDate <= endDate){  /* линия доходит до нуля в показанную дату */
+    forecastPts = forecastPts.filter(function(p){ return p.x < stat.forecastZeroDate; });
+    forecastPts.push({x: stat.forecastZeroDate, y: 0});
   }
   var methodLabel = (STATE.settings.forecastMethod === 'average') ? 'Прогноз (по burn rate)' : 'Прогноз (линейн.)';
   return { label: methodLabel, data: forecastPts, borderColor: getCss('--color-orange'), borderDash:[3,3], pointRadius:0, borderWidth:2, tension:0 };
@@ -826,7 +876,7 @@ function renderEpicRemainingChart(){
   if(rows.length){
     var firstRow = rows[0];
     var lastRow = rows[rows.length-1];
-    var fc = forecastDataset(stat.reg, stat.baseDate, firstRow.date, lastRow, svc.targetDate);
+    var fc = forecastDataset(stat, firstRow.date, lastRow, svc.targetDate);
     if(fc){ datasets.push(fc); fcData = fc.data; }
     var tl = targetLineDataset(stat.lastDate, stat.lastRemaining, svc.targetDate, 'Целевая линия (эпик)');
     if(tl) datasets.push(tl);
@@ -949,7 +999,7 @@ function renderSummaryTable(){
     if(isNum(stat.lastRemaining)){ totalRemaining += stat.lastRemaining; hasRemaining = true; }
     if(isNum(stat.burnRate)){ totalBurnRate += stat.burnRate; hasBurn = true; }
     if(isNum(stat.scope)){ totalScope += stat.scope; hasScope = true; }
-    return {etap:s.etap, name:s.name, isDone:s.isDone, remaining:stat.lastRemaining, burnRate:stat.burnRate, scope:stat.scope, targetDate:s.targetDate||'', forecastZero:stat.forecastZeroDate||'', noBurn:stat.noBurn, status:stat.status,
+    return {etap:s.etap, name:s.name, isDone:s.isDone, remaining:stat.lastRemaining, burnRate:stat.burnRate, scope:stat.scope, targetDate:s.targetDate||'', forecastZero:stat.forecastZeroDate||'', noBurn:stat.noBurn, tooFar:stat.tooFar, status:stat.status,
             mc:stat.mc, probability:stat.mc ? stat.mc.probability : null};
   });
   if(!rows.length){
@@ -969,14 +1019,16 @@ function renderSummaryTable(){
 /* ════════════════════════════════════════════════════════════════
    Burn rate daily tables
 ════════════════════════════════════════════════════════════════ */
-function unionOfAllDates(){
-  var set = {};
-  STATE.entries.forEach(function(e){ if(isNum(e.remaining)) set[e.date] = true; });
+/* Даты замеров остатка только тех эпиков, что показаны в таблице (фильтр, «Скрыть сданные») — как в PDF */
+function unionOfDates(serviceIds){
+  var set = {}, ids = {};
+  serviceIds.forEach(function(id){ ids[id] = true; });
+  STATE.entries.forEach(function(e){ if(ids[e.service_id] && isNum(e.remaining)) set[e.date] = true; });
   return Object.keys(set).sort();
 }
 
-function burnRateDates(range){
-  var allDates = unionOfAllDates();
+function burnRateDates(range, serviceIds){
+  var allDates = unionOfDates(serviceIds);
   if(range && (range.from || range.to)){
     return allDates.filter(function(d){ return (!range.from || d >= range.from) && (!range.to || d <= range.to); });
   }
@@ -1021,7 +1073,7 @@ function emptyTable(table, title, text){
 
 function renderBurnRateTable(){
   var table = document.getElementById('burnRateTable');
-  var dates = burnRateDates(burnRangeOverride);
+  var dates = burnRateDates(burnRangeOverride, visibleDashboardServices().map(function(s){ return s.id; }));
   if(!dates.length){ emptyTable(table, 'Нет данных', 'Добавьте замеры в разделе «Данные по датам».'); return; }
   var rows = visibleDashboardServices().map(function(s){
     return {label: s.etap+' — '+s.name, rates: serviceDailyRates(s.id, dates)};
@@ -1064,7 +1116,7 @@ function renderStageSummaryTable(){
     '</tr></thead><tbody>';
   var rows = stageNames.map(function(name){
     var stat = computeStageStatus(name, stageGroups);
-    return {name:name, count:stageGroups[name].length, remaining:stat.lastRemaining, burnRate:stat.burnRate, scope:stat.scope, targetDate:STATE.stageTargets[name]||'', forecastZero:stat.forecastZeroDate||'', noBurn:stat.noBurn, status:stat.status, mc:stat.mc, probability:stat.mc ? stat.mc.probability : null};
+    return {name:name, count:stageGroups[name].length, remaining:stat.lastRemaining, burnRate:stat.burnRate, scope:stat.scope, targetDate:STATE.stageTargets[name]||'', forecastZero:stat.forecastZeroDate||'', noBurn:stat.noBurn, tooFar:stat.tooFar, status:stat.status, mc:stat.mc, probability:stat.mc ? stat.mc.probability : null};
   });
   applyTableSort('stageSummaryTable', rows).forEach(function(r){
     html += '<tr><td>'+escapeHtml(r.name)+'</td><td class="num">'+r.count+'</td><td class="num">'+hoursToStr(r.remaining)+'</td>'+rateCell(r.burnRate,' ч')+scopeCell(r.scope)+'<td class="mono nowrap">'+fmtDate(r.targetDate)+'</td><td class="mono nowrap">'+forecastText(r)+'</td>'+probabilityCell(r.mc)+'<td class="nowrap">'+statusBadge(r.status)+'</td></tr>';
@@ -1076,9 +1128,9 @@ function renderStageSummaryTable(){
 
 function renderStageBurnRateTable(){
   var table = document.getElementById('stageBurnRateTable');
-  var dates = burnRateDates(stageBurnRangeOverride);
-  if(!dates.length){ emptyTable(table, 'Нет данных', 'Добавьте замеры для отображения burn rate.'); return; }
   var stageGroups = computeStageGroups();
+  var dates = burnRateDates(stageBurnRangeOverride, [].concat.apply([], Object.keys(stageGroups).map(function(k){ return stageGroups[k]; })));
+  if(!dates.length){ emptyTable(table, 'Нет данных', 'Добавьте замеры для отображения burn rate.'); return; }
   var stageNames = Object.keys(stageGroups);
   if(!stageNames.length){ emptyTable(table, 'Нет данных', 'Нет этапов для отображения.'); return; }
   /* Burn rate этапа — сумма дневных burn rate его эпиков (согласовано с таблицей на дашборде) */
@@ -1203,7 +1255,7 @@ function renderStageCharts(){
     if(agg.dates.length){
       var firstDate = agg.dates[0];
       var lastRow = {date: agg.dates[agg.dates.length-1]};
-      var fc = forecastDataset(stat.reg, stat.baseDate, firstDate, lastRow, targetDate);
+      var fc = forecastDataset(stat, firstDate, lastRow, targetDate);
       if(fc){ datasets.push(fc); fcData = fc.data; }
       var tl = targetLineDataset(stat.lastDate, stat.lastRemaining, targetDate, 'Целевая линия (этап)');
       if(tl) datasets.push(tl);
@@ -2413,8 +2465,9 @@ function compositionOf(sid){
   return c && c.latest ? c.latest[sid] : null;
 }
 
+/* Задач с неполными данными — задачи, а не виды проблем: у одной задачи их может быть несколько */
 function problemCount(latest){
-  return Object.keys(latest.problems || {}).reduce(function(n, k){ return n + latest.problems[k]; }, 0);
+  return latest.problemIssues || 0;
 }
 
 function compositionBar(latest){
@@ -2489,8 +2542,7 @@ function aggregateComposition(sids){
     CATEGORY_ORDER.forEach(function(k){ agg.counts[k] = 0; agg.volume[k] = 0; });
     hists.forEach(function(h, i){
       while(pos[i] < h.length && h[pos[i]].date <= date) cur[i] = h[pos[i]++];
-      var p = cur[i];
-      if(!p) return;
+      var p = cur[i] || h[0];  /* до первого среза эпика — его первый срез: без ложного «роста объёма» в итоге */
       agg.scope += p.scope; agg.done += p.done; agg.total += p.total; agg.doneCount += p.doneCount;
       CATEGORY_ORDER.forEach(function(k){ agg.counts[k] += p.counts[k]; agg.volume[k] += p.volume[k]; });
     });
@@ -2498,13 +2550,14 @@ function aggregateComposition(sids){
     CATEGORY_ORDER.forEach(function(k){ agg.volume[k] = round(agg.volume[k]); });
     return agg;
   });
-  var problems = {};
+  var problems = {}, problemIssues = 0;
   sids.forEach(function(id){
     var l = c.latest[id];
     if(!l) return;
     Object.keys(l.problems || {}).forEach(function(k){ problems[k] = (problems[k] || 0) + l.problems[k]; });
+    problemIssues += l.problemIssues || 0;
   });
-  return {history: history, latest: Object.assign({}, history[history.length-1], {problems: problems})};
+  return {history: history, latest: Object.assign({}, history[history.length-1], {problems: problems, problemIssues: problemIssues})};
 }
 
 /* Строка таблицы состава: эпик, этап или итог по проекту */

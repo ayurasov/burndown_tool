@@ -260,13 +260,17 @@ def test_burnup_forecast():
 
 
 def test_aggregate_composition_carries_forward():
+    """Итог по группе эпиков: последний срез каждого эпика; до первого среза эпика — его первый срез, иначе первый
+    срез позднего эпика выглядел бы как рост объёма."""
     from app import aggregate_composition
     history = {1: [pt('2026-11-01', 10, 2, 2, 1), pt('2026-11-08', 12, 6, 3, 2)], 2: [pt('2026-11-05', 5, 0, 1, 0)]}
-    latest = {1: dict(history[1][-1], problems={'overspent': 1}), 2: dict(history[2][-1], problems={'overspent': 2})}
+    latest = {1: dict(history[1][-1], problems={'overspent': 1}, problemIssues=1),
+              2: dict(history[2][-1], problems={'overspent': 2, 'no_estimate': 1}, problemIssues=2)}
     agg_history, agg_latest = aggregate_composition(history, latest, [1, 2])
     assert [(p['date'], p['scope'], p['done'], p['total']) for p in agg_history] == [
-        ('2026-11-01', 10, 2, 2), ('2026-11-05', 15, 2, 3), ('2026-11-08', 17, 6, 4)]
-    assert agg_latest['problems'] == {'overspent': 3} and agg_latest['counts']['done'] == 2
+        ('2026-11-01', 15, 2, 3), ('2026-11-05', 15, 2, 3), ('2026-11-08', 17, 6, 4)]
+    assert agg_latest['problems'] == {'overspent': 3, 'no_estimate': 1} and agg_latest['problemIssues'] == 3
+    assert agg_latest['counts']['done'] == 2
     assert aggregate_composition(history, latest, [3]) is None
 
 
