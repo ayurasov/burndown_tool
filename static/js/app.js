@@ -3141,6 +3141,36 @@ function editorFromAttribute(spec){
   });
   return {mode: 'formula', formula: expr.params.formula, variables: vars, sum: sum, distinct: false};
 }
+/* Фильтр доски Structure у кнопки — для колонок «После фильтрации» (After filtering) */
+function boardFilterHtml(bf){
+  var mode = bf ? bf.mode : 'none';
+  return '<details class="jb-board-filter"'+(bf ? ' open' : '')+'><summary>Фильтр доски Structure <span class="muted-cell">— для колонок «После фильтрации»</span></summary>'+
+    '<div class="setting-hint">Если на доске Structure включён фильтр и у колонок отмечено «After filtering», укажите здесь тот же фильтр: такие колонки Burndown посчитает только по видимым с ним задачам.</div>'+
+    '<div class="seg-filter" role="radiogroup">'+[['none', 'Без фильтра'], ['jql', 'JQL'], ['json', 'Трансформации из Structure (JSON)']].map(function(x){
+      return '<label class="checkbox-row"><input type="radio" name="jbBfMode" value="'+x[0]+'"'+(mode === x[0] ? ' checked' : '')+'> '+x[1]+'</label>';
+    }).join('')+'</div>'+
+    '<div id="jbBfJql"'+(mode === 'jql' ? '' : ' hidden')+'><label class="small" for="jbBfJqlText">JQL фильтра — как на доске</label>'+
+      '<textarea id="jbBfJqlText" rows="2" placeholder="status not in (Done, Closed)">'+escapeHtml(bf && bf.mode === 'jql' ? bf.jql : '')+'</textarea>'+
+      '<label class="checkbox-row"><input type="checkbox" id="jbBfSub"'+(bf && bf.showSubItems ? ' checked' : '')+'> Показывать вложенные задачи совпавших <span class="muted-cell">(Show sub-items)</span></label></div>'+
+    '<div id="jbBfJson"'+(mode === 'json' ? '' : ' hidden')+'><label class="small" for="jbBfJsonText">Трансформации доски: forestSpec из запроса Structure (F12 → «Сеть», запрос value или forest) или его transformations</label>'+
+      '<textarea id="jbBfJsonText" rows="3" placeholder="{&quot;structureId&quot;:…,&quot;transformations&quot;:[…]}">'+escapeHtml(bf && bf.mode === 'json' ? JSON.stringify(bf.transformations) : '')+'</textarea></div>'+
+  '</details>';
+}
+function readBoardFilter(){
+  var mode = (document.querySelector('input[name="jbBfMode"]:checked') || {}).value || 'none';
+  if(mode === 'jql') return {mode: 'jql', jql: document.getElementById('jbBfJqlText').value.trim(), showSubItems: document.getElementById('jbBfSub').checked};
+  if(mode === 'json') return {mode: 'json', transformations: document.getElementById('jbBfJsonText').value.trim()};
+  return null;
+}
+function bindBoardFilter(){
+  document.querySelectorAll('input[name="jbBfMode"]').forEach(function(r){
+    r.addEventListener('change', function(){
+      var mode = document.querySelector('input[name="jbBfMode"]:checked').value;
+      document.getElementById('jbBfJql').hidden = mode !== 'jql';
+      document.getElementById('jbBfJson').hidden = mode !== 'json';
+    });
+  });
+}
 function describeAttribute(spec){
   if(!spec) return '';
   var p = spec.params || {};
@@ -3186,7 +3216,11 @@ function fieldMapSummary(fm){
   fm = fm || JIRA_DEFAULT_FIELD_MAP;
   return JIRA_METRICS.map(function(m){
     var f = fm[m[0]] || {};
-    if(f.structure) return '<div class="jira-map-line"><span>'+m[1]+'</span> ← <span class="badge badge-info">Structure</span> '+escapeHtml(f.structure.label || describeAttribute(f.structure.attribute))+'</div>';
+    if(f.structure){
+      var label = f.structure.label || describeAttribute(f.structure.attribute);
+      if(f.structure.afterFiltering && label.indexOf('после фильтрации') === -1) label += ', после фильтрации';
+      return '<div class="jira-map-line"><span>'+m[1]+'</span> ← <span class="badge badge-info">Structure</span> '+escapeHtml(label)+'</div>';
+    }
     var known = JIRA_TIME_FIELDS.find(function(t){ return t.id === f.field; });
     return '<div class="jira-map-line"><span>'+m[1]+'</span> ← '+(f.field ? '<span class="mono">'+escapeHtml(known ? known.name : f.field)+'</span>'+(f.unit !== 'seconds' ? ' <span class="muted-cell">'+escapeHtml(({ms: 'мс', minutes: 'мин', hours: 'ч', days: 'дн'})[f.unit] || '')+'</span>' : '') : '<span class="muted-cell">не заполняется</span>')+'</div>';
   }).join('');
@@ -3228,6 +3262,7 @@ function openJiraButtonEditor(button){
           '<button type="button" class="btn btn-ghost btn-sm" id="jbLoadStructures">Загрузить из Jira</button></div>'+
           '<input type="number" id="jbStructureId" min="1" placeholder="ID структуры" hidden></div>'+
       '</div>'+
+      boardFilterHtml(b.boardFilter)+
       '<div class="jira-fields"><div class="jira-fields-head"><span class="field-label">Откуда брать показатели замера</span>'+
         '<button type="button" class="btn btn-ghost btn-sm" id="jbLoadFields">Загрузить поля из Jira</button></div>'+
         '<div class="jb-metrics" id="jbFields">'+JIRA_METRICS.map(function(m){
@@ -3276,12 +3311,12 @@ function openJiraButtonEditor(button){
         if(document.getElementById('jbSrc_'+m[0]).value === 'structure'){
           if(!strSpecs[m[0]]) missing = missing || m[1];
           else structure = {attribute: strSpecs[m[0]].attribute, editor: strSpecs[m[0]].editor || null, label: strSpecs[m[0]].label,
-                            unit: document.getElementById('jbStrUnit_'+m[0]).value};
+                            unit: document.getElementById('jbStrUnit_'+m[0]).value, afterFiltering: !!strSpecs[m[0]].afterFiltering};
         }
         fm[m[0]] = {field: document.getElementById('jbField_'+m[0]).value, unit: document.getElementById('jbUnit_'+m[0]).value, structure: structure};
       });
       var body = {name: document.getElementById('jbName').value.trim(), structureId: structureId,
-                  structureName: structureName, mappings: mappings, fieldMap: fm};
+                  structureName: structureName, mappings: mappings, fieldMap: fm, boardFilter: readBoardFilter()};
       if(!body.name){ toast('Укажите название кнопки'); return false; }
       if(missing){ toast('Выберите колонку Structure для показателя «' + missing + '»'); return false; }
       if(!structureId && JIRA_METRICS.some(function(m){ return fm[m[0]].structure; })){ toast('Колонки Structure можно выбрать только у кнопки со структурой'); return false; }
@@ -3312,12 +3347,14 @@ function openJiraButtonEditor(button){
       if(structure && !strSpecs[m[0]]) openStructureColumnPanel(m[0], m[1]);
     });
   });
+  bindBoardFilter();
   var strSpecs = {};
   JIRA_METRICS.forEach(function(m){
     var st = (fieldMap[m[0]] || {}).structure;
     if(!st) return;
     var editor = st.editor || editorFromAttribute(st.attribute);  /* формула из прежних версий — тоже в редакторе */
-    strSpecs[m[0]] = {attribute: st.attribute, editor: editor, label: st.label || (editor ? describeEditor(editor) : describeAttribute(st.attribute))};
+    strSpecs[m[0]] = {attribute: st.attribute, editor: editor, label: st.label || (editor ? describeEditor(editor) : describeAttribute(st.attribute)),
+                      afterFiltering: !!st.afterFiltering};
   });
   var jiraFieldList = JIRA_TIME_FIELDS.slice();
   confirmBody.querySelectorAll('[data-str-edit]').forEach(function(btn){
@@ -3353,8 +3390,9 @@ function openJiraButtonEditor(button){
         '<div id="jbStrVars" class="jb-str-vars"></div></div>'+
       '<div id="jbStrAgg">'+
         '<label class="checkbox-row"><input type="checkbox" id="jbStrSum"'+(aggSum ? ' checked' : '')+'> Суммировать по вложенным <span class="muted-cell">(Sum over sub-items)</span></label>'+
-        '<label class="checkbox-row"><input type="checkbox" id="jbStrDistinct"'+(aggDistinct ? ' checked' : '')+'> Исключать дубликаты <span class="muted-cell">(Exclude duplicates)</span></label>'+
-        '<div class="setting-hint">Галочка «After filtering» не нужна: Burndown считает по всей структуре, без фильтров, включённых на доске. Если в Structure она отмечена и на доске включён фильтр, сумма на доске будет меньше — сверка ниже покажет это.</div></div>'+
+        '<label class="checkbox-row"><input type="checkbox" id="jbStrDistinct"'+(aggDistinct ? ' checked' : '')+'> Исключать дубликаты <span class="muted-cell">(Exclude duplicates)</span></label></div>'+
+      '<div id="jbStrFilterOpt"><label class="checkbox-row"><input type="checkbox" id="jbStrAfter"'+(cur && cur.afterFiltering ? ' checked' : '')+'> После фильтрации <span class="muted-cell">(After filtering)</span></label>'+
+        '<div class="setting-hint">Отмечено — колонка считается с фильтром доски (задаётся у кнопки выше, «Фильтр доски Structure»): задачи, скрытые фильтром, в сумму не входят, как в Structure.</div></div>'+
       '<div id="jbStrCopy"><ol class="plan-list"><li>Откройте структуру в Jira с нужной колонкой, нажмите F12 → «Сеть» (Network) и обновите страницу.</li>'+
         '<li>В фильтре запросов введите <span class="mono">structure</span> и найдите запрос <span class="mono">value</span>; на вкладке «Полезные данные» (Payload) скопируйте его содержимое.</li>'+
         '<li>Вставьте ниже. Если такого запроса нет — задайте колонку как «Поле» или «Формула» с теми же настройками.</li></ol>'+
@@ -3425,7 +3463,7 @@ function openJiraButtonEditor(button){
       if(m === 'copy'){
         if(!picked.length){ toast('Вставьте запрос value из Structure или спецификацию колонки (JSON)'); return null; }
         var spec = picked[picked.length < 2 ? 0 : parseInt(document.getElementById('jbStrPick').value, 10)];
-        return {attribute: spec, editor: null, label: describeAttribute(spec)};
+        return {attribute: spec, editor: null, label: describeAttribute(spec), afterFiltering: document.getElementById('jbStrAfter').checked};
       }
       var editor = {mode: m, sum: document.getElementById('jbStrSum').checked, distinct: document.getElementById('jbStrDistinct').checked};
       if(m === 'field'){
@@ -3444,7 +3482,8 @@ function openJiraButtonEditor(button){
         editor.formula = formula;
         editor.variables = vars;
       }
-      return {attribute: null, editor: editor, label: describeEditor(editor)};
+      var after = document.getElementById('jbStrAfter').checked;
+      return {attribute: null, editor: editor, label: describeEditor(editor) + (after ? ', после фильтрации' : ''), afterFiltering: after};
     };
     document.getElementById('jbStrCheck').addEventListener('click', function(){
       var spec = buildSpec();
@@ -3452,26 +3491,29 @@ function openJiraButtonEditor(button){
       var box = document.getElementById('jbStrPreview');
       var unit = document.getElementById('jbStrUnit_'+metric).value;
       box.innerHTML = '<p class="insight-empty">Запрашиваем значения у Structure…</p>';
-      var body = {structureId: editorStructureId(), unit: unit, keys: editorKeys()};
+      var body = {structureId: editorStructureId(), unit: unit, keys: editorKeys(), afterFiltering: spec.afterFiltering, boardFilter: readBoardFilter()};
       if(spec.editor) body.editor = spec.editor; else body.attribute = spec.attribute;
       apiPost('/api/projects/'+currentProjectId+'/jira/structure-preview', body).then(function(r){
         var render = function(){
           var u = document.getElementById('jbStrUnit_'+metric).value, k = STRUCTURE_UNIT_HOURS[u];
           var hasVariants = r.values.some(function(v){ return v.variants; });
+          var hasFiltered = r.values.some(function(v){ return v.variants && 'filtered' in v.variants; });
+          var variantNames = ['own', 'distinct', 'all'].concat(hasFiltered ? ['filtered'] : []);
           var hours = function(x){ return x === null || x === undefined ? '—' : fmtNum(Math.round(x * k * 100) / 100) + ' ч'; };
           box.innerHTML = (r.values.length ? '<div class="table-scroll"><table class="data-table compact-table jb-str-check"><thead><tr><th>Задача</th><th class="num">Значение в Structure</th>'+
-              '<th class="num">Часов</th>'+(hasVariants ? '<th class="num">Только задача</th><th class="num">Σ без дубликатов</th><th class="num">Σ с дубликатами</th>' : '')+
+              '<th class="num">Часов</th>'+(hasVariants ? '<th class="num">Только задача</th><th class="num">Σ без дубликатов</th><th class="num">Σ с дубликатами</th>' +
+                (hasFiltered ? '<th class="num">С фильтром доски</th>' : '') : '')+
               '</tr></thead><tbody>'+
             r.values.map(function(v){
               var h = v.asUnits[u];
               return '<tr><td class="mono nowrap">'+escapeHtml(v.key)+'</td><td class="num">'+escapeHtml(v.raw === null || v.raw === undefined ? '—' : String(v.raw))+'</td>'+
                 '<td class="num jb-unit-current">'+(h === null ? '—' : fmtNum(h) + ' ч')+'</td>'+
-                (hasVariants ? ['own', 'distinct', 'all'].map(function(n){ return '<td class="num">'+hours((v.variants || {})[n])+'</td>'; }).join('') : '')+'</tr>';
+                (hasVariants ? variantNames.map(function(n){ return '<td class="num">'+hours((v.variants || {})[n])+'</td>'; }).join('') : '')+'</tr>';
             }).join('')+'</tbody></table></div>'+
             '<div class="jb-unit-switch"><span class="bulk-note">Не совпадает с колонкой в структуре? Значение в:</span>'+STRUCTURE_UNITS.map(function(x){
               return '<button type="button" class="btn btn-ghost btn-sm'+(x[0] === u ? ' active' : '')+'" data-unit="'+x[0]+'">'+x[1]+'</button>';
             }).join('')+'</div>'+
-            (hasVariants ? '<p class="setting-hint">Сверка: сравните с колонкой в Structure. Совпало с «Σ с дубликатами» — снимите «Исключать дубликаты» (или отметьте его в Structure); на доске меньше всех вариантов — на доске включён фильтр и в колонке отмечено «After filtering».</p>' : '') : '')+
+            (hasVariants ? '<p class="setting-hint">Сверка: сравните с колонкой в Structure. Совпало с «Σ с дубликатами» — снимите «Исключать дубликаты» (или отметьте его в Structure); совпало с «С фильтром доски» — отметьте «После фильтрации»; на доске меньше всех вариантов — укажите у кнопки тот же фильтр, что включён на доске.</p>' : '') : '')+
             (r.warnings.length ? '<ul class="plan-list">'+r.warnings.map(function(w){ return '<li>'+escapeHtml(w)+'</li>'; }).join('')+'</ul>' : '')+
             (r.attribute ? '<details class="jb-str-spec"><summary>Что отправляется в Structure</summary><pre class="mono">'+escapeHtml(JSON.stringify(r.attribute, null, 2))+'</pre></details>' : '');
           box.querySelectorAll('[data-unit]').forEach(function(b){

@@ -1654,6 +1654,9 @@ def test_structure_column_in_button_editor(admin_ui, admin, fake_jira):
     page.click('#jbStrApply')
     assert admin_ui.text('#jbStrLabel_remaining') == 'Σ по вложенным: Атрибут «timeestimate»'
     # формула как в Structure: переменные orig, spent, status (статус — текстом), Σ по вложенным без дубликатов
+    page.click('.jb-board-filter > summary')  # фильтр доски — для колонок «После фильтрации»
+    page.check('input[name="jbBfMode"][value="jql"]')
+    page.fill('#jbBfJqlText', 'status = "В работе"')
     page.select_option('#jbSrc_spent', 'structure')
     page.check('input[name="jbStrMode"][value="formula"]')
     page.fill('#jbStrFormulaText', 'WITH rest = orig - spent :\nif(rest < 0 OR status != "В работе", 0, rest)')
@@ -1669,8 +1672,14 @@ def test_structure_column_in_button_editor(admin_ui, admin, fake_jira):
     assert admin_ui.cells('#jbStrPreview tbody td.jb-unit-current') == ['8 ч']  # ABC-1: 7 ч + ABC-3: 1 ч
     assert admin_ui.cells('#jbStrPreview tbody tr td:nth-child(4)') == ['7 ч']  # только сама задача
     assert 'SUM{' in admin_ui.text('#jbStrPreview .jb-str-spec pre')
+    assert 'С фильтром доски' in admin_ui.text('#jbStrPreview thead')
+    page.check('#jbStrAfter')  # «После фильтрации»: ABC-2 (готово) скрыта фильтром
+    page.click('#jbStrCheck')
+    page.wait_for_function('document.querySelector("#jbStrPreview td.jb-unit-current") && '
+                           'document.querySelector("#jbStrPreview td.jb-unit-current").textContent.trim() === "8 ч"')
     page.click('#jbStrApply')
     assert admin_ui.text('#jbStrLabel_spent').startswith('Формула: WITH rest') and 'Σ без дубликатов' in admin_ui.text('#jbStrLabel_spent')
+    assert 'после фильтрации' in admin_ui.text('#jbStrLabel_spent')
     page.select_option('#jbSrc_estimate', 'structure')  # поле: Σ по вложенным
     page.select_option('#jbStrFieldSel', 'timeoriginalestimate')
     page.click('#jbStrApply')
@@ -1679,8 +1688,12 @@ def test_structure_column_in_button_editor(admin_ui, admin, fake_jira):
     assert admin_ui.text('#jiraButtonsTable').count('Structure') == 3
     fm = admin.get('/api/projects/1/jira').get_json()['buttons'][0]['fieldMap']
     assert fm['spent']['structure']['editor']['variables']['status'] == {'field': 'status', 'format': 'text'}
+    assert fm['spent']['structure']['afterFiltering'] is True and fm['estimate']['structure']['afterFiltering'] is False
+    assert admin.get('/api/projects/1/jira').get_json()['buttons'][0]['boardFilter'] == {
+        'mode': 'jql', 'jql': 'status = "В работе"', 'showSubItems': False}
     assert fm['estimate']['structure']['attribute']['params']['formula'] == 'SUM{\nvalue\n}'
     page.click('#jiraButtonsTable [data-action="edit"]')  # повторное открытие — настройки на месте
     page.wait_for_selector('#jbSrc_spent')
     page.click('[data-str-edit="spent"]')
     assert page.is_checked('input[name="jbStrMode"][value="formula"]') and 'WITH rest' in page.input_value('#jbStrFormulaText')
+    assert page.is_checked('#jbStrAfter') and page.input_value('#jbBfJqlText') == 'status = "В работе"'
