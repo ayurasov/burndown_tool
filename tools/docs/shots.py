@@ -408,6 +408,18 @@ def main():
         hide_toast()
         modal('user/26-jira-button-editor.png')
         shot(pg.locator('#confirmModal .jira-fields'), 'user/27-jira-fields.png')
+        # колонка Structure: формула с суммой по вложенным и проверка значений на эпиках
+        pg.select_option('#jbSrc_remaining', 'structure')
+        pg.wait_for_selector('#jbStrPaste')
+        pg.check('input[name="jbStrMode"][value="formula"]')
+        pg.fill('#jbStrFormulaText', 'SUM{remaining}')
+        pg.select_option('#jbStrUnit_remaining', 'ms')
+        pg.click('#jbStrCheck')
+        pg.wait_for_selector('#jbStrPreview table')
+        pg.wait_for_timeout(300)
+        pg.locator('#jbStrPanel').scroll_into_view_if_needed()
+        shot(pg.locator('#jbStrPanel'), 'user/59-structure-column.png')
+        pg.click('#jbStrCancel')  # в демо-кнопке остаются поля Jira
         pg.click('#confirmOk')
         pg.wait_for_selector('#jiraButtonsTable tbody tr[data-bid]')
         pg.wait_for_timeout(400)
