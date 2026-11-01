@@ -57,18 +57,36 @@ def test_forest_formula_and_subtree():
     assert [(p['row'], p['path']) for p in places] == [(2, ['5/7']), (5, ['5/8'])]
     assert jira.subtree_issues_at(items, 2) == {1, 2} and jira.subtree_issues_at(items, 5) == {1, 4}
     assert jira.pick_occurrence(places)[0]['row'] == 2
-    assert jira.pick_occurrence(places, {'5/8'}) == (places[1], True)
-    assert jira.pick_occurrence(places, {'5/9'}) == (places[0], False)
+    assert jira.pick_occurrence(places, {4}) == (places[1], True)  # отмечена папка над строкой
+    assert jira.pick_occurrence(places, {5}) == (places[1], True)  # отмечена сама строка эпика
+    assert jira.pick_occurrence(places, {3}) == (places[0], False)
+    assert jira.pick_occurrence(places, set()) == (places[0], False)  # разделы заданы, но в структуре их нет
     assert jira.pick_occurrence(None) == (None, False)
     assert 'стоит в структуре 2 раз(а)' in jira.occurrence_warning('A-1', places, places[0], True, None)
-    assert 'в выбранных разделах' in jira.occurrence_warning('A-1', places, places[0], False, {'5/9'})
+    assert 'в выбранных разделах' in jira.occurrence_warning('A-1', places, places[0], False, set())
     assert jira.occurrence_warning('A-1', places[:1], places[0], True, None) is None
-    assert jira.normalize_scope([{'item': '5/8', 'title': ' 4.1 '}, '10001']) == [
-        {'item': '5/8', 'title': '4.1'}, {'item': '10001', 'title': ''}]
-    assert jira.normalize_scope([]) is None and jira.scope_items(None) is None
-    for bad in ('x', [{'item': 'a:b'}], [5], ['x'] * 51):
+    assert jira.normalize_scope([{'item': '5/8', 'title': ' 4.1 '}, '10001', {'item': '1', 'row': 5}]) == [
+        {'item': '5/8', 'title': '4.1'}, {'item': '10001', 'title': ''}, {'item': '1', 'title': '', 'row': 5}]
+    assert jira.normalize_scope([]) is None
+    for bad in ('x', [{'item': 'a:b'}], [5], ['x'] * 51, [{'item': '1', 'row': -1}], [{'item': '1', 'row': '5'}],
+                [{'item': '1', 'row': True}]):
         with pytest.raises(ValueError):
             jira.normalize_scope(bad)
+
+
+def test_scope_rows_resolve_sections():
+    # эпик 1 стоит глубоко в «5/7» (под задачей 9) и прямо в «5/8» — как SRM-4687 под «Договором развития» и под «4.1»
+    items = jira.parse_forest_items('1:0:5/7,2:1:9,3:2:1,4:3:2,10:0:5/8,11:1:1,12:2:4')
+    assert jira.scope_rows(items, None) is None
+    assert jira.scope_rows(items, [{'item': '1', 'row': 11}]) == {11}  # строка на месте
+    assert jira.scope_rows(items, [{'item': '1'}]) == {11}  # сохранён до 1.9.3: строка верхних уровней, как в списке
+    assert jira.scope_rows(items, [{'item': '1', 'row': 2}]) == {11}  # в строке теперь другой элемент
+    assert jira.scope_rows(items, [{'item': '1', 'row': 404}]) == {11}  # строки больше нет
+    assert jira.scope_rows(items, [{'item': '2'}]) == {4}  # только глубже второго уровня — на любой глубине
+    assert jira.scope_rows(items, [{'item': '5/404'}]) == set()
+    places = jira.issue_occurrences(items)[1]
+    assert jira.pick_occurrence(places, jira.scope_rows(items, [{'item': '1'}]))[0]['row'] == 11
+    assert jira.pick_occurrence(places, jira.scope_rows(items, [{'item': '5/7'}]))[0]['row'] == 3
 
 
 def test_seconds_to_hours():

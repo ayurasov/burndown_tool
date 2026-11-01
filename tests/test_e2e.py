@@ -1737,7 +1737,11 @@ def test_structure_scope_and_places(admin_ui, admin, fake_jira, monkeypatch):
     page.click('#jbScopeBox > summary')
     page.click('#jbScopeLoad')
     admin_ui.expect_toast('Разделов загружено: 4')
-    page.check('#jbScopeList [data-scope-item="5/8"]')
+    # ABC-1 стоит на втором уровне в обоих разделах: отмечаем сам эпик под «4.1» — различает строка
+    epic_41 = '#jbScopeList [data-scope-item="101"][data-scope-row="1"]'
+    epic_41_label = '#jbScopeList label:has([data-scope-item="101"][data-scope-row="1"])'
+    assert admin_ui.text(epic_41_label) == 'ABC-1 строк: 4'
+    page.check(epic_41)
     page.click('#jbStrCheck')
     page.wait_for_function('document.querySelector("#jbStrPreview td.jb-unit-current") && '
                            'document.querySelector("#jbStrPreview td.jb-unit-current").textContent.trim() === "16 ч"')
@@ -1745,12 +1749,16 @@ def test_structure_scope_and_places(admin_ui, admin, fake_jira, monkeypatch):
         page.click('#jbStrPreview [data-diag]')
     import json as _json
     diag = _json.loads(open(dl.value.path(), encoding='utf-8').read())
-    assert diag['request']['structureScope'] == [{'item': '5/8', 'title': '4.1'}] and diag['response']['values'][0]['places']
+    scope = [{'item': '101', 'title': '4.1 → ABC-1', 'row': 1}]
+    assert diag['request']['structureScope'] == scope and diag['response']['values'][0]['places']
     page.click('#jbStrApply')
     page.click('#confirmOk')
     admin_ui.expect_toast('Кнопка обновлена')
     button = admin.get('/api/projects/1/jira').get_json()['buttons'][0]
-    assert button['structureScope'] == [{'item': '5/8', 'title': '4.1'}]
+    assert button['structureScope'] == scope
     page.click('#jiraButtonsTable [data-action="edit"]')
-    page.wait_for_selector('#jbScopeList [data-scope-item="5/8"]')
-    assert page.is_checked('#jbScopeList [data-scope-item="5/8"]')
+    page.wait_for_selector(epic_41)
+    assert page.is_checked(epic_41) and admin_ui.text(epic_41_label) == '4.1 → ABC-1'
+    page.click('#jbScopeLoad')  # раздел сохранён — блок открыт; после загрузки списка отмечена та же строка
+    admin_ui.expect_toast('Разделов загружено: 4')
+    assert page.is_checked(epic_41) and not page.is_checked('#jbScopeList [data-scope-item="101"][data-scope-row="21"]')

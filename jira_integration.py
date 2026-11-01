@@ -184,24 +184,25 @@ def issue_occurrences(items):
     return out
 
 
-def pick_occurrence(occurrences, scope=None):
-    """Строка задачи для расчёта: первая в выбранных разделах структуры (scope — элементы разделов), без разделов —
-    первая в структуре. → (место | None, найдено ли в разделах)."""
+def pick_occurrence(occurrences, scope_rows=None):
+    """Строка задачи для расчёта: первая в выбранных разделах структуры, без разделов — первая в структуре.
+    scope_rows — строки разделов (scope_rows()): место подходит, если раздел — сама строка задачи (отмечен эпик)
+    или одна из строк над ней (отмечена папка). → (место | None, найдено ли в разделах)."""
     if not occurrences:
         return None, False
-    if scope:
+    if scope_rows is not None:
         for occ in occurrences:
-            if scope & set(occ['path']):
+            if occ['row'] in scope_rows or scope_rows.intersection(occ['pathRows']):
                 return occ, True
         return occurrences[0], False
     return occurrences[0], True
 
 
-def occurrence_warning(key, occurrences, picked, in_scope, scope):
+def occurrence_warning(key, occurrences, picked, in_scope, scope_rows):
     """Предупреждение о задаче, которая стоит в структуре несколько раз (или не найдена в выбранных разделах)."""
-    if scope and not in_scope:
+    if scope_rows is not None and not in_scope:
         return f'{key}: в выбранных разделах структуры задачи нет — взята первая строка в структуре'
-    if len(occurrences) > 1 and not scope:
+    if len(occurrences) > 1 and scope_rows is None:
         return (f'{key}: задача стоит в структуре {len(occurrences)} раз(а) — взята первая строка; чтобы взять строку из '
                 'нужного раздела, отметьте его у кнопки («Раздел структуры»)')
     return None
@@ -228,7 +229,8 @@ SCOPE_ITEM_RE = re.compile(r'^[^,:]{1,300}$')
 
 
 def normalize_scope(raw):
-    """Разделы структуры у кнопки: [{'item', 'title'}] (до 50) или None."""
+    """Разделы структуры у кнопки: [{'item', 'title'[, 'row']}] (до 50) или None. row — строка, отмеченная в списке
+    разделов: элемент (эпик, папка) может стоять в структуре несколько раз, строка различает места."""
     if not raw:
         return None
     if not isinstance(raw, list) or len(raw) > 50:
@@ -239,12 +241,32 @@ def normalize_scope(raw):
         if not isinstance(item, str) or not SCOPE_ITEM_RE.match(item):
             raise ValueError('Некорректный раздел структуры')
         title = x.get('title') if isinstance(x, dict) and isinstance(x.get('title'), str) else ''
-        out.append({'item': item, 'title': title.strip()[:300]})
+        entry = {'item': item, 'title': title.strip()[:300]}
+        row = x.get('row') if isinstance(x, dict) else None
+        if row is not None:
+            if not isinstance(row, int) or isinstance(row, bool) or row < 0:
+                raise ValueError('Некорректная строка раздела структуры')
+            entry['row'] = row
+        out.append(entry)
     return out or None
 
 
-def scope_items(scope):
-    return {x['item'] for x in scope} if scope else None
+def scope_rows(items, scope):
+    """Строки выбранных разделов в текущей структуре (items — parse_forest_items) → set или None без разделов.
+    Сохранённая строка берётся, если в ней тот же элемент; иначе (строку пересоздали, раздел сохранён до 1.9.3) —
+    строки с этим элементом на верхних двух уровнях, как в списке разделов, а если таких нет — на любой глубине."""
+    if not scope:
+        return None
+    item_at = {row_id: item for row_id, _d, _iid, item in items}
+    out = set()
+    for entry in scope:
+        row = entry.get('row')
+        if row is not None and item_at.get(row) == entry['item']:
+            out.add(row)
+            continue
+        same = [(row_id, depth) for row_id, depth, _iid, item in items if item == entry['item']]
+        out.update(row_id for row_id, depth in (([x for x in same if x[1] <= 1]) or same))
+    return out
 
 
 def parse_forest_formula(formula):
@@ -913,7 +935,7 @@ def collect_issues(client, structure_id, mappings, fields, changelog=False, prog
         rows = client.forest_rows(structure_id)
         items = client.forest_items(structure_id)
         places = issue_occurrences(items)
-        wanted = scope_items(scope)
+        wanted = scope_rows(items, scope)
         parents = parent_issue_ids(rows)  # задачи, у которых в структуре есть вложенные
         for g in nested:
             g['need'] = set()
@@ -1025,8 +1047,9 @@ def apply_structure_columns(client, structure_id, groups, items, columns, transf
 
 
 def _apply_columns(client, structure_id, groups, items, columns, transformations, scope=None):
-    places = issue_occurrences(client.forest_items(structure_id, transformations))
-    wanted = scope_items(scope)
+    forest = client.forest_items(structure_id, transformations)
+    places = issue_occurrences(forest)
+    wanted = scope_rows(forest, scope)
     specs, index, slot = [], {}, {}
     for metric, col in columns.items():
         key = json.dumps(col['attribute'], sort_keys=True, ensure_ascii=False)
@@ -1085,10 +1108,13 @@ def row_titles(client, structure_id, rows, transformations=None):
 
 
 def structure_sections(client, structure_id, limit=300):
-    """Разделы структуры для выбора у кнопки: строки верхних двух уровней, под которыми есть вложенные строки."""
+    """Разделы структуры для выбора у кнопки: строки верхних двух уровней, под которыми есть вложенные строки.
+    У строки второго уровня parentRow — строка над ней: один и тот же эпик может стоять в нескольких разделах."""
     items = client.forest_items(structure_id)
-    out = []
+    out, top = [], None
     for i, (row_id, depth, issue_id, item) in enumerate(items):
+        if depth == 0:
+            top = row_id
         if depth > 1:
             continue
         nxt = items[i + 1] if i + 1 < len(items) else None
@@ -1099,12 +1125,15 @@ def structure_sections(client, structure_id, limit=300):
             if d <= depth:
                 break
             size += 1
-        out.append({'item': item, 'rowId': row_id, 'depth': depth, 'rows': size, 'issue': issue_id is not None})
+        out.append({'item': item, 'rowId': row_id, 'depth': depth, 'rows': size, 'issue': issue_id is not None,
+                    'parentRow': top if depth else None})
         if len(out) >= limit:
             break
-    titles = row_titles(client, structure_id, [x['rowId'] for x in out])
+    rows = {x['rowId'] for x in out} | {x['parentRow'] for x in out if x['parentRow'] is not None}
+    titles = row_titles(client, structure_id, sorted(rows))
     for x in out:
         x['title'] = titles.get(x['rowId']) or x['item']
+        x['parentTitle'] = titles.get(x.pop('parentRow')) if x['depth'] else None
     return out
 
 
@@ -1118,9 +1147,9 @@ def structure_preview(client, structure_id, keys, attribute, unit, variants=None
     колонки в каждом: если задача стоит в нескольких местах, у каждой строки своё поддерево. vars — значение каждой
     переменной формулы у выбранной строки (видно, какое поле Structure не отдаёт)."""
     found = client.issues_by_keys(keys, ['summary'])
-    wanted = scope_items(scope)
     items = client.forest_items(structure_id)
     places = issue_occurrences(items)
+    wanted = scope_rows(items, scope)
     rows, warnings, ids = [], [], {}
     for key in keys:
         issue = found.get(key)
@@ -1139,8 +1168,9 @@ def structure_preview(client, structure_id, keys, attribute, unit, variants=None
     def values_for(spec, tf, name=None):
         """{ключ: значение} по выбранным строкам задач — в структуре с фильтром tf (или без него)."""
         if tf:
-            fplaces = issue_occurrences(client.forest_items(structure_id, tf))
-            pairs = [(k, (pick_occurrence(fplaces.get(ids[k]), wanted)[0] or {}).get('row')) for k, _r in rows]
+            forest = client.forest_items(structure_id, tf)
+            fplaces, fwanted = issue_occurrences(forest), scope_rows(forest, scope)
+            pairs = [(k, (pick_occurrence(fplaces.get(ids[k]), fwanted)[0] or {}).get('row')) for k, _r in rows]
         else:
             pairs = rows
         present = [(k, r) for k, r in pairs if r is not None]
@@ -1168,7 +1198,8 @@ def structure_preview(client, structure_id, keys, attribute, unit, variants=None
     all_places = {k: places.get(ids[k], []) for k, _r in rows}
     place_rows = sorted({p['row'] for occ in all_places.values() for p in occ})
     path_rows = sorted({r for occ in all_places.values() for p in occ for r in p['pathRows']})
-    titles = row_titles(client, structure_id, path_rows) if any(len(o) > 1 or wanted for o in all_places.values()) else {}
+    show_paths = wanted is not None or any(len(o) > 1 for o in all_places.values())
+    titles = row_titles(client, structure_id, path_rows) if show_paths else {}
     try:
         at_place = client.structure_values(structure_id, place_rows, [attribute])[0] if place_rows else {}
     except JiraError:

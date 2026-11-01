@@ -477,6 +477,47 @@ def test_epic_in_two_sections_uses_chosen_section(fake, monkeypatch):
     assert any('в выбранных разделах структуры задачи нет' in w for w in missing['warnings'])
 
 
+# Как у SRM-4687: эпик ABC-1 стоит глубоко в «Договоре развития» (под ABC-4) и прямо в «4.1»; в разделах отмечен сам
+# эпик под «4.1» (строка 1), а не папка над ним
+NESTED = '20:0:5/7,23:1:104,21:2:101,22:3:102,30:0:5/8,1:1:101,2:2:102,6:2:105,3:2:5/9,4:3:103,5:1:106'
+EPIC_IN_41 = [{'item': '101', 'title': '4.1 → ABC-1', 'row': 1}]
+
+
+@pytest.mark.parametrize('formula, scope, spent', [
+    (NESTED, EPIC_IN_41, 16.0),
+    (NESTED, [{'item': '101', 'title': 'ABC-1'}], 16.0),  # сохранён до 1.9.3 без строки — эпик верхних уровней
+    (NESTED, [{'item': '101', 'title': 'ABC-1', 'row': 777}], 16.0),  # строку пересоздали
+    (NESTED, [{'item': '104', 'title': 'ABC-4', 'row': 23}], 15.0),  # отмечен раздел над эпиком
+    (TWO_SECTIONS, EPIC_IN_41, 16.0),  # эпик на втором уровне в обоих разделах — различает строка
+    (TWO_SECTIONS, [{'item': '101', 'title': 'ABC-1', 'row': 21}], 15.0),
+])
+def test_epic_row_chosen_as_section(fake, monkeypatch, formula, scope, spent):
+    monkeypatch.setattr(fake_jira, 'FORMULA', formula)
+    mappings = [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]
+    got = jira.compute_snapshot(client_for(fake), 7, mappings, estimate_map(), scope=scope)[0]
+    # и колонка Structure (spent), и сумма поля Jira (estimate) — по поддереву выбранной строки
+    assert (got['spent'], got['estimate']) == (spent, spent)
+    assert not any('в выбранных разделах' in w or 'раз(а)' in w for w in got['warnings'])
+
+
+def test_preview_and_snapshot_take_epic_row_from_section(admin, fake, monkeypatch):
+    connect(admin, fake)
+    monkeypatch.setattr(fake_jira, 'FORMULA', NESTED)
+    sections = admin.get('/api/projects/1/jira/structure-sections?structureId=7').get_json()
+    assert [(x['item'], x['rowId'], x['parentTitle']) for x in sections] == [
+        ('5/7', 20, None), ('104', 23, 'Договор развития'), ('5/8', 30, None), ('101', 1, '4.1')]
+    body = {'structureId': 7, 'unit': 'ms', 'keys': 'ABC-1', 'structureScope': EPIC_IN_41,
+            'editor': {'mode': 'field', 'field': 'timeoriginalestimate', 'format': 'duration', 'sum': True}}
+    data = admin.post('/api/projects/1/jira/structure-preview', json=body).get_json()
+    value = data['values'][0]
+    assert value['hours'] == 16.0 and value['rowId'] == 1 and not data['warnings']
+    assert [(p['path'], p['chosen']) for p in value['places']] == [(['Договор развития', 'ABC-4'], False), (['4.1'], True)]
+    button = create_button(admin, fieldMap=estimate_map(), structureScope=EPIC_IN_41).get_json()
+    assert button['structureScope'] == EPIC_IN_41
+    snap = admin.post(f"/api/jira/buttons/{button['id']}/snapshot", json={}).get_json()
+    assert snap['items'][0]['spent'] == 16.0 and snap['items'][0]['estimate'] == 16.0
+
+
 def test_preview_lists_all_places_and_variables(admin, fake, monkeypatch):
     connect(admin, fake)
     monkeypatch.setattr(fake_jira, 'FORMULA', TWO_SECTIONS)
