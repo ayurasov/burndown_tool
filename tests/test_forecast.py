@@ -29,6 +29,23 @@ def py_results(cases, settings):
     return out
 
 
+def long_cases(seed, n=6):
+    """Ежедневные замеры (автозаполнение) за полгода и больше: интервалы объединяются в недельные блоки."""
+    rng = random.Random(seed)
+    cases = []
+    for i in range(n):
+        day, rem, dates, rems = '2026-01-05', rng.uniform(300, 2000), [], []
+        stalled = i % 3 == 2  # остаток почти не сгорает — сценарии обрываются досрочно
+        for _ in range(rng.randint(35, 200)):
+            day = forecast.add_days(day, 1 if forecast.date.fromisoformat(day).isoweekday() < 5 else 3)
+            burn = rng.uniform(-6, 7) if stalled else rng.gauss(4, 4)
+            rem = max(0.0, rem - burn)
+            dates.append(day)
+            rems.append(round(rem, 2))
+        cases.append([dates, rems, forecast.add_days(day, rng.randint(-10, 400))])
+    return cases
+
+
 def random_cases(seed, n=60):
     rng = random.Random(seed)
     cases = []
@@ -61,7 +78,7 @@ SETTINGS = [
 @pytest.mark.skipif(not shutil.which('node'), reason='нужен Node.js')
 @pytest.mark.parametrize('settings', SETTINGS, ids=['linear-all', 'average-rolling', 'workdays-90', 'workdays-average-50'])
 def test_server_forecast_matches_interface(settings):
-    cases = random_cases(SETTINGS.index(settings) * 7919 + 13)
+    cases = random_cases(SETTINGS.index(settings) * 7919 + 13) + long_cases(SETTINGS.index(settings) + 1)
     cases.append([['2026-07-17', '2026-07-24', '2026-07-28', '2026-07-29'], [509, 124, 349, 346], '2026-08-31'])
     cases.append([['2026-07-01', '2026-07-08', '2026-07-15'], [10, 5, 0], '2026-07-10'])
     cases += [[EDGE_DATES[:len(r)], r, t] for r, t in EDGE_CASES]
@@ -129,6 +146,21 @@ def test_confidence_level_widens_range():
     assert r50['confidence'] == 50 and r90['confidence'] == 90 and r50['p50'] == r90['p50']
     assert r90['lo'] <= r50['lo'] <= r50['hi'] <= r90['hi'] and r90['lo'] < r90['hi']
     assert forecast.monte_carlo(dates, rems, None, dict(base, rangeConfidence=33))['confidence'] == 70
+
+
+def test_dense_measurements_use_weekly_blocks():
+    s = dict(forecast.DEFAULT_SETTINGS)
+    dates = [forecast.add_days('2026-03-02', i) for i in range(60)]
+    rems = [1000 - 5 * i for i in range(60)]
+    cal = forecast.calendar_for(s)
+    pts = list(zip(dates, rems))
+    blocks = forecast.block_points(pts, cal)
+    assert [d for d, _ in blocks][:3] == ['2026-03-02', '2026-03-09', '2026-03-16'] and blocks[-1] == pts[-1]
+    intervals = forecast.burn_intervals(pts, s, cal)
+    assert len(intervals) == 9 and {it['len'] for it in intervals[:-1]} == {7} and intervals[-1]['len'] == 3
+    assert len(forecast.burn_intervals(pts[:30], s, cal)) == 29  # до 30 интервалов — без объединения
+    mc = forecast.monte_carlo(dates, rems, '2026-12-31', s)
+    assert mc['p50'] == mc['lo'] == mc['hi'] and mc['intervals'] == 9  # ровный темп — одна дата
 
 
 def test_js_round_and_fixed():

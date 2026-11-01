@@ -6,10 +6,10 @@ function grab(name){ const i = src.indexOf('function ' + name + '('); let depth 
 var STATE = {settings: JSON.parse(process.argv[3])};
 const names = ['daysBetween','addDays','isNum','avgBurnRate','linearForecast','seededRandom','hashString','burnIntervals',
   'zeroReachedDate','monteCarloForecast','computeStatus','aggregateSeries','isoOrdinal','ordinalIso','workCalendar',
-  'rangeConfidence','burnupForecast'];
-eval(names.map(grab).join('\n') + '\nvar MC_RUNS = 2000, MC_HORIZON_DAYS = 3 * 365, SLOPE_EPS = 1e-9; var mcCache = {};' +
+  'rangeConfidence','burnupForecast','rawIntervals','blockPoints'];
+eval(names.map(grab).join('\n') + '\nvar MC_RUNS = 2000, MC_HORIZON_DAYS = 3 * 365, SLOPE_EPS = 1e-9; var mcCache = {}; var MC_BLOCK_AFTER = 30;' +
   '\nvar MC_HORIZON_WORKDAYS = 3 * 261; var CALENDAR_DAYS = {workdays: false, signature: "", horizon: 3 * 365, span: daysBetween, shift: addDays};' +
-  '\nvar calCache = {key: null, cal: null}; var MC_QUANTILES = {50: [0.25, 0.75], 70: [0.15, 0.85], 80: [0.1, 0.9], 90: [0.05, 0.95]};' +
+  '\nvar calCache = {key: null, cal: null}; var dayNumCache = new Map(); var MC_QUANTILES = {50: [0.25, 0.75], 70: [0.15, 0.85], 80: [0.1, 0.9], 90: [0.05, 0.95]};' +
   '\nglobalThis.burnup = burnupForecast; globalThis.cal = workCalendar;' +
   '\nglobalThis.run = function(d, r, t){ return computeStatus(d, r, t); }; globalThis.agg = aggregateSeries;');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));

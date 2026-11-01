@@ -11,7 +11,9 @@
 import os
 import re
 import math
+import gzip
 import hashlib
+import pickle
 import secrets
 import shutil
 import sqlite3
@@ -114,6 +116,8 @@ def migrate_db():
     lock = _migration_lock()
     conn = sqlite3.connect(DB_PATH, timeout=30)
     try:
+        # WAL: чтение не ждёт записи — несколько воркеров и пользователей работают параллельно
+        conn.execute('PRAGMA journal_mode = WAL')
         cols = [r[1] for r in conn.execute('PRAGMA table_info(services)')]
         if 'is_done' not in cols:
             conn.execute('ALTER TABLE services ADD COLUMN is_done INTEGER DEFAULT 0')
@@ -189,9 +193,10 @@ migrate_db()
 
 def get_db():
     if 'db' not in g:
-        g.db = sqlite3.connect(DB_PATH)
+        g.db = sqlite3.connect(DB_PATH, timeout=10)
         g.db.row_factory = sqlite3.Row
         g.db.execute('PRAGMA foreign_keys = ON')
+        g.db.execute('PRAGMA synchronous = NORMAL')  # с WAL: надёжно и без лишних fsync на каждую запись
     return g.db
 
 
@@ -200,6 +205,9 @@ def close_db(error):
     db = g.pop('db', None)
     if db is not None:
         db.close()
+    touched = g.pop('touched_projects', None)
+    if touched and error is None:
+        schedule_warmup(touched)
 
 
 NO_STAGE = 'Без этапа'
@@ -335,6 +343,39 @@ def security_headers(resp):
     resp.headers.setdefault('X-Frame-Options', 'DENY')
     resp.headers.setdefault('Referrer-Policy', 'same-origin')
     resp.headers.setdefault('Content-Security-Policy', "frame-ancestors 'none'")
+    return resp
+
+
+COMPRESS_MIN_BYTES = 1400  # меньше одного сетевого пакета сжимать незачем
+COMPRESSIBLE = {'application/json', 'text/html', 'text/css', 'text/plain', 'text/csv', 'text/javascript',
+                'application/javascript', 'image/svg+xml'}
+
+
+def _etag_matches(header, etag):
+    return any(tag.strip() in (etag, etag[2:], '*') for tag in (header or '').split(','))
+
+
+@app.after_request
+def optimize_response(resp):
+    """ETag для данных (браузер перепроверяет их и получает 304 без тела, если ничего не изменилось)
+    и сжатие gzip текстовых ответов. Файлы (send_file) отдаются как есть."""
+    if resp.direct_passthrough or resp.is_streamed or resp.status_code != 200:
+        return resp
+    if request.method == 'GET' and resp.mimetype == 'application/json' and 'ETag' not in resp.headers:
+        etag = 'W/"' + hashlib.blake2b(resp.get_data(), digest_size=12).hexdigest() + '"'
+        resp.headers['ETag'] = etag
+        resp.headers.setdefault('Cache-Control', 'private, no-cache')
+        if _etag_matches(request.headers.get('If-None-Match'), etag):
+            resp.status_code = 304
+            resp.set_data(b'')
+            return resp
+    if (resp.mimetype in COMPRESSIBLE and 'Content-Encoding' not in resp.headers
+            and 'gzip' in (request.headers.get('Accept-Encoding') or '').lower()):
+        body = resp.get_data()
+        if len(body) >= COMPRESS_MIN_BYTES:
+            resp.set_data(gzip.compress(body, compresslevel=5))
+            resp.headers['Content-Encoding'] = 'gzip'
+            resp.vary.add('Accept-Encoding')
     return resp
 
 
@@ -474,6 +515,8 @@ def audit_log(page, action, entity_type=None, entity_id=None, project_id=None, c
             project_name = p['name']
     if not changes:
         changes = [{'field': None, 'old': None, 'new': None}]
+    if project_id:
+        g.setdefault('touched_projects', set()).add(project_id)
     for ch in changes:
         db.execute('''INSERT INTO audit_log
             (user_id, username, project_id, project_name, page, action,
@@ -550,6 +593,27 @@ def _load_releases():
 
 RELEASES = _load_releases()
 APP_VERSION = RELEASES[0]['version'] if RELEASES else 'dev'  # единственный источник номера версии — docs/versions.md
+
+
+def _asset_version():
+    """Метка версии стилей и скрипта в их адресах: браузер и nginx (кэш статики на 30 дней) получают новые файлы
+    сразу после обновления, а не через месяц."""
+    digest = hashlib.sha1(APP_VERSION.encode('utf-8'))
+    for name in ('js/app.js', 'css/style.css'):
+        try:
+            with open(os.path.join(APP_DIR, 'static', name), 'rb') as f:
+                digest.update(f.read())
+        except OSError:
+            pass
+    return digest.hexdigest()[:10]
+
+
+ASSET_VERSION = _asset_version()
+
+
+@app.context_processor
+def asset_context():
+    return {'asset_v': ASSET_VERSION}
 
 
 @app.route('/api/about')
@@ -787,6 +851,42 @@ def api_delete_project(pid):
     return jsonify({'success': True})
 
 
+_mc_local = threading.local()
+
+
+def _mc_connection():
+    """Отдельное соединение для кэша Монте-Карло: запись в кэш не вмешивается в транзакцию запроса."""
+    conn = getattr(_mc_local, 'conn', None)
+    if conn is None or getattr(_mc_local, 'path', None) != DB_PATH:
+        # mode=rw: кэш не создаёт файл базы, если её ещё нет (расчёт вне приложения, тесты)
+        conn = sqlite3.connect(f'file:{DB_PATH}?mode=rw', uri=True, timeout=0.5, check_same_thread=False)
+        conn.execute('PRAGMA synchronous = NORMAL')
+        _mc_local.conn, _mc_local.path = conn, DB_PATH
+    return conn
+
+
+def _mc_store_get(key):
+    try:
+        row = _mc_connection().execute('SELECT value FROM mc_cache WHERE key = ?',
+                                       (hashlib.sha1(key.encode('utf-8')).hexdigest(),)).fetchone()
+        return json.loads(row[0]) if row else None
+    except (sqlite3.Error, ValueError):
+        return None
+
+
+def _mc_store_put(key, value):
+    try:
+        conn = _mc_connection()
+        conn.execute('INSERT OR REPLACE INTO mc_cache (key, value, created_at) VALUES (?, ?, ?)',
+                     (hashlib.sha1(key.encode('utf-8')).hexdigest(), json.dumps(value), _utc_now_iso()))
+        conn.commit()
+    except sqlite3.Error:  # база занята или только для чтения — кэш в памяти процесса всё равно работает
+        pass
+
+
+fc.MC_STORE = (_mc_store_get, _mc_store_put)
+
+
 def org_calendar(db):
     """Общий производственный календарь организации (задаёт администратор) → {'holidays', 'extraWorkdays'}."""
     row = db.execute("SELECT value FROM app_settings WHERE key = 'org_calendar'").fetchone()
@@ -869,7 +969,7 @@ def project_payload(db, pid):
 def api_get_project_data(pid):
     if not can_view_project(session['user_id'], pid):
         return jsonify({'error': 'Нет доступа к проекту'}), 403
-    return jsonify(project_payload(get_db(), pid))
+    return versioned_json('data', pid, lambda: project_payload(get_db(), pid))
 
 
 # ─── API: Services (epics) ───────────────────────────────────────
@@ -1882,9 +1982,12 @@ def api_jira_composition(pid):
     if not can_view_project(session['user_id'], pid):
         return jsonify({'error': 'Нет доступа'}), 403
     db = get_db()
-    history, latest = jira_composition(db, pid)
-    return jsonify({'baseUrl': _jira_base_url(db, pid), 'latest': latest, 'history': history,
-                    'problemLabels': jira.PROBLEMS})
+    base_url = _jira_base_url(db, pid)
+
+    def build():
+        history, latest = jira_composition(db, pid)
+        return {'baseUrl': base_url, 'latest': latest, 'history': history, 'problemLabels': jira.PROBLEMS}
+    return versioned_json('composition', pid, build, extra=base_url, version=snapshots_version(db, pid))
 
 
 def _days(a, b):
@@ -1978,6 +2081,17 @@ def _composition_head(unit):
 
 def jira_composition(db, pid):
     """Состав эпиков проекта по срезам задач → (история по датам, последний срез с проблемами данных)."""
+    return cached_result('composition', pid, snapshots_version(db, pid), lambda: _jira_composition(db, pid))
+
+
+def snapshots_version(db, pid):
+    """Версия состава задач: только срезы Jira (добавляются, id растут) и набор эпиков проекта."""
+    row = db.execute('SELECT group_concat(s.id), MAX((SELECT MAX(j.id) FROM jira_issue_snapshots j '
+                     'WHERE j.service_id = s.id)) FROM services s WHERE s.project_id = ?', (pid,)).fetchone()
+    return f'{row[0]}|{row[1]}'
+
+
+def _jira_composition(db, pid):
     rows = db.execute(
         f'''SELECT s.service_id, s.snap_date, s.category,
                    SUM(CASE WHEN s.container THEN 0 ELSE 1 END) AS cnt,
@@ -2944,13 +3058,180 @@ def api_digest_test(pid):
 
 # ── Состояние проекта для писем: та же логика, что в интерфейсе (forecast.py)
 
+# ─── Кэш расчётов по версии данных проекта ───────────────────────
+# Выводы, сводка для писем и состав задач пересчитываются, только когда изменились данные проекта (замеры, эпики,
+# цели, настройки, срезы Jira, общий календарь) или наступил новый день. Версия — отпечаток этих данных; результаты
+# Монте-Карло дополнительно хранятся в базе (mc_cache) и общие для всех процессов.
+
+_RESULT_CACHE = {}
+_RESULT_CACHE_LIMIT = 512
+_cache_lock = threading.Lock()
+
+
+def project_version(db, pid):
+    """Отпечаток данных проекта, от которых зависят расчёты (несколько быстрых запросов по индексам).
+    Все правки проекта пишутся в журнал изменений, срезы Jira только добавляются (AUTOINCREMENT), поэтому
+    достаточно последних id, агрегатов замеров и строк эпиков, целей, настроек и общего календаря."""
+    head = db.execute(
+        """SELECT (SELECT COALESCE(MAX(id), 0) FROM audit_log WHERE project_id = :p),
+                  (SELECT COALESCE(MAX(m), 0) FROM (SELECT (SELECT MAX(j.id) FROM jira_issue_snapshots j
+                                                          WHERE j.service_id = s.id) AS m
+                                                  FROM services s WHERE s.project_id = :p)),
+                  (SELECT COUNT(*) || ':' || COALESCE(MAX(e.id), 0) || ':' || TOTAL(e.remaining) || ':'
+                          || TOTAL(e.spent) || ':' || TOTAL(e.estimate)
+                   FROM entries e JOIN services s ON s.id = e.service_id WHERE s.project_id = :p),
+                  (SELECT value FROM app_settings WHERE key = 'org_calendar')""", {'p': pid}).fetchone()
+    parts = [tuple(head)]
+    for sql in ('SELECT * FROM projects WHERE id = ?', 'SELECT * FROM settings WHERE project_id = ?',
+                'SELECT * FROM services WHERE project_id = ? ORDER BY id',
+                'SELECT * FROM stage_targets WHERE project_id = ? ORDER BY id'):
+        parts.append([tuple(r) for r in db.execute(sql, (pid,))])
+    return hashlib.sha1(repr(parts).encode('utf-8')).hexdigest()
+
+
+_compute_locks = {}
+SHARED_RESULTS = {'insights', 'overview'}  # эти расчёты хранятся и в базе — общие для воркеров gunicorn
+
+
+def _shared_result_get(kind, key, version):
+    try:
+        row = _mc_connection().execute('SELECT value FROM result_cache WHERE kind = ? AND key = ? AND version = ?',
+                                       (kind, repr(key), version)).fetchone()
+        return json.loads(row[0]) if row else None
+    except (sqlite3.Error, ValueError):
+        return None
+
+
+def _shared_result_put(kind, key, version, value):
+    try:
+        conn = _mc_connection()
+        conn.execute('INSERT OR REPLACE INTO result_cache (kind, key, version, value, created_at) VALUES (?, ?, ?, ?, ?)',
+                     (kind, repr(key), version, json.dumps(value), _utc_now_iso()))
+        conn.commit()
+    except (sqlite3.Error, TypeError, ValueError):  # база занята — результат остаётся в кэше процесса
+        pass
+_PAYLOAD_CACHE = {}  # (вид, проект) → (ETag, JSON, JSON в gzip | None): готовые ответы самых тяжёлых запросов
+_PAYLOAD_CACHE_LIMIT = 48
+_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
+
+
+def versioned_json(kind, pid, build, extra='', version=None):
+    """JSON-ответ с ETag по версии данных проекта (version — своя версия, если ответ зависит от части данных).
+    Совпал ETag из запроса браузера — 304 без расчёта и сериализации; иначе — готовый (в том числе сжатый)
+    ответ из кэша процесса или собранный build()."""
+    tag = '|'.join((kind, str(pid), datetime.now().date().isoformat(), APP_VERSION, str(extra),
+                    version or project_version(get_db(), pid)))
+    etag = 'W/"' + hashlib.blake2b(tag.encode('utf-8'), digest_size=12).hexdigest() + '"'
+    headers = {'ETag': etag, 'Cache-Control': 'private, no-cache'}
+    if _etag_matches(request.headers.get('If-None-Match'), etag):
+        return app.response_class(status=304, headers=headers)
+    with _cache_lock:
+        hit = _PAYLOAD_CACHE.get((kind, pid))
+    if hit and hit[0] == etag:
+        body, gz = hit[1], hit[2]
+    else:
+        body, gz = jsonify(build()).get_data(), None
+    wants_gzip = 'gzip' in (request.headers.get('Accept-Encoding') or '').lower() and len(body) >= COMPRESS_MIN_BYTES
+    if wants_gzip and gz is None:
+        gz = gzip.compress(body, compresslevel=5)
+    if len(body) <= _PAYLOAD_MAX_BYTES:
+        with _cache_lock:
+            if len(_PAYLOAD_CACHE) >= _PAYLOAD_CACHE_LIMIT:
+                _PAYLOAD_CACHE.clear()
+            _PAYLOAD_CACHE[(kind, pid)] = (etag, body, gz)
+    resp = app.response_class(gz if wants_gzip else body, mimetype='application/json', headers=headers)
+    if wants_gzip:
+        resp.headers['Content-Encoding'] = 'gzip'
+    resp.vary.add('Accept-Encoding')
+    return resp
+
+
+def cached_result(kind, key, version, compute):
+    """Результат расчёта из кэша процесса или вычисленный заново; возвращается копия (её можно менять).
+    Одновременные запросы одного и того же расчёта ждут первый, а не считают его параллельно."""
+    cache_key = (kind, key)
+    with _cache_lock:
+        hit = _RESULT_CACHE.get(cache_key)
+        lock = _compute_locks.setdefault(cache_key, threading.Lock())
+    if hit and hit[0] == version:
+        return pickle.loads(hit[1])
+    shared = kind in SHARED_RESULTS
+    with lock:
+        with _cache_lock:
+            hit = _RESULT_CACHE.get(cache_key)
+        if hit and hit[0] == version:
+            return pickle.loads(hit[1])
+        value = _shared_result_get(kind, key, version) if shared else None
+        if value is None:
+            value = compute()
+            if shared:
+                _shared_result_put(kind, key, version, value)
+        with _cache_lock:
+            if len(_RESULT_CACHE) >= _RESULT_CACHE_LIMIT:
+                _RESULT_CACHE.clear()
+                _compute_locks.clear()
+            _RESULT_CACHE[cache_key] = (version, pickle.dumps(value, pickle.HIGHEST_PROTOCOL))
+    return value
+
+
+# Фоновый предрасчёт: после изменения данных проекта «Выводы» (и Монте-Карло эпиков в общем кэше базы)
+# пересчитываются заранее, чтобы следующий открывший дашборд или портфель получил их сразу.
+WARMUP_DELAY = 2  # с — серия правок подряд пересчитывается один раз
+_warm_pending = set()
+_warm_cond = threading.Condition()
+_warm_thread = None
+
+
+def schedule_warmup(pids):
+    global _warm_thread
+    if not pids or app.config.get('TESTING') or os.environ.get('BURNDOWN_WARMUP', '1') == '0':
+        return
+    with _warm_cond:
+        _warm_pending.update(pids)
+        if _warm_thread is None or not _warm_thread.is_alive():
+            _warm_thread = threading.Thread(target=_warm_loop, name='burndown-warmup', daemon=True)
+            _warm_thread.start()
+        _warm_cond.notify()
+
+
+def warm_projects(pids):
+    """Пересчитать «Выводы» проектов (ошибка одного проекта не мешает остальным)."""
+    done = 0
+    for pid in pids:
+        try:
+            with app.app_context():
+                db = get_db()
+                if db.execute('SELECT 1 FROM projects WHERE id = ?', (pid,)).fetchone():
+                    project_insights(db, pid)
+                    done += 1
+        except Exception:  # noqa: BLE001
+            logger.exception('warm-up of project %s failed', pid)
+    return done
+
+
+def _warm_loop():  # pragma: no cover — фоновый поток; логика — в warm_projects
+    while True:
+        with _warm_cond:
+            while not _warm_pending:
+                _warm_cond.wait()
+        time.sleep(WARMUP_DELAY)
+        with _warm_cond:
+            pids = sorted(_warm_pending)
+            _warm_pending.clear()
+        warm_projects(pids)
+
+
 def project_overview(db, pid, today=None):
+    today = today or datetime.now().date().isoformat()
+    return cached_result('overview', (pid, today), project_version(db, pid), lambda: _project_overview(db, pid, today))
+
+
+def _project_overview(db, pid, today=None):
     project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
     settings = project_settings(db, pid)
     services = db.execute('SELECT * FROM services WHERE project_id = ? AND NOT COALESCE(is_done, 0) '
                           'ORDER BY sort_order, id', (pid,)).fetchall()
-    rows = {s['id']: [dict(r) for r in db.execute('SELECT date, remaining, spent, estimate FROM entries WHERE '
-                                                  'service_id = ? ORDER BY date', (s['id'],))] for s in services}
+    rows = project_rows(db, pid, services)
     history, latest = jira_composition(db, pid)
     epics = []
     for s in services:
@@ -2991,6 +3272,18 @@ def digest_overview(db, pid, today=None):
     return ov
 
 
+def project_rows(db, pid, services):
+    """Замеры эпиков одним запросом → {id эпика: [{date, remaining, spent, estimate}] по датам}."""
+    rows = {s['id']: [] for s in services}
+    for r in db.execute('SELECT e.service_id, e.date, e.remaining, e.spent, e.estimate FROM entries e '
+                        'JOIN services s ON s.id = e.service_id WHERE s.project_id = ? ORDER BY e.service_id, e.date',
+                        (pid,)):
+        if r['service_id'] in rows:
+            rows[r['service_id']].append({'date': r['date'], 'remaining': r['remaining'], 'spent': r['spent'],
+                                          'estimate': r['estimate']})
+    return rows
+
+
 def _autofill_state(db, pid):
     return [{'button': b['name'], 'lastStatus': b['last_status'], 'lastMessage': b['last_message'],
              'lastRunAt': b['last_run_at']} for b in db.execute(
@@ -3001,14 +3294,19 @@ def _autofill_state(db, pid):
 
 def project_insights(db, pid, today=None):
     """«Выводы» по проекту (insights.py): эпики и этапы с драйверами прогноза и сводка для руководителя.
-    Учитываются несданные эпики; today — дата, относительно которой оценивается свежесть данных и прошедшие цели."""
+    Учитываются несданные эпики; today — дата, относительно которой оценивается свежесть данных и прошедшие цели.
+    Результат кэшируется до изменения данных проекта или наступления нового дня."""
+    today = today or datetime.now().date().isoformat()
+    return cached_result('insights', (pid, today), project_version(db, pid), lambda: _project_insights(db, pid, today))
+
+
+def _project_insights(db, pid, today=None):
     project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
     settings = project_settings(db, pid)
     today = today or datetime.now().date().isoformat()
     services = db.execute('SELECT * FROM services WHERE project_id = ? AND NOT COALESCE(is_done, 0) '
                           'ORDER BY sort_order, id', (pid,)).fetchall()
-    rows = {s['id']: [dict(r) for r in db.execute('SELECT date, remaining, spent, estimate FROM entries WHERE '
-                                                  'service_id = ? ORDER BY date', (s['id'],))] for s in services}
+    rows = project_rows(db, pid, services)
     history, latest = jira_composition(db, pid)
     epics, by_id, groups = [], {}, {}
     for s in services:
@@ -3046,7 +3344,7 @@ def api_project_insights(pid):
     db = get_db()
     if not db.execute('SELECT 1 FROM projects WHERE id = ?', (pid,)).fetchone():
         return jsonify({'error': 'Проект не найден'}), 404
-    return jsonify(project_insights(db, pid))
+    return versioned_json('insights', pid, lambda: project_insights(db, pid))
 
 
 def accessible_projects(db, uid):
@@ -3402,6 +3700,8 @@ def deliver_outbox():
     db.execute("DELETE FROM notification_outbox WHERE status != 'pending' AND created_at < ?",
                ((now - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S'),))
     db.execute('DELETE FROM notification_log WHERE created_at < ?', ((now - timedelta(days=365)).strftime('%Y-%m-%d %H:%M:%S'),))
+    db.execute('DELETE FROM mc_cache WHERE created_at < ?', ((now - timedelta(days=60)).strftime('%Y-%m-%d %H:%M:%S'),))
+    db.execute('DELETE FROM result_cache WHERE created_at < ?', ((now - timedelta(days=2)).strftime('%Y-%m-%d %H:%M:%S'),))
     db.commit()
     for item in db.execute("SELECT * FROM notification_outbox WHERE status = 'pending' ORDER BY id").fetchall():
         claimed = db.execute("UPDATE notification_outbox SET status = 'sending' WHERE id = ? AND status = 'pending'",

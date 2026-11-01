@@ -286,6 +286,11 @@ def create_indexes(conn):
     conn.execute('DROP INDEX IF EXISTS idx_entries_service_date')  # заменён уникальным
     conn.execute('CREATE INDEX IF NOT EXISTS idx_services_project ON services(project_id)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_audit_project ON audit_log(project_id)')
+    # 1.9.0: быстрый отпечаток данных проекта (последний срез эпика) и кэш Монте-Карло, общий для процессов
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_jira_issue_snapshots_id ON jira_issue_snapshots(service_id, id)')
+    conn.execute('CREATE TABLE IF NOT EXISTS mc_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at TEXT)')
+    conn.execute('CREATE TABLE IF NOT EXISTS result_cache (kind TEXT NOT NULL, key TEXT NOT NULL, version TEXT NOT NULL, '
+                 'value TEXT NOT NULL, created_at TEXT, PRIMARY KEY (kind, key))')
 
 
 def init_db():

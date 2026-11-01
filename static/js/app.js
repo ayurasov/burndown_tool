@@ -232,8 +232,20 @@ function getCss(varName){
 function colorPalette(){
   return [getCss('--color-primary'), getCss('--color-blue'), getCss('--color-orange'), getCss('--color-error'), getCss('--color-success'), getCss('--color-warning')];
 }
+/* номер дня даты ГГГГ-ММ-ДД (дни от 1970-01-01, UTC); разбор даты запоминается — расчёты прогноза обращаются
+   к одним и тем же датам тысячи раз */
+var dayNumCache = new Map();
+function isoOrdinal(d){
+  var v = dayNumCache.get(d);
+  if(v === undefined){
+    v = Math.round(Date.parse(d + 'T00:00:00Z') / 86400000);
+    if(dayNumCache.size > 50000) dayNumCache.clear();
+    dayNumCache.set(d, v);
+  }
+  return v;
+}
 function daysBetween(d1, d2){
-  return Math.round((Date.parse(d2 + 'T00:00:00Z') - Date.parse(d1 + 'T00:00:00Z')) / 86400000);
+  return isoOrdinal(d2) - isoOrdinal(d1);
 }
 function addDays(dateStr, days){
   var d = new Date(dateStr + 'T00:00:00Z');
@@ -246,7 +258,6 @@ function addDays(dateStr, days){
 var MC_HORIZON_WORKDAYS = 3 * 261;
 var CALENDAR_DAYS = {workdays: false, signature: '', horizon: 3 * 365, span: daysBetween, shift: addDays};
 var calCache = {key: null, cal: null};
-function isoOrdinal(d){ return Math.round(Date.parse(d + 'T00:00:00Z') / 86400000); }
 function ordinalIso(o){ return new Date(o * 86400000).toISOString().slice(0, 10); }
 function workCalendar(){
   var st = STATE.settings || {};
@@ -518,12 +529,27 @@ function hashString(str){
   for(var i = 0; i < str.length; i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
   return h >>> 0;
 }
-function burnIntervals(pts){
-  var list = [], cal = workCalendar();
+/* Частые замеры (ежедневное автозаполнение) — недельными блоками, как block_points в forecast.py: сценарии опираются
+   на недельный темп, а не на дневной шум, и считаются в разы быстрее */
+var MC_BLOCK_AFTER = 30;
+function rawIntervals(pts, cal){
+  var list = [];
   for(var i = 1; i < pts.length; i++){
     var len = cal.span(pts[i-1].d, pts[i].d);
     if(len > 0) list.push({end: pts[i].d, len: len, rate: (pts[i-1].y - pts[i].y) / len});
   }
+  return list;
+}
+function blockPoints(pts, cal){
+  var block = cal.workdays ? 5 : 7, out = [pts[0]];
+  for(var i = 1; i < pts.length; i++) if(cal.span(out[out.length-1].d, pts[i].d) >= block) out.push(pts[i]);
+  if(out[out.length-1] !== pts[pts.length-1]) out.push(pts[pts.length-1]);
+  return out;
+}
+function burnIntervals(pts){
+  var cal = workCalendar();
+  var list = rawIntervals(pts, cal);
+  if(list.length > MC_BLOCK_AFTER) list = rawIntervals(blockPoints(pts, cal), cal);
   if(STATE.settings && STATE.settings.burnrateMethod === 'rolling' && list.length){
     var cutoff = addDays(pts[pts.length-1].d, -(STATE.settings.burnrateWindowDays || 14));
     var windowed = list.filter(function(it){ return it.end > cutoff; });
@@ -558,20 +584,24 @@ function monteCarloForecast(dates, remainingVals, targetDate){
     res = {lo: doneDate, p50: doneDate, hi: doneDate, confidence: confidence,
            probability: targetDate ? (doneDate <= targetDate ? 1 : 0) : null, intervals: intervals.length};
   } else {
-    var total = intervals.reduce(function(sum, it){ return sum + it.len; }, 0);
+    var cum = [], total = 0, maxRate = -Infinity, maxLen = 0;
+    intervals.forEach(function(it){ total += it.len; cum.push(total); if(it.rate > maxRate) maxRate = it.rate; if(it.len > maxLen) maxLen = it.len; });
     var rnd = seededRandom(hashString(key));
     var days = [];
-    for(var r = 0; r < MC_RUNS; r++){
+    for(var r = 0; r < (maxRate > 0 ? MC_RUNS : 0); r++){  /* нигде не сгорало — ни один сценарий не завершится */
       var rem = last.y, day = 0;
       while(day < cal.horizon){
-        var pick = rnd() * total, it = intervals[0];
-        for(var k = 0; k < intervals.length; k++){ pick -= intervals[k].len; if(pick <= 0){ it = intervals[k]; break; } }
+        if(rem > maxRate * (cal.horizon - day + maxLen)) break;  /* уже не успеть до горизонта даже на самой высокой скорости */
+        var pick = rnd() * total, lo = 0, hi = cum.length - 1;
+        while(lo < hi){ var mid = (lo + hi) >> 1; if(cum[mid] < pick) lo = mid + 1; else hi = mid; }  /* с весом по длине */
+        var it = intervals[lo];
         if(it.rate > 0 && rem <= it.rate * it.len){ day += rem / it.rate; rem = 0; break; }
         rem -= it.rate * it.len;
         day += it.len;
       }
       days.push(rem <= 0 ? day : Infinity);
     }
+    if(maxRate <= 0) for(var z = 0; z < MC_RUNS; z++) days.push(Infinity);
     days.sort(function(a, b){ return a - b; });
     var at = function(qq){ var d = days[Math.floor(qq * (days.length - 1))]; return isFinite(d) ? cal.shift(last.d, Math.ceil(d)) : null; };
     var probability = null;
@@ -721,6 +751,29 @@ function destroyChart(key){ if(charts[key]){ charts[key].destroy(); delete chart
 function destroyChartsByPrefix(prefix){
   Object.keys(charts).forEach(function(k){ if(k.indexOf(prefix) === 0){ charts[k].destroy(); delete charts[k]; } });
 }
+
+/* Плотные данные (ежедневные замеры за месяцы, десятки эпиков): без анимации и маркеров точек — Chart.js тогда
+   использует общие параметры элементов и рисует график в разы быстрее; при наведении точка по-прежнему видна */
+var DENSE_SERIES_POINTS = 60, DENSE_CHART_POINTS = 1200;
+function tuneChartConfig(cfg){
+  var datasets = (cfg.data && cfg.data.datasets) || [], total = 0;
+  datasets.forEach(function(ds){
+    var n = (ds.data || []).length;
+    total += n;
+    if(n > DENSE_SERIES_POINTS && !ds.isRange && !ds.isEpicTarget){
+      ds.pointRadius = 0;
+      ds.pointHoverRadius = Math.max(3, ds.pointHoverRadius || 0);
+      ds.tension = 0;
+      delete ds.cubicInterpolationMode;
+    }
+  });
+  if(total > DENSE_CHART_POINTS){
+    cfg.options = cfg.options || {};
+    cfg.options.animation = false;
+  }
+  return cfg;
+}
+function makeChart(el, cfg){ return new Chart(el, tuneChartConfig(cfg)); }
 
 function baseChartOptions(yTitle, extraTooltipCtx){
   var opts = {
@@ -946,7 +999,7 @@ function renderEpicRemainingChart(){
   renderLegend('legendRemaining', datasets);
   var ctx = document.getElementById('chartRemaining');
   var tooltipCtx = { avgPts: avgPts, forecastPts: fcData };
-  charts.epicRemaining = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle('ост. время'), tooltipCtx)});
+  charts.epicRemaining = makeChart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle('ост. время'), tooltipCtx)});
 }
 
 function renderEpicSpentChart(){
@@ -963,7 +1016,7 @@ function renderEpicSpentChart(){
   var datasets = [{ label: svc ? svc.name : '', data: data, borderColor: palette[1], backgroundColor: palette[1]+'33', spanGaps:true, tension:0.25, cubicInterpolationMode:'monotone', pointRadius:3, borderWidth:2 }];
   renderLegend('legendSpentEpic', datasets);
   var ctx = document.getElementById('chartSpentEpic');
-  charts.epicSpent = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle())});
+  charts.epicSpent = makeChart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle())});
 }
 
 function renderEpicEstimateChart(){
@@ -980,7 +1033,7 @@ function renderEpicEstimateChart(){
   var datasets = [{ label: svc ? svc.name : '', data: data, borderColor: palette[2], backgroundColor: palette[2]+'33', spanGaps:true, tension:0.25, cubicInterpolationMode:'monotone', pointRadius:3, borderWidth:2 }];
   renderLegend('legendEstimateEpic', datasets);
   var ctx = document.getElementById('chartEstimateEpic');
-  charts.epicEstimate = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle())});
+  charts.epicEstimate = makeChart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle())});
 }
 
 var allEpicsBlock = document.getElementById('allEpicsBlock');
@@ -1002,7 +1055,7 @@ function renderAllEpicsCharts(){
     if(setChartEmpty(c[2], empty)){ document.getElementById(c[3]).innerHTML = ''; return; }
     var datasets = buildDatasetsForMetric(c[0], ids);
     renderLegend(c[3], datasets);
-    charts[c[1]] = new Chart(document.getElementById(c[2]), {type:'line', data:{datasets:datasets}, options: baseChartOptions(c[4])});
+    charts[c[1]] = makeChart(document.getElementById(c[2]), {type:'line', data:{datasets:datasets}, options: baseChartOptions(c[4])});
   });
 }
 
@@ -1338,7 +1391,7 @@ function renderStageCharts(){
 
     renderLegend('legendStage_'+safeId, datasets);
     var tooltipCtx = { avgPts: avgPts, forecastPts: fcData };
-    charts['stage_'+safeId] = new Chart(canvas, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle('суммарный остаток'), tooltipCtx), plugins:[epicTargetLabelPlugin]});
+    charts['stage_'+safeId] = makeChart(canvas, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle('суммарный остаток'), tooltipCtx), plugins:[epicTargetLabelPlugin]});
   });
 }
 
@@ -3246,7 +3299,7 @@ function drawBurnup(key, canvasId, legendId, noteId, hist){
     var raw = ctx.raw || {};
     return raw.count !== undefined ? 'Задач готово: ' + raw.count + ' из ' + raw.total : 'Задач: ' + raw.total;
   };
-  charts[key] = new Chart(document.getElementById(canvasId), {type: 'line', data: {datasets: datasets}, options: opts});
+  charts[key] = makeChart(document.getElementById(canvasId), {type: 'line', data: {datasets: datasets}, options: opts});
 }
 
 function renderBurnupChart(){
@@ -3259,18 +3312,30 @@ function renderBurnupChart(){
 }
 
 /* ── Дрейф прогноза: какой была прогнозная дата завершения на каждую дату замера ── */
+var DRIFT_MAX_POINTS = 90;
 function forecastDrift(sid){
   var svc = serviceById(sid);
   var rows = entriesForService(sid).filter(function(r){ return isNum(r.remaining); });
   if(rows.length < 2) return null;
   var target = svc ? svc.targetDate || null : null;
   var points = [];
-  for(var i = 1; i < rows.length; i++){
+  /* при длинной истории — не больше DRIFT_MAX_POINTS дат (равномерно), последние две — всегда: прогноз
+     пересчитывается на каждую дату, и при ежедневных замерах за год это сотни расчётов Монте-Карло */
+  var idx = [];
+  for(var i = 1; i < rows.length; i++) idx.push(i);
+  if(idx.length > DRIFT_MAX_POINTS){
+    var step = (rows.length - 3) / (DRIFT_MAX_POINTS - 2), picked = {};
+    idx = [];
+    for(var k = 0; k < DRIFT_MAX_POINTS - 2; k++) picked[1 + Math.round(k * step)] = true;
+    picked[rows.length - 2] = true; picked[rows.length - 1] = true;
+    idx = Object.keys(picked).map(Number).sort(function(a, b){ return a - b; });
+  }
+  idx.forEach(function(i){
     var sub = rows.slice(0, i + 1);
     var st = computeStatus(sub.map(function(r){ return r.date; }), sub.map(function(r){ return r.remaining; }), target);
     points.push({date: rows[i].date, forecast: st.forecastZeroDate, noBurn: st.noBurn,
                  lo: st.mc ? st.mc.lo : null, p50: st.mc ? st.mc.p50 : null, hi: st.mc ? st.mc.hi : null});
-  }
+  });
   return {points: points, target: target};
 }
 function driftShiftText(from, to, since){
@@ -3326,7 +3391,7 @@ function renderDriftChart(){
   datasets.forEach(function(d){ d.data.forEach(function(p){ if(p.y) ys.push(p.y); }); });
   ys.sort();
   var yMin = ys.length ? addDays(ys[0], -3) : undefined, yMax = ys.length ? addDays(ys[ys.length-1], 3) : undefined;
-  charts.epicDrift = new Chart(document.getElementById('chartDrift'), {type: 'line', data: {datasets: datasets}, options: {
+  charts.epicDrift = makeChart(document.getElementById('chartDrift'), {type: 'line', data: {datasets: datasets}, options: {
     responsive: true, maintainAspectRatio: false, spanGaps: false,
     interaction: {mode: 'nearest', axis: 'x', intersect: false},
     plugins: {legend: {display: false}, tooltip: {
@@ -3471,7 +3536,7 @@ function renderScopeWaterfall(c){
   });
   steps.push(['Объём ' + fmtShortDate(c.to), 0, c.scopeTo, 'base']);
   var colors = {base: getCss('--color-blue'), up: getCss('--color-orange'), down: getCss('--color-success')};
-  charts.scopeChanges = new Chart(document.getElementById('chartScopeChanges'), {
+  charts.scopeChanges = makeChart(document.getElementById('chartScopeChanges'), {
     type: 'bar',
     data: {labels: steps.map(function(st){ return st[0]; }),
            datasets: [{data: steps.map(function(st){ return [Math.min(st[1], st[2]), Math.max(st[1], st[2])]; }),
