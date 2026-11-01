@@ -106,14 +106,14 @@ def demo_jira(step=3):
     fake_jira.FORMULA = ','.join(formula)
     fake_jira.STRUCTURES = [{'id': 7, 'name': 'АИСУЗ — релиз 4.0'}, {'id': 8, 'name': 'Портфель проектов 2026'},
                             {'id': 9, 'name': 'Бэклог сопровождения'}]
-    fake_jira.FIELDS = fake_jira.FIELDS[:5] + [
+    fake_jira.FIELDS = fake_jira.FIELDS[:6] + [
         {'id': 'customfield_10051', 'name': 'Трудозатраты по плану, ч', 'custom': True, 'schema': {'type': 'number'}},
         {'id': 'customfield_10016', 'name': 'Story Points', 'custom': True, 'schema': {'type': 'number'}},
         # поля для записи прогноза Burndown в задачи эпиков
         {'id': 'customfield_10100', 'name': 'Прогноз Burndown', 'custom': True, 'schema': {'type': 'date'}},
         {'id': 'customfield_10101', 'name': 'Статус сроков', 'custom': True, 'schema': {'type': 'option'}},
         {'id': 'customfield_10102', 'name': 'Шанс успеть, %', 'custom': True, 'schema': {'type': 'number'}}]
-    fake_jira.FIELDS[4] = dict(fake_jira.FIELDS[4], name='Трудозатраты, чел.-дни')
+    fake_jira.FIELDS[5] = dict(fake_jira.FIELDS[5], name='Трудозатраты, чел.-дни')
 
 
 def jira_history(api, base, jira_url):
@@ -425,9 +425,10 @@ def main():
         shot(pg.locator('#confirmModal .jira-fields'), 'user/27-jira-fields.png')
         # колонка Structure: формула с суммой по вложенным и проверка значений на эпиках
         pg.select_option('#jbSrc_remaining', 'structure')
-        pg.wait_for_selector('#jbStrPaste')
+        pg.wait_for_selector('#jbStrPaste', state='attached')
         pg.check('input[name="jbStrMode"][value="formula"]')
-        pg.fill('#jbStrFormulaText', 'SUM{remaining}')
+        pg.fill('#jbStrFormulaText', 'WITH rest = orig - spent :\nif (rest < 0 OR (status != "Открыта" AND status != "В работе"), 0, rest)')
+        pg.wait_for_selector('#jbStrVars [data-var="status"]')
         pg.select_option('#jbStrUnit_remaining', 'ms')
         pg.click('#jbStrCheck')
         pg.wait_for_selector('#jbStrPreview table')

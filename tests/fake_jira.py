@@ -35,6 +35,7 @@ ISSUES = {
 }
 FIELDS = [
     {'id': 'summary', 'name': 'Тема', 'custom': False, 'schema': {'type': 'string'}},
+    {'id': 'status', 'name': 'Статус', 'custom': False, 'schema': {'type': 'status'}},
     {'id': 'timeestimate', 'name': 'Remaining Estimate', 'custom': False, 'schema': {'type': 'number'}},
     {'id': 'timespent', 'name': 'Time Spent', 'custom': False, 'schema': {'type': 'number'}},
     {'id': 'timeoriginalestimate', 'name': 'Original Estimate', 'custom': False, 'schema': {'type': 'number'}},
@@ -109,17 +110,67 @@ TIME_FIELD_IDS = ('timeestimate', 'timespent', 'timeoriginalestimate')
 _OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv}
 
 
-def _forest():
-    """[(rowId, depth, issueId|None)] по формуле структуры."""
+def _forest(transformations=None):
+    """[(rowId, depth, issueId|None)] по формуле структуры; transformations — фильтры доски (forestSpec)."""
     out = []
     for part in FORMULA.split(','):
         row, depth, item = part.split(':')[:3]
         out.append((int(row), int(depth), int(item) if item.isdigit() else None))
+    for tf in transformations or []:
+        if tf.get('module') != FILTER_JQL:
+            raise ValueError('transformation')
+        out = _filter_forest(out, (tf.get('params') or {}).get('jql') or '', bool((tf.get('params') or {}).get('showSubItems')))
     return out
 
 
-def _subtree(row_id):
-    rows = _forest()
+FILTER_JQL = 'com.almworks.jira.structure:filter-jql'
+
+
+def _jql_match(jql, issue):
+    """Учебный JQL фильтра: status / statusCategory / key, операторы = != in (…) not in (…), связки AND / OR."""
+    data = ISSUES.get(issue)
+    if data is None or data.get('hidden'):
+        return False
+    values = {'status': STATUS_NAMES[data.get('category') or 'new'].lower(), 'key': data['key'].lower(),
+              'statuscategory': {'new': 'to do', 'indeterminate': 'in progress', 'done': 'done'}[data.get('category') or 'new']}
+    token = r'"[^"]*"|\'[^\']*\'|[^\s,()]+'
+
+    def clean(v):
+        return v.strip().strip('"').strip("'").lower()
+
+    def cond(text):
+        m = re.fullmatch(r'\s*(\w+)\s*(not\s+in|in|!=|=)\s*(\(.*\)|' + token + r')\s*', text, re.I)
+        if not m:
+            raise ValueError('jql')
+        field, op, value = m.group(1).lower(), re.sub(r'\s+', ' ', m.group(2).lower()), m.group(3)
+        options = [clean(v) for v in re.findall(token, value.strip('()'))] if op in ('in', 'not in') else [clean(value)]
+        hit = values.get(field) in options
+        return not hit if op in ('!=', 'not in') else hit
+    return any(all(cond(c) for c in re.split(r'\s+AND\s+', part, flags=re.I)) for part in re.split(r'\s+OR\s+', jql, flags=re.I))
+
+
+def _filter_forest(rows, jql, show_sub_items):
+    """Фильтр доски Structure: остаются совпавшие задачи и их родители (с showSubItems — и вложенные в совпавшие)."""
+    keep = set()
+    for i, (rid, depth, item) in enumerate(rows):
+        if item is None or not _jql_match(jql, item):
+            continue
+        keep.add(rid)
+        d = depth
+        for prid, pdepth, _pitem in reversed(rows[:i]):  # родители
+            if pdepth < d:
+                keep.add(prid)
+                d = pdepth
+        if show_sub_items:
+            for crid, cdepth, _citem in rows[i + 1:]:
+                if cdepth <= depth:
+                    break
+                keep.add(crid)
+    return [r for r in rows if r[0] in keep]
+
+
+def _subtree(row_id, forest=None):
+    rows = forest if forest is not None else _forest()
     for i, (rid, depth, _item) in enumerate(rows):
         if rid == row_id:
             out = [rid]
@@ -131,47 +182,191 @@ def _subtree(row_id):
     return []
 
 
-def _attr_value(spec, row_id):
+def _attr_value(spec, row_id, forest=None):
     """Значение колонки Structure у строки, как считает учебный Structure: поле (длительности — в миллисекундах,
-    как в Structure), сумма по поддереву (sum) и простая формула (expr: + − × ÷, переменные, SUM{переменная})."""
-    item = {rid: it for rid, _d, it in _forest()}.get(row_id)
+    как в Structure; пользовательское поле — {"id": "customfield", "params": {"fieldId": N}}), статус — его название,
+    сумма по поддереву (sum — с дубликатами) и формула (expr) на языке Structure — см. _Expr."""
+    forest = forest if forest is not None else _forest()
+    item = {rid: it for rid, _d, it in forest}.get(row_id)
     data = ISSUES.get(item) if item else None
     attr = spec.get('id')
     params = spec.get('params') or {}
     if attr == 'sum':
         inner = params.get('attribute') or params.get('value')
-        vals = [_attr_value(inner, r) for r in _subtree(row_id)]
-        nums = [v for v in vals if isinstance(v, (int, float))]
+        vals = [_attr_value(inner, r, forest) for r in _subtree(row_id, forest)]
+        nums = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
         return sum(nums) if nums else None
     if attr == 'expr':
-        variables = params.get('variables') or {}
-        formula = params.get('formula') or ''
-
-        def sum_var(match):
-            vals = [_attr_value(variables[match.group(1)], r) for r in _subtree(row_id)]
-            return str(sum(v for v in vals if isinstance(v, (int, float))))
-        formula = re.sub(r'SUM\{\s*(\w+)\s*\}', sum_var, formula)
-
-        def ev(node):
-            if isinstance(node, ast.Expression):
-                return ev(node.body)
-            if isinstance(node, ast.Constant):
-                return node.value
-            if isinstance(node, ast.Name):
-                value = _attr_value(variables[node.id], row_id) if node.id in variables else None
-                return value or 0
-            if isinstance(node, ast.BinOp):
-                return _OPS[type(node.op)](ev(node.left), ev(node.right))
-            raise ValueError('formula')
-        return ev(ast.parse(formula, mode='eval'))
+        return _Expr(params.get('formula') or '', params.get('variables') or {}).value(row_id, forest)
+    if attr == 'customfield':
+        attr = f"customfield_{params['fieldId']}"
     if data is None or data.get('hidden'):
         return None
+    if attr == 'status':
+        return STATUS_NAMES[data.get('category') or 'new']
     if attr not in FIELD_IDS:
         raise KeyError(attr)
     value = data.get(attr)
     if attr in TIME_FIELD_IDS and value is not None:
         return value * 1000
     return value
+
+
+class _Expr:
+    """Учебный вычислитель языка формул Structure (Expr): числа, строки, переменные, WITH имя = … : …,
+    if(условие, да, нет), + − × ÷, сравнения (= != < > <= >=), AND / OR / NOT, скобки и агрегаты SUM{…}
+    (дубликаты — одна и та же задача в поддереве — не считаются) и SUM#all{…} (считаются)."""
+    TOKEN = re.compile(r'\s*(?:(\d+(?:\.\d+)?)|"([^"]*)"|\'([^\']*)\'|(SUM#all|[A-Za-z_][A-Za-z0-9_]*)|(<=|>=|!=|[-+*/<>=(),:{}]))')
+
+    def __init__(self, formula, variables):
+        self.variables, self.tokens, pos = variables, [], 0
+        formula = formula.strip()
+        while pos < len(formula):
+            m = self.TOKEN.match(formula, pos)
+            if not m or m.end() == pos:
+                raise ValueError('formula')
+            num, s1, s2, name, op = m.groups()
+            self.tokens.append(('num', float(num)) if num else ('str', s1 if s1 is not None else s2) if (s1 is not None or s2 is not None)
+                               else ('name', name) if name else ('op', op))
+            pos = m.end()
+        self.pos = 0
+        self.tree = self.with_expr()
+        if self.pos != len(self.tokens):
+            raise ValueError('formula')
+
+    # ── разбор в дерево
+    def peek(self, kind=None, value=None):
+        if self.pos >= len(self.tokens):
+            return None
+        tok = self.tokens[self.pos]
+        if kind and tok[0] != kind:
+            return None
+        if value is not None and (tok[1].upper() if tok[0] == 'name' else tok[1]) != value:
+            return None
+        return tok
+
+    def take(self, kind=None, value=None):
+        tok = self.peek(kind, value)
+        if tok is None:
+            raise ValueError('formula')
+        self.pos += 1
+        return tok
+
+    def with_expr(self):
+        if self.peek('name', 'WITH'):
+            self.take()
+            name = self.take('name')[1]
+            self.take('op', '=')
+            value = self.or_expr()
+            self.take('op', ':')
+            return ('with', name.lower(), value, self.with_expr())
+        return self.or_expr()
+
+    def binary(self, sub, ops, kind='op'):
+        node = sub()
+        while self.peek(kind) and (self.tokens[self.pos][1].upper() if kind == 'name' else self.tokens[self.pos][1]) in ops:
+            op = self.take()[1].upper()
+            node = (op, node, sub())
+        return node
+
+    def or_expr(self):
+        return self.binary(self.and_expr, ('OR',), 'name')
+
+    def and_expr(self):
+        return self.binary(self.not_expr, ('AND',), 'name')
+
+    def not_expr(self):
+        if self.peek('name', 'NOT'):
+            self.take()
+            return ('NOT', self.not_expr())
+        return self.binary(self.add, ('=', '!=', '<', '>', '<=', '>='))
+
+    def add(self):
+        return self.binary(self.mul, ('+', '-'))
+
+    def mul(self):
+        return self.binary(self.unary, ('*', '/'))
+
+    def unary(self):
+        if self.peek('op', '-'):
+            self.take()
+            return ('neg', self.unary())
+        return self.primary()
+
+    def primary(self):
+        tok = self.take()
+        if tok[0] in ('num', 'str'):
+            return ('const', tok[1])
+        if tok == ('op', '('):
+            node = self.with_expr()
+            self.take('op', ')')
+            return node
+        if tok[0] != 'name':
+            raise ValueError('formula')
+        name = tok[1]
+        if name.upper() in ('SUM', 'SUM#ALL') and self.peek('op', '{'):
+            self.take()
+            body = self.with_expr()
+            self.take('op', '}')
+            return ('sum', name.upper() == 'SUM#ALL', body)
+        if self.peek('op', '('):
+            self.take()
+            args = [self.with_expr()]
+            while self.peek('op', ','):
+                self.take()
+                args.append(self.with_expr())
+            self.take('op', ')')
+            if name.lower() != 'if' or len(args) != 3:
+                raise ValueError('formula')
+            return ('if', *args)
+        return ('var', name)
+
+    # ── вычисление
+    def value(self, row_id, forest):
+        self.forest = forest
+        return self.ev(self.tree, row_id, {})
+
+    def ev(self, node, row, local):
+        kind = node[0]
+        if kind == 'const':
+            return node[1]
+        if kind == 'var':
+            name = node[1]
+            if name.lower() in local:
+                return local[name.lower()]
+            if name not in self.variables:
+                raise KeyError(name)
+            return _attr_value(self.variables[name], row, self.forest)
+        if kind == 'with':
+            return self.ev(node[3], row, dict(local, **{node[1]: self.ev(node[2], row, local)}))
+        if kind == 'if':
+            return self.ev(node[2] if self.ev(node[1], row, local) else node[3], row, local)
+        if kind == 'sum':
+            total, seen = 0, set()
+            for r in _subtree(row, self.forest):
+                item = {rid: it for rid, _d, it in self.forest}.get(r)
+                if not node[1] and item is not None:
+                    if item in seen:
+                        continue  # та же задача в поддереве ещё раз — дубликат
+                    seen.add(item)
+                v = self.ev(node[2], r, local)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    total += v
+            return total
+        if kind == 'NOT':
+            return not self.ev(node[1], row, local)
+        if kind == 'neg':
+            return -(self.ev(node[1], row, local) or 0)
+        a, b = self.ev(node[1], row, local), self.ev(node[2], row, local)
+        if kind == 'AND':
+            return bool(a) and bool(b)
+        if kind == 'OR':
+            return bool(a) or bool(b)
+        if kind in ('=', '!='):
+            return (a == b) == (kind == '=')
+        a, b = a or 0, b or 0
+        return {'+': lambda: a + b, '-': lambda: a - b, '*': lambda: a * b, '/': lambda: a / b,
+                '<': lambda: a < b, '>': lambda: a > b, '<=': lambda: a <= b, '>=': lambda: a >= b}[kind]()
 
 
 FIELD_IDS = {'summary', 'timeestimate', 'timespent', 'timeoriginalestimate', 'customfield_10050', 'customfield_10060',
@@ -299,10 +494,16 @@ def create_app(state):
 
     @app.post('/rest/structure/2.0/forest/latest')
     def forest():
-        sid = request.get_json().get('structureId')
-        if sid != 7:
+        spec = request.get_json()
+        if spec.get('structureId') != 7:
             return jsonify({'message': 'structure not found'}), 404
-        return jsonify({'spec': {'structureId': 7}, 'formula': FORMULA,
+        state.setdefault('forest_specs', []).append(spec)
+        try:
+            rows = _forest(spec.get('transformations'))
+        except ValueError:
+            return jsonify({'errorMessages': ['Invalid transformation or JQL']}), 400
+        formula = ','.join(f"{r}:{d}:{it if it is not None else '5/9'}" for r, d, it in rows)
+        return jsonify({'spec': spec, 'formula': formula,
                         'itemTypes': {'5': 'com.almworks.jira.structure:type-folder'},
                         'version': {'signature': 1, 'version': 3}})
 
@@ -317,10 +518,15 @@ def create_app(state):
             if (req.get('forestSpec') or {}).get('structureId') != 7:
                 return jsonify({'message': 'structure not found'}), 404
             rows = req.get('rows') or []
+            try:
+                forest = _forest(req['forestSpec'].get('transformations'))
+            except ValueError:
+                return jsonify({'errorMessages': ['Invalid transformation or JQL']}), 400
+            present = {rid for rid, _d, _it in forest}
             data = []
             for spec in req.get('attributes') or []:
                 try:
-                    vals = [_attr_value(spec, r) for r in rows]
+                    vals = [_attr_value(spec, r, forest) if r in present else None for r in rows]
                 except (KeyError, ValueError, ZeroDivisionError):
                     return jsonify({'errorMessages': [f"Unknown attribute: {spec.get('id')}"]}), 400
                 data.append({'attribute': spec, 'values': vals, 'trailMode': 'INDEPENDENT', 'trails': ['' for _ in rows]})

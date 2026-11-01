@@ -104,6 +104,9 @@ def create_jira_tables(conn):
         conn.execute('ALTER TABLE jira_snapshot_buttons ADD COLUMN field_map TEXT')
     if 'last_success_at' not in cols:
         conn.execute('ALTER TABLE jira_snapshot_buttons ADD COLUMN last_success_at TEXT')
+    # 1.9.1: фильтр доски Structure — для колонок «После фильтрации»
+    if 'board_filter' not in cols:
+        conn.execute('ALTER TABLE jira_snapshot_buttons ADD COLUMN board_filter TEXT')
     # 1.8.0: синхронизация эпиков с Jira (настройки и итог последнего запуска)
     for col in ('epic_sync', 'epic_sync_at', 'epic_sync_message'):
         if col not in cols:

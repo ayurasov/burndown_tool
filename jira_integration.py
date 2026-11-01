@@ -230,6 +230,199 @@ def normalize_attribute(spec, depth=0):
     return out
 
 
+# ─── Колонка Structure по настройкам, как в редакторе колонки Structure ──
+# «Поле» или «Формула», «Σ по вложенным» (Sum over sub-items), «Исключить дубликаты» (Exclude duplicates).
+# Σ с исключением дубликатов — агрегатная функция языка Structure SUM{…} (дубликаты она по умолчанию не считает);
+# Σ с дубликатами — атрибут суммы sum (он, как колонка без «Exclude duplicates», считает строку столько раз, сколько
+# раз задача стоит в поддереве). Значения считаются по всей структуре — без временных фильтров представления.
+
+STRUCTURE_FORMATS = ('duration', 'number', 'text', 'time')
+EDITOR_MODES = ('field', 'formula')
+VARIABLE_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,63}$')
+FORMULA_MAX = 20000
+DURATION_FIELDS = {'timeestimate', 'timespent', 'timeoriginalestimate', 'aggregatetimeestimate', 'aggregatetimespent',
+                   'aggregatetimeoriginalestimate'}
+
+
+def field_spec(field_id, fmt):
+    """Поле Jira как атрибут Structure: пользовательское поле — {"id": "customfield", "params": {"fieldId": N}}."""
+    m = re.fullmatch(r'customfield_(\d+)', field_id)
+    if m:
+        return {'id': 'customfield', 'format': fmt, 'params': {'fieldId': int(m.group(1))}}
+    return {'id': field_id, 'format': fmt}
+
+
+def normalize_column_editor(raw):
+    """Настройки колонки из редактора Burndown → проверенный словарь (ValueError с понятным текстом)."""
+    if not isinstance(raw, dict) or raw.get('mode') not in EDITOR_MODES:
+        raise ValueError('Тип колонки Structure — «Поле» или «Формула»')
+
+    def variable(v, name):
+        if not isinstance(v, dict):
+            raise ValueError(f'Переменная «{name}»: выберите поле Jira')
+        field = (v.get('field') or '').strip()
+        if not field:
+            raise ValueError(f'Выберите поле Jira для переменной «{name}»')
+        if not FIELD_ID_RE.match(field):
+            raise ValueError(f'Переменная «{name}»: некорректное поле Jira {field}')
+        fmt = v.get('format') or 'number'
+        if fmt not in STRUCTURE_FORMATS:
+            raise ValueError(f'Переменная «{name}»: формат — длительность, число, текст или дата')
+        return {'field': field, 'format': fmt}
+    out = {'mode': raw['mode'], 'sum': bool(raw.get('sum')), 'distinct': bool(raw.get('distinct', True))}
+    if raw['mode'] == 'field':  # из редактора — field и format; сохранённые настройки — переменная value
+        saved = (raw.get('variables') or {}).get('value') if isinstance(raw.get('variables'), dict) else None
+        saved = saved if isinstance(saved, dict) else {}
+        out['variables'] = {'value': variable({'field': raw.get('field') or saved.get('field'),
+                                               'format': raw.get('format') or saved.get('format')}, 'поле')}
+        out['formula'] = 'value'
+        return out
+    formula = raw.get('formula')
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError('Введите формулу')
+    if len(formula) > FORMULA_MAX:
+        raise ValueError('Формула слишком большая')
+    variables = raw.get('variables')
+    variables = {} if variables is None else variables
+    if not isinstance(variables, dict) or len(variables) > 50:
+        raise ValueError('Переменные формулы — объект {имя: поле}')
+    out['formula'] = formula.strip()
+    out['variables'] = {}
+    for name, v in variables.items():
+        if not isinstance(name, str) or not VARIABLE_RE.match(name):
+            raise ValueError(f'Некорректное имя переменной: {name}')
+        out['variables'][name] = variable(v, name)
+    return out
+
+
+def _expr(formula, variables):
+    return {'id': 'expr', 'format': 'number',
+            'params': {'formula': formula, 'variables': {n: field_spec(v['field'], v['format']) for n, v in variables.items()}}}
+
+
+def column_variants(editor):
+    """Три варианта колонки для сверки: только сама задача, Σ без дубликатов, Σ с дубликатами."""
+    own = _expr(editor['formula'], editor['variables'])
+    return {'own': own,
+            'distinct': _expr('SUM{\n' + editor['formula'] + '\n}', editor['variables']),
+            'all': {'id': 'sum', 'format': 'number', 'params': {'attribute': own}}}
+
+
+def build_structure_attribute(editor):
+    """Спецификация атрибута для Value API по настройкам колонки (как их задают в Structure)."""
+    variants = column_variants(editor)
+    if not editor['sum']:
+        return variants['own']
+    return variants['distinct'] if editor['distinct'] else variants['all']
+
+
+def formula_fields(raw):
+    """Поля Jira для переменных формулы: [{id, name, format}] — учёт времени, статус, затем остальные по имени."""
+    out = []
+    for f in raw or []:
+        if not isinstance(f, dict) or not isinstance(f.get('id'), str) or not FIELD_ID_RE.match(f['id']):
+            continue
+        kind = (f.get('schema') or {}).get('type')
+        fmt = ('duration' if f['id'] in DURATION_FIELDS else 'number' if kind == 'number'
+               else 'time' if kind in ('date', 'datetime') else 'text')
+        out.append({'id': f['id'], 'name': TIME_FIELD_NAMES.get(f['id']) or str(f.get('name') or f['id']), 'format': fmt})
+    rank = {'timeoriginalestimate': 0, 'timespent': 1, 'timeestimate': 2, 'status': 3}
+    return sorted(out, key=lambda x: (rank.get(x['id'], 9), x['format'] != 'duration', x['name'].lower()))
+
+
+# ─── Фильтр доски Structure — для колонок «После фильтрации» (After filtering) ──
+# Колонка с «After filtering» в Structure суммирует только задачи, видимые с фильтром доски. Burndown повторяет это:
+# такие колонки запрашиваются у Structure с тем же фильтром (трансформация в forestSpec), остальные — по всей
+# структуре. Фильтр — JQL (модуль filter-jql, как фильтр на доске) или трансформации, скопированные из Structure.
+
+FILTER_JQL_MODULE = 'com.almworks.jira.structure:filter-jql'
+TRANSFORM_MODULE_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,100}:[A-Za-z0-9_.\-]{1,100}$')
+BOARD_FILTER_MODES = ('none', 'jql', 'json')
+
+
+def extract_transformations(data, depth=0):
+    """Трансформации из вставленного JSON: forestSpec, запрос value/forest из инструментов разработчика или список."""
+    if depth > 6:
+        return None
+    if isinstance(data, list):
+        if data and all(isinstance(t, dict) and 'module' in t for t in data):
+            return data
+        for item in data:
+            found = extract_transformations(item, depth + 1)
+            if found:
+                return found
+        return None
+    if not isinstance(data, dict):
+        return None
+    if isinstance(data.get('module'), str):
+        return [data]
+    if isinstance(data.get('transformations'), list) and data['transformations']:
+        return data['transformations']
+    for key in ('forestSpec', 'spec', 'requests', 'responses'):
+        if key in data:
+            found = extract_transformations(data[key], depth + 1)
+            if found:
+                return found
+    return None
+
+
+def normalize_board_filter(raw):
+    """Фильтр доски у кнопки → None (нет) | {'mode': 'jql', 'jql', 'showSubItems'} | {'mode': 'json', 'transformations'}."""
+    if not raw:
+        return None
+    if not isinstance(raw, dict) or (raw.get('mode') or 'none') not in BOARD_FILTER_MODES:
+        raise ValueError('Фильтр доски — JQL или трансформации из Structure (JSON)')
+    mode = raw.get('mode') or 'none'
+    if mode == 'none':
+        return None
+    if mode == 'jql':
+        jql = raw.get('jql')
+        if not isinstance(jql, str) or not jql.strip():
+            raise ValueError('Введите JQL фильтра доски — тот же, что на доске Structure')
+        if len(jql) > 5000:
+            raise ValueError('JQL фильтра доски слишком длинный')
+        return {'mode': 'jql', 'jql': jql.strip(), 'showSubItems': bool(raw.get('showSubItems'))}
+    data = raw.get('transformations')
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            raise ValueError('Трансформации доски — JSON из Structure (forestSpec или его transformations)')
+    found = extract_transformations(data)
+    if not found:
+        raise ValueError('В JSON не найдены трансформации доски (transformations с module)')
+    if len(found) > 10:
+        raise ValueError('Слишком много трансформаций доски')
+    out = []
+    for t in found:
+        module, params = t.get('module'), t.get('params', {})
+        if not isinstance(module, str) or not TRANSFORM_MODULE_RE.match(module) or not isinstance(params, (dict, type(None))):
+            raise ValueError('Некорректная трансформация доски: нужен module вида com.almworks.jira.structure:… и params')
+        out.append({'module': module, 'params': params or {}})
+    if len(json.dumps(out, ensure_ascii=False)) > ATTRIBUTE_MAX_JSON:
+        raise ValueError('Трансформации доски слишком большие')
+    return {'mode': 'json', 'transformations': out}
+
+
+def board_transformations(board_filter):
+    """Фильтр доски → трансформации для forestSpec (None — без фильтра)."""
+    if not board_filter:
+        return None
+    if board_filter['mode'] == 'jql':
+        params = {'jql': board_filter['jql']}
+        if board_filter.get('showSubItems'):
+            params['showSubItems'] = True
+        return [{'module': FILTER_JQL_MODULE, 'params': params}]
+    return board_filter['transformations']
+
+
+def forest_spec(structure_id, transformations=None):
+    spec = {'structureId': structure_id}
+    if transformations:
+        spec['transformations'] = transformations
+    return spec
+
+
 def normalize_field_map(raw):
     """Проверенное сопоставление метрик: {metric: {'field': id|'', 'unit', 'structure': None | {'attribute',
     'unit', 'label'}}}. field — поле Jira (сумма по задачам; для показателя из колонки Structure — для состава задач
@@ -257,8 +450,12 @@ def normalize_field_map(raw):
             if s_unit not in UNITS:
                 raise ValueError('Единица колонки Structure — миллисекунды, секунды, минуты, часы или дни')
             label = structure.get('label') if isinstance(structure.get('label'), str) else ''
-            structure = {'attribute': normalize_attribute(structure.get('attribute')), 'unit': s_unit,
-                         'label': label.strip()[:200]}
+            editor = normalize_column_editor(structure['editor']) if structure.get('editor') else None
+            attribute = build_structure_attribute(editor) if editor else normalize_attribute(structure.get('attribute'))
+            structure = {'attribute': attribute, 'unit': s_unit, 'label': label.strip()[:200],
+                         'afterFiltering': bool(structure.get('afterFiltering'))}
+            if editor:
+                structure['editor'] = editor
         out[metric] = {'field': field, 'unit': unit, 'structure': structure or None}
     if not any(v['field'] or v['structure'] for v in out.values()):
         raise ValueError('Сопоставьте с полями Jira или колонками Structure хотя бы одну метрику')
@@ -418,19 +615,20 @@ class JiraClient:
         return [{'id': s.get('id'), 'name': s.get('name') or f"Структура {s.get('id')}"}
                 for s in (data.get('structures') or []) if isinstance(s, dict) and isinstance(s.get('id'), int)]
 
-    def forest(self, structure_id):
-        """Строки структуры [(rowId, depth, issueId|None)]; за срез структура загружается один раз."""
+    def forest(self, structure_id, transformations=None):
+        """Строки структуры [(rowId, depth, issueId|None)], с фильтром доски — видимые с ним; за срез — один раз."""
         cache = self.__dict__.setdefault('_forests', {})
-        if structure_id not in cache:
-            data = self.json('POST', self.structure_api('forest/latest'), json={'structureId': structure_id},
+        key = (structure_id, json.dumps(transformations, sort_keys=True) if transformations else '')
+        if key not in cache:
+            data = self.json('POST', self.structure_api('forest/latest'), json=forest_spec(structure_id, transformations),
                              not_found=f'Структура {structure_id} не найдена или плагин Structure недоступен')
-            cache[structure_id] = parse_forest_rows(str(data.get('formula') or ''))
-        return cache[structure_id]
+            cache[key] = parse_forest_rows(str(data.get('formula') or ''))
+        return cache[key]
 
     def forest_rows(self, structure_id):
         return [(depth, issue_id) for _row, depth, issue_id in self.forest(structure_id)]
 
-    def structure_values(self, structure_id, rows, attributes):
+    def structure_values(self, structure_id, rows, attributes, transformations=None):
         """Значения колонок Structure для строк структуры (Value API) → [{rowId: значение}] по порядку attributes.
         Формат значений — число: так Structure отдаёт значение колонки без оформления."""
         out = [dict() for _ in attributes]
@@ -439,7 +637,7 @@ class JiraClient:
         for start in range(0, len(rows), 500):
             batch = rows[start:start + 500]
             data = self.json('POST', self.structure_api('value'), json={'requests': [
-                {'forestSpec': {'structureId': structure_id}, 'rows': batch, 'attributes': specs}]},
+                {'forestSpec': forest_spec(structure_id, transformations), 'rows': batch, 'attributes': specs}]},
                 not_found='API значений Structure недоступно — нужен Structure 4 или новее')
             for response in data.get('responses') or []:
                 got_rows = response.get('rows') or batch
@@ -685,7 +883,7 @@ def _snapshot_item(group, field_map):
     return dict(serviceId=group['serviceId'], issueCount=len(group['issues']), warnings=warnings, issues=issues, **values)
 
 
-def compute_snapshot(client, structure_id, mappings, field_map=None):
+def compute_snapshot(client, structure_id, mappings, field_map=None, transformations=None):
     """Срез для кнопки.
 
     mappings: [{'serviceId', 'issueKeys': 'ABC-1, ABC-2', 'includeSubtree': bool}]
@@ -698,7 +896,7 @@ def compute_snapshot(client, structure_id, mappings, field_map=None):
     items = [_snapshot_item(g, field_map) for g in groups]
     columns = {m: field_map[m]['structure'] for m in METRICS if field_map[m].get('structure')}
     if columns:
-        apply_structure_columns(client, structure_id, groups, items, columns)
+        apply_structure_columns(client, structure_id, groups, items, columns, transformations)
     return items
 
 
@@ -727,16 +925,30 @@ def root_rows(rows):
     return first, count
 
 
-def apply_structure_columns(client, structure_id, groups, items, columns):
+def apply_structure_columns(client, structure_id, groups, items, columns, transformations=None):
     """Показатели из колонок Structure: значение колонки у строки задачи эпика (как в структуре); у эпика из
-    нескольких задач — сумма их строк. Задача, которой нет в структуре, в показатель не входит (с предупреждением)."""
+    нескольких задач — сумма их строк. Колонки «После фильтрации» считаются с фильтром доски (transformations),
+    остальные — по всей структуре. Задача, которой нет в структуре, в показатель не входит (с предупреждением)."""
     if not structure_id:
         for item in items:
             for metric in columns:
                 item[metric] = None
             item['warnings'].append('Колонки Structure работают только у кнопки со структурой — показатели из них не заполнены')
         return
-    first, count = root_rows(client.forest(structure_id))
+    plain = {m: c for m, c in columns.items() if not (c.get('afterFiltering') and transformations)}
+    filtered = {m: c for m, c in columns.items() if c.get('afterFiltering') and transformations}
+    if any(c.get('afterFiltering') for c in columns.values()) and not transformations:
+        for item in items:
+            item['warnings'].append('Колонка отмечена «После фильтрации», но фильтр доски у кнопки не задан — '
+                                    'посчитано по всей структуре')
+    if plain:
+        _apply_columns(client, structure_id, groups, items, plain, None)
+    if filtered:
+        _apply_columns(client, structure_id, groups, items, filtered, transformations)
+
+
+def _apply_columns(client, structure_id, groups, items, columns, transformations):
+    first, count = root_rows(client.forest(structure_id, transformations))
     specs, index, slot = [], {}, {}
     for metric, col in columns.items():
         key = json.dumps(col['attribute'], sort_keys=True, ensure_ascii=False)
@@ -744,36 +956,47 @@ def apply_structure_columns(client, structure_id, groups, items, columns):
             index[key] = len(specs)
             specs.append(col['attribute'])
         slot[metric] = index[key]
-    need = []
+    need, hidden = [], []
     for g, item in zip(groups, items):
-        rows = []
+        rows, gone = [], False
         for key, issue_id, _f in g['roots']:
             row = first.get(issue_id)
             if row is None:
-                item['warnings'].append(f'{key}: задачи нет в структуре — колонки Structure для неё не посчитаны')
+                if transformations:
+                    item['warnings'].append(f'{key}: задача скрыта фильтром доски — для колонок «После фильтрации» '
+                                            'её значение 0')
+                    gone = True
+                else:
+                    item['warnings'].append(f'{key}: задачи нет в структуре — колонки Structure для неё не посчитаны')
                 continue
             if count.get(issue_id, 0) > 1:
                 item['warnings'].append(f'{key}: задача стоит в структуре несколько раз — взято значение первой строки')
             rows.append(row)
         need.append(rows)
+        hidden.append(gone)
     all_rows = sorted({r for rows in need for r in rows})
-    values = client.structure_values(structure_id, all_rows, specs) if all_rows else [{} for _ in specs]
-    for rows, item in zip(need, items):
+    values = client.structure_values(structure_id, all_rows, specs, transformations) if all_rows else [{} for _ in specs]
+    for rows, item, gone in zip(need, items, hidden):
         for metric, col in columns.items():
             raw = [values[slot[metric]].get(row) for row in rows]
             nums = [n for n in (_number(v) for v in raw) if n is not None]
+            if not nums and gone and not rows:
+                nums = [0]  # на доске с фильтром эпика не видно — в сумме «После фильтрации» его нет
             item[metric] = round(sum(nums) * UNITS[col['unit']], 2) if nums else None
             if not nums and any(v not in (None, '') for v in raw):
                 item['warnings'].append(f"Колонка Structure «{col.get('label') or col['attribute']['id']}» вернула не число — "
                                         'проверьте её формат')
 
 
-def structure_preview(client, structure_id, keys, attribute, unit):
+def structure_preview(client, structure_id, keys, attribute, unit, variants=None, transformations=None,
+                      after_filtering=False):
     """Значения колонки Structure у строк задач (проверка в редакторе кнопки) →
-    [{'key', 'rowId', 'raw', 'hours'}] и предупреждения."""
+    [{'key', 'rowId', 'raw', 'hours', 'asUnits', 'variants'}] и предупреждения. variants — {имя: атрибут}: для сверки
+    со структурой те же значения считаются и в других вариантах (без суммы, Σ без и с дубликатами — по всей структуре;
+    с фильтром доски — «как настроено» с фильтром). after_filtering — основное значение считается с фильтром доски."""
     found = client.issues_by_keys(keys, ['summary'])
+    rows, warnings, ids = [], [], {}
     first, _count = root_rows(client.forest(structure_id))
-    rows, warnings = [], []
     for key in keys:
         issue = found.get(key)
         row = first.get(int(issue['id'])) if issue else None
@@ -783,15 +1006,51 @@ def structure_preview(client, structure_id, keys, attribute, unit):
             warnings.append(f'{key}: задачи нет в структуре')
         else:
             rows.append((key, row))
-    values = client.structure_values(structure_id, [r for _k, r in rows], [attribute])[0] if rows else {}
+            ids[key] = int(issue['id'])
+
+    def values_for(spec, tf, name=None):
+        """{ключ: значение} по строкам задач в структуре с фильтром tf (или без него)."""
+        if tf:
+            frows, _c = root_rows(client.forest(structure_id, tf))
+            pairs = [(k, frows.get(ids[k])) for k, _r in rows]
+        else:
+            pairs = rows
+        present = [(k, r) for k, r in pairs if r is not None]
+        try:
+            got = client.structure_values(structure_id, [r for _k, r in present], [spec], tf)[0] if present else {}
+        except JiraError as e:
+            if name is None:
+                raise
+            warnings.append(f'Вариант для сверки «{VARIANT_TITLES.get(name, name)}» не посчитан: {e}')
+            return {}
+        return {k: got.get(r) for k, r in present}
+    main_tf = transformations if after_filtering else None
+    values = values_for(attribute, main_tf) if rows else {}
+    if after_filtering and not transformations:
+        warnings.append('Колонка отмечена «После фильтрации», но фильтр доски у кнопки не задан — посчитано по всей структуре')
+    if main_tf:
+        for key in [k for k, _r in rows if k not in values]:
+            warnings.append(f'{key}: задача скрыта фильтром доски')
+    variant_specs = dict(variants or {})
+    if transformations and variants:
+        variant_specs['filtered'] = attribute
+    extra = {name: (values_for(spec, transformations if name == 'filtered' else None, name) if rows else {})
+             for name, spec in variant_specs.items()}
     out = []
     for key, row in rows:
-        raw = values.get(row)
+        raw = values.get(key)
         num = _number(raw)
-        out.append({'key': key, 'rowId': row, 'raw': raw,
-                    'hours': None if num is None else round(num * UNITS[unit], 2),
-                    'asUnits': {u: (None if num is None else round(num * k, 2)) for u, k in UNITS.items()}})
+        item = {'key': key, 'rowId': row, 'raw': raw,
+                'hours': None if num is None else round(num * UNITS[unit], 2),
+                'asUnits': {u: (None if num is None else round(num * k, 2)) for u, k in UNITS.items()}}
+        if variant_specs:
+            item['variants'] = {name: _number(extra[name].get(key)) for name in variant_specs}
+        out.append(item)
     return out, warnings
+
+
+VARIANT_TITLES = {'own': 'только сама задача', 'distinct': 'Σ без дубликатов', 'all': 'Σ с дубликатами',
+                  'filtered': 'с фильтром доски'}
 
 
 # ─── Состав эпика по задачам и качество данных ───────────────────

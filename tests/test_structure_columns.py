@@ -49,8 +49,10 @@ def test_attribute_spec_validation():
 
 def test_field_map_with_structure_columns():
     fm = jira.normalize_field_map(field_map())
-    assert fm['remaining']['structure'] == {'attribute': jira.normalize_attribute(SUM_REMAINING), 'unit': 'ms', 'label': 'Σ остаток'}
-    assert fm['spent'] == {'field': '', 'unit': 'seconds', 'structure': {'attribute': FORMULA_SPENT, 'unit': 'hours', 'label': ''}}
+    assert fm['remaining']['structure'] == {'attribute': jira.normalize_attribute(SUM_REMAINING), 'unit': 'ms', 'label': 'Σ остаток',
+                                            'afterFiltering': False}
+    assert fm['spent'] == {'field': '', 'unit': 'seconds', 'structure': {'attribute': FORMULA_SPENT, 'unit': 'hours', 'label': '',
+                                                                         'afterFiltering': False}}
     assert fm['estimate']['structure'] is None
     only_structure = {m: {'field': ''} for m in jira.METRICS}
     only_structure['remaining'] = {'field': '', 'structure': {'attribute': {'id': 'timeestimate'}}}
@@ -174,3 +176,266 @@ def test_stored_field_map_round_trip(flask_app):
     fm = app_module._button_field_map(row)
     assert fm['remaining']['structure']['unit'] == 'ms' and fm['estimate']['structure'] is None
     assert app_module._button_field_map({'field_map': '{"remaining": 5}'}) == jira.DEFAULT_FIELD_MAP
+
+
+# ─── Колонка, заданная как в Structure: поле или формула, Σ, дубликаты (1.9.1) ──
+
+USER_FORMULA = '''WITH rest = orig - spent :
+
+if (
+  rest < 0 OR (
+    status != "Backlog" AND
+    status != "В работе" AND
+    status != "Reopened"
+  ),
+  0,
+  rest
+)'''
+USER_VARS = {'orig': {'field': 'timeoriginalestimate', 'format': 'duration'},
+             'spent': {'field': 'timespent', 'format': 'duration'},
+             'status': {'field': 'status', 'format': 'text'}}
+WITH_DUPLICATE = '1:0:101,2:1:102,6:1:105,3:1:5/9,4:2:103,9:2:102,5:0:104'  # ABC-2 стоит под ABC-1 дважды
+
+
+def test_column_editor_builds_structure_specs():
+    field = jira.normalize_column_editor({'mode': 'field', 'field': 'timespent', 'format': 'duration', 'sum': True})
+    assert field['distinct'] is True  # «Исключать дубликаты» — по умолчанию, как в Structure
+    assert jira.build_structure_attribute(field) == {
+        'id': 'expr', 'format': 'number',
+        'params': {'formula': 'SUM{\nvalue\n}', 'variables': {'value': {'id': 'timespent', 'format': 'duration'}}}}
+    with_dups = jira.build_structure_attribute(dict(field, distinct=False))
+    assert with_dups['id'] == 'sum' and with_dups['params']['attribute']['params']['formula'] == 'value'
+    own = jira.build_structure_attribute(dict(field, sum=False))
+    assert own['params']['formula'] == 'value'
+    custom = jira.normalize_column_editor({'mode': 'field', 'field': 'customfield_10050', 'format': 'number'})
+    assert jira.build_structure_attribute(custom)['params']['variables']['value'] == {
+        'id': 'customfield', 'format': 'number', 'params': {'fieldId': 10050}}
+    formula = jira.normalize_column_editor({'mode': 'formula', 'formula': USER_FORMULA, 'variables': USER_VARS, 'sum': True})
+    spec = jira.build_structure_attribute(formula)
+    assert spec['params']['formula'].startswith('SUM{\nWITH rest') and spec['params']['variables']['status'] == {
+        'id': 'status', 'format': 'text'}
+    stored = jira.normalize_column_editor(field)  # сохранённые настройки читаются повторно
+    assert stored == field
+
+
+def test_column_editor_validation():
+    cases = [('x', 'Тип колонки'), ({'mode': 'formula', 'formula': ' '}, 'Введите формулу'),
+             ({'mode': 'formula', 'formula': 'a' * 20001}, 'большая'),
+             ({'mode': 'formula', 'formula': 'a', 'variables': []}, 'объект'),
+             ({'mode': 'formula', 'formula': 'a', 'variables': {'1a': {'field': 'x'}}}, 'имя переменной'),
+             ({'mode': 'formula', 'formula': 'a', 'variables': {'a': 'x'}}, 'выберите поле'),
+             ({'mode': 'formula', 'formula': 'a', 'variables': {'a': {'field': ''}}}, 'Выберите поле Jira для переменной «a»'),
+             ({'mode': 'formula', 'formula': 'a', 'variables': {'a': {'field': 'bad id'}}}, 'некорректное поле'),
+             ({'mode': 'formula', 'formula': 'a', 'variables': {'a': {'field': 'status', 'format': 'json'}}}, 'формат'),
+             ({'mode': 'field', 'field': ''}, 'Выберите поле')]
+    for raw, message in cases:
+        with pytest.raises(ValueError, match=message):
+            jira.normalize_column_editor(raw)
+
+
+def test_formula_fields_list():
+    fields = jira.formula_fields(fake_jira.FIELDS + [{'id': 'status', 'name': 'Status', 'custom': False, 'schema': {'type': 'status'}},
+                                                     {'id': 'duedate', 'name': 'Due', 'schema': {'type': 'date'}}, {'id': 'bad id'}, 'x'])
+    by_id = {f['id']: f['format'] for f in fields}
+    assert [f['id'] for f in fields[:4]] == ['timeoriginalestimate', 'timespent', 'timeestimate', 'status']
+    assert by_id['status'] == 'text' and by_id['duedate'] == 'time' and by_id['customfield_10050'] == 'number'
+    assert by_id['timespent'] == 'duration' and 'bad id' not in by_id
+
+
+def test_user_formula_with_status_and_duplicates(fake, monkeypatch):
+    """Формула пользователя (WITH, if, статусы) с «Σ по вложенным» и «Исключить дубликаты» — как в Structure."""
+    monkeypatch.setattr(fake_jira, 'FORMULA', WITH_DUPLICATE)
+    fm = jira.normalize_field_map({
+        'remaining': {'field': 'timeestimate', 'unit': 'seconds', 'structure': {
+            'editor': {'mode': 'formula', 'formula': USER_FORMULA, 'variables': USER_VARS, 'sum': True, 'distinct': True},
+            'unit': 'ms', 'label': 'Σ Остаток (с обнулением)'}},
+        'spent': {'field': 'timespent', 'unit': 'seconds', 'structure': {
+            'editor': {'mode': 'field', 'field': 'timespent', 'format': 'duration', 'sum': True, 'distinct': True}, 'unit': 'ms'}},
+        'estimate': {'field': 'timeoriginalestimate', 'unit': 'seconds', 'structure': {
+            'editor': {'mode': 'field', 'field': 'timeoriginalestimate', 'format': 'duration', 'sum': True, 'distinct': False},
+            'unit': 'ms'}}})
+    items = jira.compute_snapshot(client_for(fake), 7, [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}], fm)
+    item = items[0]
+    # ABC-1: 12 − 5 = 7 ч (в работе); ABC-2 готово → 0; ABC-3: 1 − 0 = 1 ч; повтор ABC-2 не считается
+    assert item['remaining'] == 8.0
+    assert item['spent'] == 6.0  # 5 + 1, дубликат ABC-2 исключён
+    assert item['estimate'] == 19.0  # 12 + 3 + 1 + 3: без «Исключить дубликаты» ABC-2 посчитана дважды
+
+
+def test_preview_with_editor_shows_variants(admin, fake, monkeypatch):
+    connect(admin, fake)
+    monkeypatch.setattr(fake_jira, 'FORMULA', WITH_DUPLICATE)
+    body = {'structureId': 7, 'unit': 'ms', 'keys': 'ABC-1, ABC-4',
+            'editor': {'mode': 'field', 'field': 'timespent', 'format': 'duration', 'sum': True, 'distinct': True}}
+    data = admin.post('/api/projects/1/jira/structure-preview', json=body).get_json()
+    first = data['values'][0]
+    assert first['key'] == 'ABC-1' and first['hours'] == 6.0
+    assert first['variants'] == {'own': 5 * 3600000, 'distinct': 6 * 3600000, 'all': 7 * 3600000}
+    assert data['attribute']['params']['formula'] == 'SUM{\nvalue\n}'
+    formula = dict(body, editor={'mode': 'formula', 'formula': USER_FORMULA, 'variables': USER_VARS, 'sum': True})
+    assert admin.post('/api/projects/1/jira/structure-preview', json=formula).get_json()['values'][0]['hours'] == 8.0
+    unbound = admin.post('/api/projects/1/jira/structure-preview', json=dict(body, editor={'mode': 'formula', 'formula': 'x'}))
+    assert unbound.status_code == 502  # переменная без поля — ошибку формулы сообщает Structure
+    bad = admin.post('/api/projects/1/jira/structure-preview', json=dict(body, editor={'mode': 'chart'}))
+    assert bad.status_code == 400 and 'Тип колонки' in bad.get_json()['error']
+
+
+def test_preview_variant_errors_do_not_hide_value(admin, fake, monkeypatch):
+    connect(admin, fake)
+    original = jira.JiraClient.structure_values
+
+    def values(self, structure_id, rows, attributes, transformations=None):
+        if attributes[0]['id'] == 'sum':
+            raise jira.JiraError('Unknown attribute: sum')  # вариант, которого нет в этой версии Structure
+        return original(self, structure_id, rows, attributes, transformations)
+    monkeypatch.setattr(jira.JiraClient, 'structure_values', values)
+    body = {'structureId': 7, 'unit': 'ms', 'keys': 'ABC-1',
+            'editor': {'mode': 'field', 'field': 'timespent', 'format': 'duration', 'sum': True}}
+    data = admin.post('/api/projects/1/jira/structure-preview', json=body).get_json()
+    assert data['values'][0]['hours'] == 6.0 and data['values'][0]['variants']['all'] is None
+    assert 'Σ с дубликатами' in data['warnings'][0]
+
+
+def test_button_saves_editor_and_rebuilds_spec(admin, fake, flask_app):
+    connect(admin, fake)
+    fm = field_map(spent={'field': 'timespent', 'unit': 'seconds', 'structure': {
+        'editor': {'mode': 'formula', 'formula': USER_FORMULA, 'variables': USER_VARS, 'sum': True, 'distinct': True},
+        'attribute': {'id': 'ignored'}, 'unit': 'ms', 'label': 'Остаток'}})
+    r = create_button(admin, fieldMap=fm)
+    assert r.status_code == 200, r.get_json()
+    saved = r.get_json()['fieldMap']['spent']['structure']
+    assert saved['editor']['variables']['status'] == {'field': 'status', 'format': 'text'}
+    assert saved['attribute']['params']['formula'].startswith('SUM{')  # спецификацию строит сервер, а не браузер
+    snap = admin.post(f"/api/jira/buttons/{r.get_json()['id']}/snapshot", json={}).get_json()
+    assert snap['items'][0]['spent'] == 8.0
+
+
+def test_formula_fields_endpoint(admin, fake, make_user):
+    connect(admin, fake)
+    fields = admin.get('/api/projects/1/jira/formula-fields').get_json()
+    assert fields[0]['id'] == 'timeoriginalestimate' and {'id': 'customfield_10060', 'name': 'Комментарий', 'format': 'text'} in fields
+    assert make_user('viewer', project_id=1).get('/api/projects/1/jira/formula-fields').status_code == 403
+    fake.configure(token='другой')
+    assert admin.get('/api/projects/1/jira/formula-fields').status_code == 502
+
+
+# ─── «После фильтрации» (After filtering): фильтр доски Structure ──
+
+NOT_DONE = {'mode': 'jql', 'jql': 'status != "Готово"'}
+
+
+def test_board_filter_normalization():
+    assert jira.normalize_board_filter(None) is None and jira.normalize_board_filter({'mode': 'none'}) is None
+    assert jira.normalize_board_filter(NOT_DONE) == {'mode': 'jql', 'jql': 'status != "Готово"', 'showSubItems': False}
+    assert jira.board_transformations(jira.normalize_board_filter(dict(NOT_DONE, showSubItems=True))) == [
+        {'module': 'com.almworks.jira.structure:filter-jql', 'params': {'jql': 'status != "Готово"', 'showSubItems': True}}]
+    payload = json.dumps({'requests': [{'forestSpec': {'structureId': 7, 'transformations': [
+        {'module': 'com.almworks.jira.structure:filter-sjql', 'params': {'query': 'child of resolved'}}]}, 'rows': [1]}]})
+    pasted = jira.normalize_board_filter({'mode': 'json', 'transformations': payload})
+    assert pasted == {'mode': 'json', 'transformations': [
+        {'module': 'com.almworks.jira.structure:filter-sjql', 'params': {'query': 'child of resolved'}}]}
+    assert jira.board_transformations(pasted) == pasted['transformations']
+    assert jira.extract_transformations([{'module': 'a:b'}]) == [{'module': 'a:b'}]
+    assert jira.extract_transformations({'module': 'a:b', 'params': {}}) == [{'module': 'a:b', 'params': {}}]
+    assert jira.extract_transformations([[1], {'spec': {'transformations': [{'module': 'a:b'}]}}]) == [{'module': 'a:b'}]
+    assert jira.board_transformations(None) is None
+    cases = [('x', 'Фильтр доски'), ({'mode': 'chart'}, 'Фильтр доски'), ({'mode': 'jql', 'jql': ' '}, 'Введите JQL'),
+             ({'mode': 'jql', 'jql': 'a' * 5001}, 'длинный'), ({'mode': 'json', 'transformations': '{не json'}, 'JSON из Structure'),
+             ({'mode': 'json', 'transformations': {'structureId': 7}}, 'не найдены'),
+             ({'mode': 'json', 'transformations': [{'module': 'плохой'}]}, 'Некорректная трансформация'),
+             ({'mode': 'json', 'transformations': [{'module': 'a:b', 'params': []}]}, 'Некорректная трансформация'),
+             ({'mode': 'json', 'transformations': [{'module': 'a:b'}] * 11}, 'Слишком много'),
+             ({'mode': 'json', 'transformations': [{'module': 'a:b', 'params': {'x': 'y' * 20001}}]}, 'слишком большие')]
+    for raw, message in cases:
+        with pytest.raises(ValueError, match=message):
+            jira.normalize_board_filter(raw)
+
+
+def filtered_map():
+    return jira.normalize_field_map({
+        'remaining': {'field': 'timeestimate', 'unit': 'seconds'},
+        'spent': {'field': 'timespent', 'unit': 'seconds', 'structure': {
+            'editor': {'mode': 'field', 'field': 'timespent', 'format': 'duration', 'sum': True}, 'unit': 'ms',
+            'afterFiltering': True}},
+        'estimate': {'field': 'timeoriginalestimate', 'unit': 'seconds', 'structure': {
+            'editor': {'mode': 'field', 'field': 'timeoriginalestimate', 'format': 'duration', 'sum': True}, 'unit': 'ms'}}})
+
+
+def test_after_filtering_uses_board_filter(fake):
+    """«Σ Time Spent» с After filtering — только видимые с фильтром доски задачи; «Σ Original Estimate» без неё — все."""
+    tf = jira.board_transformations(jira.normalize_board_filter(NOT_DONE))
+    items = jira.compute_snapshot(client_for(fake), 7, [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True},
+                                                        {'serviceId': 2, 'issueKeys': 'ABC-4', 'includeSubtree': False}],
+                                  filtered_map(), tf)
+    first, second = items
+    assert first['spent'] == 5.0  # ABC-2 (готово) скрыта фильтром — её 1 ч не входит
+    assert first['estimate'] == 16.0  # без «После фильтрации» — по всей структуре: 12 + 3 + 1
+    assert second['spent'] == 0.0 and second['estimate'] == 10.0  # ABC-4 видна: открыта, затрачено 0
+    specs = fake.state['forest_specs']
+    assert {'structureId': 7} in specs and {'structureId': 7, 'transformations': tf} in specs
+    assert any(r['forestSpec'] == {'structureId': 7, 'transformations': tf}
+               for b in fake.state['value_bodies'] for r in b['requests'])
+
+
+def test_epic_hidden_by_board_filter_counts_as_zero(fake):
+    tf = jira.board_transformations(jira.normalize_board_filter({'mode': 'jql', 'jql': 'status = "В работе"'}))
+    item = jira.compute_snapshot(client_for(fake), 7, [{'serviceId': 2, 'issueKeys': 'ABC-4', 'includeSubtree': False}],
+                                 filtered_map(), tf)[0]
+    assert item['spent'] == 0.0 and item['estimate'] == 10.0
+    assert any('скрыта фильтром доски' in w for w in item['warnings'])
+
+
+def test_after_filtering_without_board_filter_warns(fake):
+    item = jira.compute_snapshot(client_for(fake), 7, [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}],
+                                 filtered_map())[0]
+    assert item['spent'] == 6.0 and any('фильтр доски у кнопки не задан' in w for w in item['warnings'])
+
+
+def test_preview_with_board_filter(admin, fake):
+    connect(admin, fake)
+    body = {'structureId': 7, 'unit': 'ms', 'keys': 'ABC-1, ABC-4', 'afterFiltering': True,
+            'boardFilter': {'mode': 'jql', 'jql': 'status = "В работе"'},
+            'editor': {'mode': 'field', 'field': 'timespent', 'format': 'duration', 'sum': True}}
+    data = admin.post('/api/projects/1/jira/structure-preview', json=body).get_json()
+    first = data['values'][0]
+    assert first['hours'] == 5.0  # с фильтром: ABC-1 (5 ч) и ABC-3 (0)
+    assert first['variants']['distinct'] == 6 * 3600000 and first['variants']['filtered'] == 5 * 3600000
+    assert data['values'][1]['raw'] is None and 'ABC-4: задача скрыта фильтром доски' in data['warnings']
+    plain = admin.post('/api/projects/1/jira/structure-preview', json=dict(body, afterFiltering=False)).get_json()
+    assert plain['values'][0]['hours'] == 6.0
+    no_filter = admin.post('/api/projects/1/jira/structure-preview', json=dict(body, boardFilter=None)).get_json()
+    assert no_filter['values'][0]['hours'] == 6.0 and 'фильтр доски у кнопки не задан' in ' '.join(no_filter['warnings'])
+    bad = admin.post('/api/projects/1/jira/structure-preview', json=dict(body, boardFilter={'mode': 'jql', 'jql': ''}))
+    assert bad.status_code == 400 and 'JQL' in bad.get_json()['error']
+    broken = admin.post('/api/projects/1/jira/structure-preview',
+                        json=dict(body, boardFilter={'mode': 'json', 'transformations': [{'module': 'x:unknown'}]}))
+    assert broken.status_code == 502  # Structure не знает такую трансформацию — понятная ошибка
+
+
+def test_button_keeps_board_filter(admin, fake, flask_app):
+    connect(admin, fake)
+    fm = field_map(spent={'field': 'timespent', 'unit': 'seconds', 'structure': {
+        'editor': {'mode': 'field', 'field': 'timespent', 'format': 'duration', 'sum': True}, 'unit': 'ms', 'afterFiltering': True}})
+    r = create_button(admin, fieldMap=fm, boardFilter=NOT_DONE)
+    assert r.status_code == 200, r.get_json()
+    button = r.get_json()
+    assert button['boardFilter'] == {'mode': 'jql', 'jql': 'status != "Готово"', 'showSubItems': False}
+    assert button['fieldMap']['spent']['structure']['afterFiltering'] is True
+    snap = admin.post(f"/api/jira/buttons/{button['id']}/snapshot", json={}).get_json()
+    assert snap['items'][0]['spent'] == 5.0
+    with flask_app.app_context():
+        db = app_module.get_db()
+        row = db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (button['id'],)).fetchone()
+        status, _message = app_module.run_autofill(db, row, '2026-10-30', 'Автозаполнение')
+        db.commit()
+        spent = db.execute("SELECT spent FROM entries WHERE service_id = 1 AND date = '2026-10-30'").fetchone()[0]
+    assert status == 'ok' and spent == 5.0
+    updated = admin.put(f"/api/jira/buttons/{button['id']}", json={
+        'name': 'Срез', 'structureId': 7, 'mappings': [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}],
+        'fieldMap': fm, 'boardFilter': {'mode': 'none'}}).get_json()
+    assert updated['boardFilter'] is None
+    assert create_button(admin, structureId=None, boardFilter=NOT_DONE).get_json()['error'] == \
+        'Фильтр доски задаётся только у кнопки со структурой'
+    assert create_button(admin, boardFilter={'mode': 'jql'}).status_code == 400
+    with flask_app.app_context():
+        assert app_module._button_board_filter({'board_filter': '{"mode": "jql"}'}) is None  # повреждённая запись

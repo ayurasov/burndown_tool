@@ -770,3 +770,13 @@ textarea:disabled{opacity:0.55;cursor:not-allowed;}
 .webhook-url input{flex:1;min-width:0;font-family:var(--font-mono);font-size:var(--text-xs);}
 #wbFields, #crPanel .form-grid{margin-top:var(--space-3);}
 #wbTable{margin-top:var(--space-3);}
+.jb-str-spec{margin-top:var(--space-2);}
+.jb-str-spec > summary{cursor:pointer;color:var(--color-primary);font-size:var(--text-sm);}
+.jb-str-spec pre{white-space:pre-wrap;word-break:break-word;font-size:var(--text-xs);max-height:240px;overflow:auto;margin:var(--space-2) 0 0;}
+#jbStrField .jb-str-var .field-label{min-width:6rem;}
+.jb-str-check th{white-space:normal;vertical-align:bottom;}
+#jbStrFormulaText{font-variant-ligatures:none;font-feature-settings:"liga" 0, "calt" 0;}
+.jb-board-filter{margin:var(--space-3) 0;border:1px solid var(--color-divider);border-radius:var(--radius-md, 8px);padding:var(--space-2) var(--space-3);}
+.jb-board-filter > summary{cursor:pointer;font-weight:600;font-size:var(--text-sm);}
+.jb-board-filter textarea{width:100%;font-family:var(--font-mono);font-size:var(--text-xs);}
+#jbStrFilterOpt{margin-top:var(--space-1);}
