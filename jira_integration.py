@@ -26,7 +26,7 @@ import os
 from datetime import datetime
 import re
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 # Без этих библиотек (не выполнен pip install -r requirements.txt после обновления) приложение работает,
 # недоступна только связь с Jira — с понятным сообщением вместо падения при запуске.
@@ -396,6 +396,18 @@ class JiraClient:
         raise error(f'Jira вернула ошибку {resp.status_code}: {_error_text(resp) or self.where(url)}')
 
     # ── операции ──
+    def fields(self):
+        """Все поля Jira: [{id, name, custom, schema}]."""
+        return self.json('GET', self.api('field'), kind=list)
+
+    def update_issue(self, key, fields):
+        """Записать значения полей задачи (REST API v2 — простые значения и в Jira Cloud)."""
+        url = f"{self.base_url}/rest/api/2/issue/{quote(key)}"
+        resp = self.request('PUT', url, json={'fields': fields})
+        if resp.status_code == 204:
+            return
+        self.check(resp, url, not_found=f'Задача {key} не найдена или нет прав на её просмотр')
+
     def myself(self):
         data = self.json('GET', self.api('myself'))
         return data.get('displayName') or data.get('name') or data.get('emailAddress') or ''
@@ -836,6 +848,47 @@ def issue_volume(issue):
     if issue.get('estimate') is not None:
         return issue['estimate']
     return (issue.get('spent') or 0) + (issue.get('remaining') or 0)
+
+
+# ─── Запись прогноза в задачи Jira ───────────────────────────────
+
+WRITABLE_TYPES = {'date': 'дата', 'datetime': 'дата и время', 'number': 'число', 'string': 'текст', 'option': 'список'}
+# какие типы полей подходят для каждого показателя
+WRITEBACK_KINDS = {
+    'forecast': ('Прогноз завершения', ('date', 'datetime', 'string')),
+    'status': ('Статус сроков', ('string', 'option')),
+    'chance': ('Шанс успеть, %', ('number', 'string')),
+    'headline': ('Главный вывод', ('string',)),
+}
+
+
+def writable_fields(raw):
+    """Пользовательские поля Jira, в которые можно записать прогноз: [{id, name, type}] по имени."""
+    out = []
+    for f in raw or []:
+        if not isinstance(f, dict) or not f.get('custom'):
+            continue
+        schema = f.get('schema') or {}
+        kind = schema.get('type')
+        if kind in WRITABLE_TYPES and isinstance(f.get('id'), str) and FIELD_ID_RE.match(f['id']):
+            out.append({'id': f['id'], 'name': str(f.get('name') or f['id']), 'type': kind,
+                        'typeLabel': WRITABLE_TYPES[kind]})
+    return sorted(out, key=lambda x: x['name'].lower())
+
+
+def field_value(kind, value):
+    """Значение для поля Jira данного типа (None — очистить поле)."""
+    if value is None or value == '':
+        return None
+    if kind == 'date':
+        return str(value)
+    if kind == 'datetime':
+        return f'{value}T00:00:00.000+0000'
+    if kind == 'number':
+        return float(value)
+    if kind == 'option':
+        return {'value': str(value)}
+    return str(value)[:250]
 
 
 def connection_json(row):

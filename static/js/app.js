@@ -4729,10 +4729,10 @@ var auditPageLabels = {
   dashboard: 'Дашборд', stages: 'Свод по этапам', data: 'Данные по датам',
   services: 'Эпики', settings: 'Настройки', users: 'Пользователи',
   projects: 'Проекты', profile: 'Профиль', jira: 'Связь с Jira', notify: 'Рассылки', integrations: 'Интеграции',
-  calendar: 'Производственный календарь', health: 'Состояние системы'
+  calendar: 'Производственный календарь', health: 'Состояние системы', confluence: 'Отчёт в Confluence'
 };
 var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление', autofill: 'Автозаполнение', restore: 'Восстановление истории',
-  sync: 'Синхронизация с Jira' };
+  sync: 'Синхронизация с Jira', writeback: 'Запись в Jira', publish: 'Публикация' };
 var auditEntityLabels = { project: 'Проект', service: 'Эпик', entry: 'Замер', user: 'Пользователь', stage_target: 'Цель этапа', settings: 'Настройки',
   jira_connection: 'Подключение к Jira', jira_button: 'Кнопка среза', jira_schedule: 'Расписание автозаполнения',
   notify_settings: 'Почта и Telegram', org_calendar: 'Производственный календарь', admin_alerts: 'Оповещения администратору' };
