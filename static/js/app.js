@@ -232,8 +232,20 @@ function getCss(varName){
 function colorPalette(){
   return [getCss('--color-primary'), getCss('--color-blue'), getCss('--color-orange'), getCss('--color-error'), getCss('--color-success'), getCss('--color-warning')];
 }
+/* номер дня даты ГГГГ-ММ-ДД (дни от 1970-01-01, UTC); разбор даты запоминается — расчёты прогноза обращаются
+   к одним и тем же датам тысячи раз */
+var dayNumCache = new Map();
+function isoOrdinal(d){
+  var v = dayNumCache.get(d);
+  if(v === undefined){
+    v = Math.round(Date.parse(d + 'T00:00:00Z') / 86400000);
+    if(dayNumCache.size > 50000) dayNumCache.clear();
+    dayNumCache.set(d, v);
+  }
+  return v;
+}
 function daysBetween(d1, d2){
-  return Math.round((Date.parse(d2 + 'T00:00:00Z') - Date.parse(d1 + 'T00:00:00Z')) / 86400000);
+  return isoOrdinal(d2) - isoOrdinal(d1);
 }
 function addDays(dateStr, days){
   var d = new Date(dateStr + 'T00:00:00Z');
@@ -246,7 +258,6 @@ function addDays(dateStr, days){
 var MC_HORIZON_WORKDAYS = 3 * 261;
 var CALENDAR_DAYS = {workdays: false, signature: '', horizon: 3 * 365, span: daysBetween, shift: addDays};
 var calCache = {key: null, cal: null};
-function isoOrdinal(d){ return Math.round(Date.parse(d + 'T00:00:00Z') / 86400000); }
 function ordinalIso(o){ return new Date(o * 86400000).toISOString().slice(0, 10); }
 function workCalendar(){
   var st = STATE.settings || {};
@@ -518,12 +529,27 @@ function hashString(str){
   for(var i = 0; i < str.length; i++){ h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
   return h >>> 0;
 }
-function burnIntervals(pts){
-  var list = [], cal = workCalendar();
+/* Частые замеры (ежедневное автозаполнение) — недельными блоками, как block_points в forecast.py: сценарии опираются
+   на недельный темп, а не на дневной шум, и считаются в разы быстрее */
+var MC_BLOCK_AFTER = 30;
+function rawIntervals(pts, cal){
+  var list = [];
   for(var i = 1; i < pts.length; i++){
     var len = cal.span(pts[i-1].d, pts[i].d);
     if(len > 0) list.push({end: pts[i].d, len: len, rate: (pts[i-1].y - pts[i].y) / len});
   }
+  return list;
+}
+function blockPoints(pts, cal){
+  var block = cal.workdays ? 5 : 7, out = [pts[0]];
+  for(var i = 1; i < pts.length; i++) if(cal.span(out[out.length-1].d, pts[i].d) >= block) out.push(pts[i]);
+  if(out[out.length-1] !== pts[pts.length-1]) out.push(pts[pts.length-1]);
+  return out;
+}
+function burnIntervals(pts){
+  var cal = workCalendar();
+  var list = rawIntervals(pts, cal);
+  if(list.length > MC_BLOCK_AFTER) list = rawIntervals(blockPoints(pts, cal), cal);
   if(STATE.settings && STATE.settings.burnrateMethod === 'rolling' && list.length){
     var cutoff = addDays(pts[pts.length-1].d, -(STATE.settings.burnrateWindowDays || 14));
     var windowed = list.filter(function(it){ return it.end > cutoff; });
@@ -558,20 +584,24 @@ function monteCarloForecast(dates, remainingVals, targetDate){
     res = {lo: doneDate, p50: doneDate, hi: doneDate, confidence: confidence,
            probability: targetDate ? (doneDate <= targetDate ? 1 : 0) : null, intervals: intervals.length};
   } else {
-    var total = intervals.reduce(function(sum, it){ return sum + it.len; }, 0);
+    var cum = [], total = 0, maxRate = -Infinity, maxLen = 0;
+    intervals.forEach(function(it){ total += it.len; cum.push(total); if(it.rate > maxRate) maxRate = it.rate; if(it.len > maxLen) maxLen = it.len; });
     var rnd = seededRandom(hashString(key));
     var days = [];
-    for(var r = 0; r < MC_RUNS; r++){
+    for(var r = 0; r < (maxRate > 0 ? MC_RUNS : 0); r++){  /* нигде не сгорало — ни один сценарий не завершится */
       var rem = last.y, day = 0;
       while(day < cal.horizon){
-        var pick = rnd() * total, it = intervals[0];
-        for(var k = 0; k < intervals.length; k++){ pick -= intervals[k].len; if(pick <= 0){ it = intervals[k]; break; } }
+        if(rem > maxRate * (cal.horizon - day + maxLen)) break;  /* уже не успеть до горизонта даже на самой высокой скорости */
+        var pick = rnd() * total, lo = 0, hi = cum.length - 1;
+        while(lo < hi){ var mid = (lo + hi) >> 1; if(cum[mid] < pick) lo = mid + 1; else hi = mid; }  /* с весом по длине */
+        var it = intervals[lo];
         if(it.rate > 0 && rem <= it.rate * it.len){ day += rem / it.rate; rem = 0; break; }
         rem -= it.rate * it.len;
         day += it.len;
       }
       days.push(rem <= 0 ? day : Infinity);
     }
+    if(maxRate <= 0) for(var z = 0; z < MC_RUNS; z++) days.push(Infinity);
     days.sort(function(a, b){ return a - b; });
     var at = function(qq){ var d = days[Math.floor(qq * (days.length - 1))]; return isFinite(d) ? cal.shift(last.d, Math.ceil(d)) : null; };
     var probability = null;
@@ -721,6 +751,29 @@ function destroyChart(key){ if(charts[key]){ charts[key].destroy(); delete chart
 function destroyChartsByPrefix(prefix){
   Object.keys(charts).forEach(function(k){ if(k.indexOf(prefix) === 0){ charts[k].destroy(); delete charts[k]; } });
 }
+
+/* Плотные данные (ежедневные замеры за месяцы, десятки эпиков): без анимации и маркеров точек — Chart.js тогда
+   использует общие параметры элементов и рисует график в разы быстрее; при наведении точка по-прежнему видна */
+var DENSE_SERIES_POINTS = 60, DENSE_CHART_POINTS = 1200;
+function tuneChartConfig(cfg){
+  var datasets = (cfg.data && cfg.data.datasets) || [], total = 0;
+  datasets.forEach(function(ds){
+    var n = (ds.data || []).length;
+    total += n;
+    if(n > DENSE_SERIES_POINTS && !ds.isRange && !ds.isEpicTarget){
+      ds.pointRadius = 0;
+      ds.pointHoverRadius = Math.max(3, ds.pointHoverRadius || 0);
+      ds.tension = 0;
+      delete ds.cubicInterpolationMode;
+    }
+  });
+  if(total > DENSE_CHART_POINTS){
+    cfg.options = cfg.options || {};
+    cfg.options.animation = false;
+  }
+  return cfg;
+}
+function makeChart(el, cfg){ return new Chart(el, tuneChartConfig(cfg)); }
 
 function baseChartOptions(yTitle, extraTooltipCtx){
   var opts = {
@@ -946,7 +999,7 @@ function renderEpicRemainingChart(){
   renderLegend('legendRemaining', datasets);
   var ctx = document.getElementById('chartRemaining');
   var tooltipCtx = { avgPts: avgPts, forecastPts: fcData };
-  charts.epicRemaining = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle('ост. время'), tooltipCtx)});
+  charts.epicRemaining = makeChart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle('ост. время'), tooltipCtx)});
 }
 
 function renderEpicSpentChart(){
@@ -963,7 +1016,7 @@ function renderEpicSpentChart(){
   var datasets = [{ label: svc ? svc.name : '', data: data, borderColor: palette[1], backgroundColor: palette[1]+'33', spanGaps:true, tension:0.25, cubicInterpolationMode:'monotone', pointRadius:3, borderWidth:2 }];
   renderLegend('legendSpentEpic', datasets);
   var ctx = document.getElementById('chartSpentEpic');
-  charts.epicSpent = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle())});
+  charts.epicSpent = makeChart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle())});
 }
 
 function renderEpicEstimateChart(){
@@ -980,7 +1033,7 @@ function renderEpicEstimateChart(){
   var datasets = [{ label: svc ? svc.name : '', data: data, borderColor: palette[2], backgroundColor: palette[2]+'33', spanGaps:true, tension:0.25, cubicInterpolationMode:'monotone', pointRadius:3, borderWidth:2 }];
   renderLegend('legendEstimateEpic', datasets);
   var ctx = document.getElementById('chartEstimateEpic');
-  charts.epicEstimate = new Chart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle())});
+  charts.epicEstimate = makeChart(ctx, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle())});
 }
 
 var allEpicsBlock = document.getElementById('allEpicsBlock');
@@ -1002,7 +1055,7 @@ function renderAllEpicsCharts(){
     if(setChartEmpty(c[2], empty)){ document.getElementById(c[3]).innerHTML = ''; return; }
     var datasets = buildDatasetsForMetric(c[0], ids);
     renderLegend(c[3], datasets);
-    charts[c[1]] = new Chart(document.getElementById(c[2]), {type:'line', data:{datasets:datasets}, options: baseChartOptions(c[4])});
+    charts[c[1]] = makeChart(document.getElementById(c[2]), {type:'line', data:{datasets:datasets}, options: baseChartOptions(c[4])});
   });
 }
 
@@ -1338,7 +1391,7 @@ function renderStageCharts(){
 
     renderLegend('legendStage_'+safeId, datasets);
     var tooltipCtx = { avgPts: avgPts, forecastPts: fcData };
-    charts['stage_'+safeId] = new Chart(canvas, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle('суммарный остаток'), tooltipCtx), plugins:[epicTargetLabelPlugin]});
+    charts['stage_'+safeId] = makeChart(canvas, {type:'line', data:{datasets:datasets}, options: baseChartOptions(unitAxisTitle('суммарный остаток'), tooltipCtx), plugins:[epicTargetLabelPlugin]});
   });
 }
 
@@ -1963,7 +2016,7 @@ var titles = {
   data: ['Данные по датам', 'Внесение и редактирование замеров'],
   services: ['Эпики (блоки задач)', 'Список эпиков проекта и целевых дат'],
   settings: ['Настройки проекта', 'Прогноз, календарь, единицы и пороги выводов'],
-  jira: ['Связь с Jira', 'Кнопки среза: задачи Jira по эпикам проекта'],
+  jira: ['Jira и Confluence', 'Кнопки среза, прогноз в задачах Jira, отчёт в Confluence'],
   autofill: ['Автозаполнение', 'Срез из Jira по расписанию'],
   notify: ['Уведомления', 'Дайджест и оповещения по проекту'],
   integrations: ['Интеграции', 'Jira, почта, Telegram-бот и журнал отправок'],
@@ -2048,7 +2101,10 @@ function renderDashboard(){
    Выводы: проект → этапы → эпики (расчёт на сервере, insights.py) и портфель проектов
 ════════════════════════════════════════════════════════════════ */
 var insightsCache = {pid: null, data: null, promise: null, stamp: 0};
-function invalidateInsights(){ insightsCache.pid = null; insightsCache.data = null; insightsCache.promise = null; insightsCache.stamp++; }
+function invalidateInsights(){
+  insightsCache.pid = null; insightsCache.data = null; insightsCache.promise = null; insightsCache.stamp++;
+  if(typeof changesCache !== 'undefined') changesCache = {pid: null, data: null};
+}
 function loadInsights(){
   var pid = currentProjectId;
   if(!pid) return Promise.resolve(null);
@@ -2068,6 +2124,8 @@ function findingHtml(f, withSubject){
   if(withSubject && f.subject && f.ref){
     subject = '<button type="button" class="insight-subject" data-level="' + f.ref.level + '" data-ref="' +
       escapeAttr(f.ref.level === 'epic' ? f.ref.id : f.ref.name) + '">' + escapeHtml(f.subject) + '</button> ';
+  } else if(withSubject && f.subject){
+    subject = '<b class="insight-subject-plain">' + escapeHtml(f.subject) + '</b> ';  /* эпик уже не в работе — без ссылки */
   }
   return '<li class="insight insight-' + f.severity + '"><span class="insight-dot" aria-hidden="true"></span>' +
     '<span class="sr-only">' + SEVERITY_LABELS[f.severity] + ': </span><span class="insight-text">' + subject + escapeHtml(f.text) + '</span></li>';
@@ -2108,11 +2166,68 @@ function insightsHtml(d){
     findingsList(s.top, true, 'Рисков по срокам не видно.') + '</div><div>';
   if(s.wins.length) html += '<div class="insight-col-title">Хорошие новости</div>' + findingsList(s.wins, true);
   html += '<div class="insight-col-title">Данные</div>' + findingsList(s.health, false, 'Замеры свежие, цели заданы, ошибок автозаполнения нет.') + '</div></div>';
+  html += '<div class="insight-changes" id="insightChanges"><div class="insight-col-title">Что изменилось за неделю</div>' +
+    '<p class="insight-empty">Сравниваем с прошлой неделей…</p></div>';
   if(d.stages.length){
     html += '<details class="insight-details"><summary>Подробно по этапам и эпикам</summary>' +
       d.stages.map(function(st, i){ return stageDetailHtml(st, stageEpics(d, st), i); }).join('') + '</details>';
   }
   return html;
+}
+/* «Что изменилось за неделю» и лента по неделям: сравнение ежедневных снимков выводов (insight_changes на сервере) */
+var changesCache = {pid: null, data: null};
+var CHANGES_SHOWN = 6;
+function loadInsightChanges(){
+  var pid = currentProjectId;
+  if(changesCache.pid === pid && changesCache.data) return Promise.resolve(changesCache.data);
+  return api('/api/projects/' + pid + '/insights/changes').then(function(d){
+    if(pid === currentProjectId) changesCache = {pid: pid, data: d};
+    return d;
+  });
+}
+function plural(n, one, few, many){
+  n = Math.abs(Math.trunc(n));
+  if(n % 10 === 1 && n % 100 !== 11) return one;
+  return (n % 10 >= 2 && n % 10 <= 4 && !(n % 100 >= 12 && n % 100 <= 14)) ? few : many;
+}
+/* первые CHANGES_SHOWN изменений сразу, остальные — под «Ещё N» */
+function changesListHtml(items, empty){
+  var html = findingsList(items.slice(0, CHANGES_SHOWN), true, empty);
+  if(items.length > CHANGES_SHOWN){
+    html += '<details class="insight-more"><summary>Ещё ' + (items.length - CHANGES_SHOWN) + '</summary>' +
+      findingsList(items.slice(CHANGES_SHOWN), true) + '</details>';
+  }
+  return html;
+}
+function changesWeekTitle(w){ return fmtDate(w.from) + ' — ' + fmtDate(w.to); }
+function insightChangesHtml(d){
+  var weeks = d.weeks || [];
+  var html = '<div class="insight-col-title">Что изменилось за неделю' + (weeks.length ? ' <span class="insight-changes-period">' +
+    changesWeekTitle(weeks[0]) + '</span>' : '') + '</div>';
+  if(!weeks.length) return html + '<p class="insight-empty">Сравнивать пока не с чем: замеры появились меньше недели назад.</p>';
+  html += changesListHtml(weeks[0].items, 'Существенных изменений в статусах и прогнозах нет.');
+  if(weeks.length > 1){
+    html += '<details class="insight-feed"><summary>Лента изменений по неделям</summary>' + weeks.slice(1).map(function(w){
+      return '<div class="insight-feed-week"><div class="insight-feed-title">' + changesWeekTitle(w) + '<span class="insight-feed-count">' +
+        (w.items.length ? w.items.length + ' ' + plural(w.items.length, 'изменение', 'изменения', 'изменений') : 'без изменений') +
+        '</span></div>' + changesListHtml(w.items) + '</div>';
+    }).join('') + '</details>';
+  }
+  return html;
+}
+function renderInsightChanges(){
+  var box = document.getElementById('insightChanges');
+  if(!box) return;
+  var pid = currentProjectId;
+  loadInsightChanges().then(function(d){
+    var el = document.getElementById('insightChanges');
+    if(!el || pid !== currentProjectId) return;
+    el.innerHTML = insightChangesHtml(d);
+    bindInsightLinks(el);
+  }).catch(function(){
+    var el = document.getElementById('insightChanges');
+    if(el) el.innerHTML = '<div class="insight-col-title">Что изменилось за неделю</div><p class="insight-empty">Не удалось загрузить изменения.</p>';
+  });
 }
 function bindInsightLinks(root){
   root.querySelectorAll('.insight-subject').forEach(function(btn){
@@ -2166,6 +2281,7 @@ function renderInsightsPanel(){
     body.classList.remove('insight-loading');
     body.innerHTML = insightsHtml(d);
     bindInsightLinks(body);
+    renderInsightChanges();
     body.querySelectorAll('.insight-epic').forEach(function(det){
       det.querySelector('summary').addEventListener('dblclick', function(){ showEpicOnDashboard(parseInt(det.dataset.epic, 10)); });
     });
@@ -2566,17 +2682,260 @@ function renderJiraView(){
     : 'Подключение к Jira не настроено' + (isGlobalAdmin() ? ' — настройте его в разделе «Интеграции».' : ' — обратитесь к администратору.');
   document.getElementById('jiraOpenIntegrations').hidden = !isGlobalAdmin();
   document.getElementById('jiraWizardCallout').hidden = !connected;
+  renderWritebackPanel();
+  renderConfluencePanel();
   if(!cfg){ document.getElementById('jiraButtonsTable').innerHTML = ''; return; }
   renderJiraButtonsTable();
 }
+
+/* ── Прогноз в Jira: какие показатели в какие поля задач эпиков записывать ── */
+var wbState = {data: null, fields: null};
+function renderWritebackPanel(){
+  var pid = currentProjectId;
+  api('/api/projects/' + pid + '/jira/writeback').then(function(d){
+    if(pid !== currentProjectId) return;
+    wbState.data = d;
+    fillWriteback();
+  }).catch(function(){});
+}
+function wbKind(kind){ return wbState.data.kinds.find(function(k){ return k.kind === kind; }); }
+function wbFieldOptions(kind){
+  var saved = wbState.data.fields[kind], types = wbKind(kind).types;
+  var list = (wbState.fields || []).filter(function(f){ return types.indexOf(f.type) !== -1; });
+  if(saved && !list.some(function(f){ return f.id === saved.id; })) list.unshift(saved);
+  return '<option value="">— не записывать —</option>' + list.map(function(f){
+    return '<option value="' + escapeAttr(f.id) + '" data-type="' + escapeAttr(f.type) + '" data-name="' + escapeAttr(f.name) + '"' +
+      (saved && saved.id === f.id ? ' selected' : '') + '>' + escapeHtml(f.name) + ' (' + escapeHtml(f.id) + ')</option>';
+  }).join('');
+}
+function wbValueText(kind, v){
+  if(v === null || v === undefined || v === '') return '<span class="muted-cell">пусто</span>';
+  if(kind === 'forecast' && /^\d{4}-\d{2}-\d{2}$/.test(v)) return fmtDate(v);
+  if(kind === 'chance' && typeof v === 'number') return v + '%';
+  return escapeHtml(String(v));
+}
+function fillWriteback(){
+  var d = wbState.data;
+  var blocked = !d.allowed || !d.connected;
+  var st = document.getElementById('wbStatus');
+  st.className = 'jira-status' + (blocked ? '' : (d.lastStatus === 'error' ? ' error' : (d.lastStatus === 'ok' ? ' ok' : '')));
+  st.textContent = !d.connected ? 'Подключение к Jira не настроено.' :
+    (!d.allowed ? 'Запись в Jira не разрешена администратором' + (isGlobalAdmin() ? ' — разрешите её в разделе «Интеграции».' : '.') :
+      (d.lastAt ? 'Последняя запись: ' + fmtDateTime(d.lastAt) + ' — ' + (d.lastMessage || '') : 'В Jira ещё ничего не записывалось.'));
+  var enabled = document.getElementById('wbEnabled');
+  enabled.checked = d.enabled;
+  enabled.disabled = blocked;
+  document.getElementById('wbFields').innerHTML = d.kinds.map(function(k){
+    return '<div class="setting-item"><label class="small" for="wbField-' + k.kind + '">' + escapeHtml(k.label) + '</label>' +
+      '<select id="wbField-' + k.kind + '" data-kind="' + k.kind + '"' + (blocked ? ' disabled' : '') + '>' + wbFieldOptions(k.kind) + '</select></div>';
+  }).join('');
+  ['wbLoadFields', 'wbRun', 'wbSave'].forEach(function(id){ document.getElementById(id).disabled = blocked; });
+  var kinds = d.kinds.filter(function(k){ return d.fields[k.kind]; });
+  var table = document.getElementById('wbTable');
+  if(!kinds.length){
+    table.innerHTML = '<tbody><tr><td class="muted-cell">Выберите поля Jira — здесь появится, что и в какие задачи будет записано.</td></tr></tbody>';
+    return;
+  }
+  table.innerHTML = '<thead><tr><th>Эпик</th><th>Задача Jira</th>' + kinds.map(function(k){ return '<th>' + escapeHtml(k.label) + '</th>'; }).join('') +
+    '<th>В Jira</th></tr></thead><tbody>' + d.epics.map(function(e){
+      if(!e.issue) return '<tr><td>' + escapeHtml(e.epic) + '</td><td colspan="' + (kinds.length + 2) + '" class="muted-cell">нет задачи — эпик не привязан к кнопке среза</td></tr>';
+      return '<tr><td>' + escapeHtml(e.epic) + '</td><td class="mono">' + escapeHtml(e.issue) + '</td>' + kinds.map(function(k){
+        return '<td>' + wbValueText(k.kind, e.values[k.kind]) + '</td>';
+      }).join('') + '<td>' + (e.changed ? '<span class="prob-mid">будет записано</span>' : '<span class="prob-high">актуально</span>') + '</td></tr>';
+    }).join('') + '</tbody>';
+}
+function writebackBody(){
+  var fields = {};
+  document.querySelectorAll('#wbFields select').forEach(function(sel){
+    var opt = sel.options[sel.selectedIndex];
+    if(sel.value) fields[sel.dataset.kind] = {id: sel.value, type: opt.dataset.type, name: opt.dataset.name};
+  });
+  return {enabled: document.getElementById('wbEnabled').checked, fields: fields};
+}
+function saveWriteback(message){
+  return apiPut('/api/projects/' + currentProjectId + '/jira/writeback', writebackBody()).then(function(d){
+    wbState.data = d;
+    fillWriteback();
+    if(message) toast(message);
+    return d;
+  });
+}
+document.getElementById('wbLoadFields').addEventListener('click', function(){
+  var btn = this, current = writebackBody();
+  btn.disabled = true;
+  api('/api/projects/' + currentProjectId + '/jira/writable-fields').then(function(list){
+    wbState.fields = list;
+    wbState.data.fields = current.fields;  /* выбор, ещё не сохранённый, не теряется */
+    fillWriteback();
+    toast(list.length ? 'Поля Jira загружены: ' + list.length : 'В Jira нет подходящих пользовательских полей');
+  }).catch(function(){}).then(function(){ btn.disabled = false; });
+});
+document.getElementById('wbSave').addEventListener('click', function(){ saveWriteback('Настройки записи в Jira сохранены').catch(function(){}); });
+document.getElementById('wbEnabled').addEventListener('change', function(e){
+  saveWriteback(e.target.checked ? 'Автоматическая запись в Jira включена' : 'Автоматическая запись в Jira выключена').catch(function(){
+    e.target.checked = !e.target.checked;
+  });
+});
+document.getElementById('wbRun').addEventListener('click', function(){
+  var btn = this;
+  btn.disabled = true;
+  saveWriteback().then(function(){
+    return apiPost('/api/projects/' + currentProjectId + '/jira/writeback/run');
+  }).then(function(d){
+    wbState.data = d;
+    fillWriteback();
+    toast(d.result.message);
+  }).catch(function(){}).then(function(){ btn.disabled = false; });
+});
+
+/* ── Отчёт в Confluence ── */
+function renderConfluencePanel(){
+  var pid = currentProjectId;
+  api('/api/projects/' + pid + '/confluence').then(function(d){ if(pid === currentProjectId) fillConfluence(d); }).catch(function(){});
+}
+function fillConfluence(d){
+  var st = document.getElementById('crStatus');
+  st.className = 'jira-status' + (!d.connected ? '' : (d.lastStatus === 'error' ? ' error' : (d.lastStatus === 'ok' ? ' ok' : '')));
+  st.textContent = !d.connected ? 'Подключение к Confluence не настроено' + (isGlobalAdmin() ? ' — настройте его в разделе «Интеграции».' : ' — обратитесь к администратору.') :
+    (d.lastAt ? 'Последняя публикация: ' + fmtDateTime(d.lastAt) + ' — ' + (d.lastMessage || '') : 'Отчёт ещё не публиковался.');
+  document.getElementById('crEnabled').checked = d.enabled;
+  document.getElementById('crSpace').value = d.spaceKey;
+  document.getElementById('crParent').value = d.parentId;
+  document.getElementById('crTitle').value = d.title;
+  document.getElementById('crMode').value = d.mode;
+  document.getElementById('crWeekday').value = String(d.weekday);
+  document.getElementById('crTime').value = d.time;
+  var zones = TIMEZONES.slice();
+  if(zones.indexOf(d.timezone) === -1) zones.push(d.timezone);
+  document.getElementById('crTz').innerHTML = zones.map(function(z){
+    return '<option value="' + escapeAttr(z) + '"' + (z === d.timezone ? ' selected' : '') + '>' + escapeHtml(z) + '</option>';
+  }).join('');
+  var open = document.getElementById('crOpen');
+  open.hidden = !d.pageUrl;
+  if(d.pageUrl) open.href = d.pageUrl;
+  document.querySelectorAll('#crPanel input, #crPanel select, #crPanel button').forEach(function(el){ el.disabled = !d.connected; });
+}
+function confluenceBody(){
+  return {enabled: document.getElementById('crEnabled').checked, spaceKey: document.getElementById('crSpace').value.trim(),
+          parentId: document.getElementById('crParent').value.trim(), title: document.getElementById('crTitle').value.trim(),
+          mode: document.getElementById('crMode').value, weekday: parseInt(document.getElementById('crWeekday').value, 10),
+          time: document.getElementById('crTime').value, timezone: document.getElementById('crTz').value};
+}
+function saveConfluence(message){
+  return apiPut('/api/projects/' + currentProjectId + '/confluence', confluenceBody()).then(function(d){
+    fillConfluence(d);
+    if(message) toast(message);
+    return d;
+  });
+}
+document.getElementById('crSave').addEventListener('click', function(){ saveConfluence('Настройки отчёта сохранены').catch(function(){}); });
+document.getElementById('crEnabled').addEventListener('change', function(e){
+  saveConfluence(e.target.checked ? 'Еженедельная публикация включена' : 'Еженедельная публикация выключена').catch(function(){
+    e.target.checked = !e.target.checked;
+  });
+});
+document.getElementById('crPublish').addEventListener('click', function(){
+  var btn = this;
+  btn.disabled = true;
+  saveConfluence().then(function(){
+    return apiPost('/api/projects/' + currentProjectId + '/confluence/publish');
+  }).then(function(d){
+    fillConfluence(d);
+    toast(d.result.message);
+  }).catch(function(){ renderConfluencePanel(); }).then(function(){ btn.disabled = false; });
+});
 document.getElementById('jiraOpenIntegrations').addEventListener('click', function(){ navigate('integrations'); });
 
 /* «Интеграции» (администратор): общее подключение к Jira, почта и Telegram-бот */
 var adminJira = null;
 function renderIntegrationsView(){
   api('/api/admin/jira-connection').then(function(c){ adminJira = c; fillJiraForm(); }).catch(function(){});
+  api('/api/admin/jira-options').then(fillJiraOptions).catch(function(){});
+  api('/api/admin/confluence-connection').then(fillConfForm).catch(function(){});
   renderNotifyAdminView();
 }
+
+/* Запись в Jira (разрешение) и вебхук Jira */
+function fillJiraOptions(o){
+  document.getElementById('joWriteback').checked = o.writebackAllowed;
+  var w = o.webhook, last = w.last;
+  var st = document.getElementById('joWebhookStatus');
+  st.className = 'jira-status' + (w.enabled ? ' ok' : '');
+  st.textContent = !w.enabled ? 'Вебхук выключен: замеры обновляются только по расписанию и вручную.' :
+    'Вебхук включён. ' + (last ? 'Последнее событие: ' + fmtDateTime(last.at) + (last.event ? ' (' + last.event + ')' : '') +
+      (last.keys && last.keys.length ? ', задачи ' + last.keys.join(', ') : '') + ', кнопок в очереди: ' + last.buttons + '.' : 'Событий от Jira ещё не было.');
+  document.getElementById('joWebhookUrlRow').hidden = !w.enabled;
+  document.getElementById('joWebhookUrl').value = w.url;
+  document.getElementById('joWebhookOn').hidden = w.enabled;
+  document.getElementById('joWebhookOff').hidden = !w.enabled;
+  document.getElementById('joWebhookRotate').hidden = !w.enabled;
+}
+function saveJiraOptions(body, message){
+  return apiPut('/api/admin/jira-options', body).then(function(o){ fillJiraOptions(o); if(message) toast(message); return o; });
+}
+document.getElementById('joWriteback').addEventListener('change', function(e){
+  saveJiraOptions({writebackAllowed: e.target.checked}, e.target.checked ? 'Проекты могут записывать прогноз в Jira' : 'Запись в Jira запрещена')
+    .catch(function(){ e.target.checked = !e.target.checked; });
+});
+document.getElementById('joWebhookOn').addEventListener('click', function(){
+  saveJiraOptions({webhook: true}, 'Вебхук включён — добавьте адрес в настройках Jira').catch(function(){});
+});
+document.getElementById('joWebhookRotate').addEventListener('click', function(){
+  askConfirm('Новый адрес вебхука?', 'Прежний адрес перестанет работать — его нужно будет заменить в настройках Jira.', function(){
+    saveJiraOptions({webhook: true, rotate: true}, 'Адрес вебхука заменён').catch(function(){});
+  }, 'Заменить');
+});
+document.getElementById('joWebhookOff').addEventListener('click', function(){
+  askConfirm('Выключить вебхук?', 'События Jira перестанут приниматься; замеры будут обновляться только по расписанию.', function(){
+    saveJiraOptions({webhook: false}, 'Вебхук выключен').catch(function(){});
+  }, 'Выключить');
+});
+document.getElementById('joWebhookCopy').addEventListener('click', function(){
+  var input = document.getElementById('joWebhookUrl');
+  var done = function(){ toast('Адрес скопирован'); };
+  if(navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(input.value).then(done, function(){ input.select(); });
+  else { input.select(); try { document.execCommand('copy'); done(); } catch(e){} }
+});
+
+/* Подключение к Confluence */
+var adminConf = null;
+function fillConfForm(c){
+  adminConf = c;
+  document.getElementById('confUrl').value = c ? c.baseUrl : '';
+  document.getElementById('confType').value = c ? c.instanceType : 'server';
+  document.getElementById('confLogin').value = c ? c.login : '';
+  document.getElementById('confInsecure').checked = !!(c && c.acceptInvalidCerts);
+  var token = document.getElementById('confToken');
+  token.value = '';
+  token.placeholder = c && c.hasToken ? 'Сохранён — оставьте пустым, чтобы не менять' : '';
+  var st = document.getElementById('confStatus');
+  st.className = 'jira-status' + (c ? ' ok' : '');
+  st.textContent = c ? 'Подключение сохранено' : 'Подключение не настроено';
+  document.getElementById('confDisconnect').hidden = !c;
+}
+function confFormBody(){
+  return {baseUrl: document.getElementById('confUrl').value.trim(), instanceType: document.getElementById('confType').value,
+          login: document.getElementById('confLogin').value.trim(), token: document.getElementById('confToken').value,
+          acceptInvalidCerts: document.getElementById('confInsecure').checked};
+}
+document.getElementById('confForm').addEventListener('submit', function(e){
+  e.preventDefault();
+  apiPut('/api/admin/confluence-connection', confFormBody()).then(function(c){ fillConfForm(c); toast('Подключение к Confluence сохранено'); }).catch(function(){});
+});
+document.getElementById('confTest').addEventListener('click', function(){
+  var st = document.getElementById('confStatus');
+  st.className = 'jira-status';
+  st.textContent = 'Проверяем…';
+  apiPost('/api/admin/confluence-connection/test', confFormBody()).then(function(r){
+    st.className = 'jira-status ok';
+    st.textContent = '✓ Подключение работает' + (r.user ? ': ' + r.user : '');
+  }).catch(function(){ st.className = 'jira-status error'; st.textContent = 'Проверка не прошла — подробности в сообщении выше'; });
+});
+document.getElementById('confDisconnect').addEventListener('click', function(){
+  askConfirm('Отключить Confluence?', 'Подключение и сохранённый токен будут удалены; отчёты проектов перестанут публиковаться.', function(){
+    apiDelete('/api/admin/confluence-connection').then(function(){ fillConfForm(null); toast('Confluence отключён'); });
+  }, 'Отключить');
+});
 function fillJiraForm(){
   var c = adminJira;
   document.getElementById('jiraUrl').value = c ? c.baseUrl : '';
@@ -3246,7 +3605,7 @@ function drawBurnup(key, canvasId, legendId, noteId, hist){
     var raw = ctx.raw || {};
     return raw.count !== undefined ? 'Задач готово: ' + raw.count + ' из ' + raw.total : 'Задач: ' + raw.total;
   };
-  charts[key] = new Chart(document.getElementById(canvasId), {type: 'line', data: {datasets: datasets}, options: opts});
+  charts[key] = makeChart(document.getElementById(canvasId), {type: 'line', data: {datasets: datasets}, options: opts});
 }
 
 function renderBurnupChart(){
@@ -3259,18 +3618,30 @@ function renderBurnupChart(){
 }
 
 /* ── Дрейф прогноза: какой была прогнозная дата завершения на каждую дату замера ── */
+var DRIFT_MAX_POINTS = 90;
 function forecastDrift(sid){
   var svc = serviceById(sid);
   var rows = entriesForService(sid).filter(function(r){ return isNum(r.remaining); });
   if(rows.length < 2) return null;
   var target = svc ? svc.targetDate || null : null;
   var points = [];
-  for(var i = 1; i < rows.length; i++){
+  /* при длинной истории — не больше DRIFT_MAX_POINTS дат (равномерно), последние две — всегда: прогноз
+     пересчитывается на каждую дату, и при ежедневных замерах за год это сотни расчётов Монте-Карло */
+  var idx = [];
+  for(var i = 1; i < rows.length; i++) idx.push(i);
+  if(idx.length > DRIFT_MAX_POINTS){
+    var step = (rows.length - 3) / (DRIFT_MAX_POINTS - 2), picked = {};
+    idx = [];
+    for(var k = 0; k < DRIFT_MAX_POINTS - 2; k++) picked[1 + Math.round(k * step)] = true;
+    picked[rows.length - 2] = true; picked[rows.length - 1] = true;
+    idx = Object.keys(picked).map(Number).sort(function(a, b){ return a - b; });
+  }
+  idx.forEach(function(i){
     var sub = rows.slice(0, i + 1);
     var st = computeStatus(sub.map(function(r){ return r.date; }), sub.map(function(r){ return r.remaining; }), target);
     points.push({date: rows[i].date, forecast: st.forecastZeroDate, noBurn: st.noBurn,
                  lo: st.mc ? st.mc.lo : null, p50: st.mc ? st.mc.p50 : null, hi: st.mc ? st.mc.hi : null});
-  }
+  });
   return {points: points, target: target};
 }
 function driftShiftText(from, to, since){
@@ -3326,7 +3697,7 @@ function renderDriftChart(){
   datasets.forEach(function(d){ d.data.forEach(function(p){ if(p.y) ys.push(p.y); }); });
   ys.sort();
   var yMin = ys.length ? addDays(ys[0], -3) : undefined, yMax = ys.length ? addDays(ys[ys.length-1], 3) : undefined;
-  charts.epicDrift = new Chart(document.getElementById('chartDrift'), {type: 'line', data: {datasets: datasets}, options: {
+  charts.epicDrift = makeChart(document.getElementById('chartDrift'), {type: 'line', data: {datasets: datasets}, options: {
     responsive: true, maintainAspectRatio: false, spanGaps: false,
     interaction: {mode: 'nearest', axis: 'x', intersect: false},
     plugins: {legend: {display: false}, tooltip: {
@@ -3471,7 +3842,7 @@ function renderScopeWaterfall(c){
   });
   steps.push(['Объём ' + fmtShortDate(c.to), 0, c.scopeTo, 'base']);
   var colors = {base: getCss('--color-blue'), up: getCss('--color-orange'), down: getCss('--color-success')};
-  charts.scopeChanges = new Chart(document.getElementById('chartScopeChanges'), {
+  charts.scopeChanges = makeChart(document.getElementById('chartScopeChanges'), {
     type: 'bar',
     data: {labels: steps.map(function(st){ return st[0]; }),
            datasets: [{data: steps.map(function(st){ return [Math.min(st[1], st[2]), Math.max(st[1], st[2])]; }),
@@ -3908,7 +4279,8 @@ document.getElementById('calSave').addEventListener('click', function(){
     document.getElementById('calHolidays').value = formatDateList(c.holidays);
     document.getElementById('calExtra').value = formatDateList(c.extraWorkdays);
     refreshCalendarPresets();
-    if(currentProjectId) loadProjectData(currentProjectId, currentView);
+    invalidateInsights();
+    if(currentProjectId) loadProjectData(currentProjectId, currentView, true);
     toast('Календарь сохранён');
   }).catch(function(){});
 });
@@ -3981,7 +4353,8 @@ function fillNotifyForm(d){
     (ch.email ? escapeHtml(ch.email) : '<span class="prob-low">В профиле не указан email — обратитесь к администратору</span>');
   document.getElementById('nfTelegramState').innerHTML = !ch.telegramReady ?
     '<span class="muted-cell">Администратор ещё не подключил Telegram-бота</span>' :
-    (ch.telegramLinked ? '<span class="prob-high">✓ Привязан</span>' :
+    (ch.telegramLinked ? '<span class="prob-high">✓ Привязан</span>' +
+      (ch.telegramCommands ? ' <span class="muted-cell">· спросите бота: /status, /risks, /week</span>' : '') :
       '<span class="muted-cell">Не привязан</span>');
   document.getElementById('nfTelegramLink').hidden = !ch.telegramReady || ch.telegramLinked;
   document.getElementById('nfTelegramUnlink').hidden = !ch.telegramLinked;
@@ -4103,6 +4476,10 @@ function fillNotifyAdmin(d){
   st.textContent = !d.telegram.hasToken ? 'Бот не подключён' : (d.telegram.botName ? '✓ Бот @' + d.telegram.botName : 'Токен сохранён, бот не проверен');
   st.className = 'jira-status' + (d.telegram.botName ? ' ok' : '');
   document.getElementById('naBotRemove').hidden = !d.telegram.hasToken;
+  document.getElementById('naCommands').checked = d.telegram.commands;
+  document.getElementById('naCommandsNote').textContent = 'Привязанный пользователь спрашивает бота о своих проектах — статус и главное, ' +
+    'риски, изменения за неделю.' + (d.telegram.hasToken && d.telegram.commands ? (d.telegram.pollTick ?
+    ' Бот на связи: последний опрос — ' + fmtDateTime(d.telegram.pollTick) + '.' : ' Бот начнёт отвечать в течение минуты.') : '');
   document.getElementById('naUrl').value = d.publicUrl;
 }
 
@@ -4111,7 +4488,7 @@ function notifyAdminData(extra){
     smtp: {host: document.getElementById('naHost').value.trim(), port: parseInt(document.getElementById('naPort').value, 10) || null,
            security: document.getElementById('naSecurity').value, sender: document.getElementById('naSender').value.trim(),
            login: document.getElementById('naLogin').value.trim(), password: document.getElementById('naPassword').value},
-    telegram: {token: document.getElementById('naToken').value.trim()},
+    telegram: {token: document.getElementById('naToken').value.trim(), commands: document.getElementById('naCommands').checked},
     publicUrl: document.getElementById('naUrl').value.trim()
   }, extra || {});
 }
@@ -4139,6 +4516,9 @@ document.getElementById('naTestEmail').addEventListener('click', function(){
     btn.disabled = false;
     loadNotifyLog();
   });
+});
+document.getElementById('naCommands').addEventListener('change', function(e){
+  saveNotifyAdmin(null, e.target.checked ? 'Бот отвечает на команды' : 'Команды бота выключены').catch(function(){});
 });
 document.getElementById('naBotTest').addEventListener('click', function(){
   saveNotifyAdmin().then(function(){
@@ -4191,7 +4571,7 @@ function renderAutofillView(){
   if(!cfg.connected || !cfg.buttons.length){
     box.innerHTML = '<div class="empty-cell autofill-empty">'+(!cfg.connected ?
       (isGlobalAdmin() ? 'Сначала настройте подключение к Jira в разделе «Интеграции».' : 'Подключение к Jira не настроено — обратитесь к администратору.') :
-      'Нет кнопок среза. Создайте кнопку в разделе «Связь с Jira», выполните по ней срез — после этого здесь можно включить расписание.')+'</div>';
+      'Нет кнопок среза. Создайте кнопку в разделе «Jira и Confluence», выполните по ней срез — после этого здесь можно включить расписание.')+'</div>';
     return;
   }
   var browserTz = '';
@@ -4202,11 +4582,12 @@ function renderAutofillView(){
     var zones = TIMEZONES.slice();
     [s.timezone, browserTz].forEach(function(z){ if(z && zones.indexOf(z) === -1) zones.push(z); });
     var status = locked ?
-      '<div class="autofill-lock">🔒 Расписание станет доступно после первого успешного среза по этой кнопке. Выполните срез в разделе «Данные по датам» или «Связь с Jira».</div>' :
+      '<div class="autofill-lock">🔒 Расписание станет доступно после первого успешного среза по этой кнопке. Выполните срез в разделе «Данные по датам» или «Jira и Confluence».</div>' :
       '<dl class="autofill-status">'+
         '<dt>Последний успешный срез</dt><dd>'+fmtDateTime(b.lastSuccessAt)+'</dd>'+
         '<dt>Последний автозапуск</dt><dd>'+(s.lastRunAt ? fmtDateTime(s.lastRunAt) + ' — <span class="autofill-result '+(s.lastStatus === 'ok' ? 'ok' : 'error')+'">'+escapeHtml(s.lastMessage || '')+'</span>' : '—')+'</dd>'+
         '<dt>Следующий запуск</dt><dd>'+(s.enabled && s.nextRunAt ? fmtLocalIso(s.nextRunAt) + ' <span class="muted-cell">('+escapeHtml(s.timezone)+')</span>' : '<span class="muted-cell">расписание выключено</span>')+'</dd>'+
+        (s.onEvents ? '<dt>По событиям Jira</dt><dd>'+(s.eventsRunAt ? fmtDateTime(s.eventsRunAt) + ' — <span class="autofill-result '+(s.eventsStatus === 'ok' ? 'ok' : 'error')+'">'+escapeHtml(s.eventsMessage || '')+'</span>' : '<span class="muted-cell">событий ещё не было</span>')+'</dd>' : '')+
       '</dl>';
     return '<form class="autofill-card'+(locked ? ' locked' : '')+'" data-bid="'+b.id+'" novalidate>'+
       '<div class="autofill-head"><div><div class="autofill-title">'+escapeHtml(b.name)+'</div>'+
@@ -4222,6 +4603,7 @@ function renderAutofillView(){
           return '<option value="'+escapeAttr(z)+'"'+(z === s.timezone ? ' selected' : '')+'>'+escapeHtml(z)+(z === browserTz ? ' — ваш' : '')+'</option>';
         }).join('')+'</select></div>'+
         '<label class="quick-filter-item check-wrap autofill-overwrite"><input type="checkbox" data-f="overwrite"'+(s.overwrite ? ' checked' : '')+'> Перезаписывать замер, если на эту дату он уже внесён</label>'+
+        '<label class="quick-filter-item check-wrap autofill-overwrite" title="Работает, если администратор включил вебхук Jira в разделе «Интеграции»"><input type="checkbox" data-f="onEvents"'+(s.onEvents ? ' checked' : '')+'> Также обновлять замер на сегодня при изменениях задач в Jira (вебхук)</label>'+
       '</fieldset>'+
       '<div class="form-actions">'+
         '<button type="button" class="btn btn-ghost btn-sm" data-action="run"'+(locked ? ' disabled' : '')+'>Запустить сейчас</button>'+
@@ -4237,14 +4619,16 @@ function renderAutofillView(){
         days: Array.prototype.map.call(form.querySelectorAll('[data-day]:checked'), function(c){ return parseInt(c.dataset.day, 10); }),
         time: form.querySelector('[data-f="time"]').value,
         timezone: form.querySelector('[data-f="timezone"]').value,
-        overwrite: form.querySelector('[data-f="overwrite"]').checked
+        overwrite: form.querySelector('[data-f="overwrite"]').checked,
+        onEvents: form.querySelector('[data-f="onEvents"]').checked
       };
       if(body.enabled && !body.days.length){ toast('Выберите хотя бы один день недели'); return; }
       if(!body.time){ toast('Укажите время запуска'); return; }
       apiPut('/api/jira/buttons/'+bid+'/schedule', body).then(function(saved){
         replaceJiraButton(saved);
         renderAutofillView();
-        toast(saved.schedule.enabled ? 'Расписание сохранено: ' + scheduleSummary(saved.schedule) : 'Автозаполнение выключено');
+        toast(saved.schedule.enabled ? 'Расписание сохранено: ' + scheduleSummary(saved.schedule) + (saved.schedule.onEvents ? ' и по событиям Jira' : '') :
+          (saved.schedule.onEvents ? 'Автозаполнение — по событиям Jira' : 'Автозаполнение выключено'));
       }).catch(function(){});
     });
     form.querySelector('[data-action="run"]').addEventListener('click', function(){
@@ -4530,7 +4914,9 @@ function switchProject(pid){
   loadProjectData(pid, GLOBAL_VIEWS.indexOf(currentView) !== -1 ? 'dashboard' : currentView);
 }
 
-function loadProjectData(pid, view){
+/* quiet — только обновить данные проекта, не перерисовывая текущий раздел (иначе затрётся то, что пользователь
+   уже начал вводить) */
+function loadProjectData(pid, view, quiet){
   return api('/api/projects/'+pid+'/data').then(function(data){
     if(pid !== currentProjectId) return; /* пользователь успел переключить проект */
     STATE.services = data.services || [];
@@ -4540,7 +4926,7 @@ function loadProjectData(pid, view){
     loadJiraConfig();
     loadJiraComposition();
     if(!serviceById(currentDataServiceId)) currentDataServiceId = STATE.services.length ? STATE.services[0].id : null;
-    navigate(view || currentView);
+    if(!quiet) navigate(view || currentView);
   });
 }
 
@@ -4571,6 +4957,14 @@ function init(){
     currentUser = data.user;
     currentUser.defaultPassword = !!data.defaultPassword;
     updateRoleUI();
+    /* ссылка на проект из письма или ответа бота: /?project=3 */
+    try {
+      var linked = parseInt(new URLSearchParams(window.location.search).get('project'), 10);
+      if(linked > 0){
+        currentProjectId = linked;
+        if(window.history && window.history.replaceState) window.history.replaceState(null, '', window.location.pathname);
+      }
+    } catch(e){}
     loadProjects();
     if(isGlobalAdmin()) api('/api/admin/health').then(function(h){ setHealthDot(h.status); }).catch(function(){});
   }).catch(function(){
@@ -4584,11 +4978,11 @@ function init(){
 var auditPageLabels = {
   dashboard: 'Дашборд', stages: 'Свод по этапам', data: 'Данные по датам',
   services: 'Эпики', settings: 'Настройки', users: 'Пользователи',
-  projects: 'Проекты', profile: 'Профиль', jira: 'Связь с Jira', notify: 'Рассылки', integrations: 'Интеграции',
-  calendar: 'Производственный календарь', health: 'Состояние системы'
+  projects: 'Проекты', profile: 'Профиль', jira: 'Jira и Confluence', notify: 'Рассылки', integrations: 'Интеграции',
+  calendar: 'Производственный календарь', health: 'Состояние системы', confluence: 'Отчёт в Confluence'
 };
 var auditActionLabels = { create: 'Создание', update: 'Изменение', delete: 'Удаление', autofill: 'Автозаполнение', restore: 'Восстановление истории',
-  sync: 'Синхронизация с Jira' };
+  sync: 'Синхронизация с Jira', writeback: 'Запись в Jira', publish: 'Публикация' };
 var auditEntityLabels = { project: 'Проект', service: 'Эпик', entry: 'Замер', user: 'Пользователь', stage_target: 'Цель этапа', settings: 'Настройки',
   jira_connection: 'Подключение к Jira', jira_button: 'Кнопка среза', jira_schedule: 'Расписание автозаполнения',
   notify_settings: 'Почта и Telegram', org_calendar: 'Производственный календарь', admin_alerts: 'Оповещения администратору' };

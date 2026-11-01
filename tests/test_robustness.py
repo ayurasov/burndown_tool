@@ -1,6 +1,7 @@
 """Отказоустойчивость: сбои Jira, почты и Telegram, планировщика; редкие ветки и отказ в доступе."""
 
 import smtplib
+import threading
 from datetime import datetime, timezone
 
 import pytest
@@ -112,9 +113,15 @@ def test_scheduler_loop_and_start(db_path, monkeypatch):
     assert len(ticks) == 2  # после ошибки цикл продолжился
     monkeypatch.setenv('BURNDOWN_SCHEDULER', '1')
     monkeypatch.setattr(app_module, '_scheduler_loop', lambda: None)
+    polled = []
+    monkeypatch.setattr(app_module, '_telegram_loop', lambda: polled.append(1))  # настоящий опрос бота — бесконечный цикл
     thread = app_module.start_scheduler()
     thread.join(1)
     assert thread.name == 'burndown-autofill'
+    for t in threading.enumerate():
+        if t.name == 'burndown-telegram':
+            t.join(1)
+    assert polled == [1]
 
 
 def test_autofill_internal_error_is_recorded(admin, flask_app, fake, monkeypatch):

@@ -826,6 +826,74 @@ def setup_jira_connection(ui, fake_jira):
     page.wait_for_selector('#jiraProjectStatus.ok')
 
 
+def test_writeback_panel_and_webhook_options(admin_ui, admin, fake_jira):
+    """«Интеграции»: разрешение записи в Jira и вебхук; проект: поля Jira для прогноза и запись в задачи."""
+    page = admin_ui.page
+    setup_jira_connection(admin_ui, fake_jira)
+    admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'structureId': 7, 'structureName': 'Релиз 2026',
+                                                       'mappings': [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]})
+    admin_ui.go('jira')
+    page.wait_for_selector('#wbStatus:has-text("не разрешена")')
+    assert page.is_disabled('#wbRun') and page.is_disabled('#wbField-forecast')
+    admin_ui.go('integrations')
+    page.wait_for_selector('#joWebhookStatus:has-text("выключен")')
+    page.check('#joWriteback')
+    admin_ui.expect_toast('Проекты могут записывать прогноз в Jira')
+    page.click('#joWebhookOn')
+    admin_ui.expect_toast('Вебхук включён — добавьте адрес в настройках Jira')
+    assert '/api/jira/webhook/' in page.input_value('#joWebhookUrl') and page.is_visible('#joWebhookRotate')
+    admin_ui.go('jira')
+    page.wait_for_selector('#wbStatus:has-text("ещё ничего не записывалось")')
+    page.click('#wbLoadFields')
+    admin_ui.expect_toast('Поля Jira загружены: 6')
+    page.select_option('#wbField-forecast', 'customfield_10100')
+    page.select_option('#wbField-status', 'customfield_10101')
+    assert page.locator('#wbField-status option').count() == 3  # только текст и список: «не записывать» + 2 поля
+    page.click('#wbSave')
+    admin_ui.expect_toast('Настройки записи в Jira сохранены')
+    page.wait_for_selector('#wbTable td:has-text("будет записано")')
+    page.click('#wbRun')
+    admin_ui.expect_toast('Записано в Jira: 1 из 1')
+    page.wait_for_selector('#wbTable td:has-text("актуально")')
+    assert fake_jira.state['writes'][0][0] == 'ABC-1'
+    page.check('#wbEnabled')
+    admin_ui.expect_toast('Автоматическая запись в Jira включена')
+
+
+def test_confluence_report_panel(admin_ui, admin):
+    from fake_confluence import FakeConfluence
+    conf = FakeConfluence()
+    try:
+        page = admin_ui.page
+        admin_ui.go('jira')
+        page.wait_for_selector('#crStatus:has-text("Подключение к Confluence не настроено")')
+        assert page.is_disabled('#crPublish')
+        admin_ui.go('integrations')
+        page.wait_for_selector('#confStatus:has-text("не настроено")')
+        page.fill('#confUrl', conf.url)
+        page.fill('#confToken', 'conf-pat')
+        page.click('#confTest')
+        page.wait_for_selector('#confStatus.ok:has-text("Сервисная учётная запись")')
+        page.click('#confSave')
+        admin_ui.expect_toast('Подключение к Confluence сохранено')
+        admin_ui.go('jira')
+        page.wait_for_selector('#crStatus:has-text("ещё не публиковался")')
+        page.fill('#crSpace', 'PROJ')
+        page.select_option('#crMode', 'weekly')
+        page.click('#crSave')
+        admin_ui.expect_toast('Настройки отчёта сохранены')
+        page.click('#crPublish')
+        page.wait_for_selector('#crStatus.ok:has-text("Создана страница")')
+        assert len(conf.state['pages']) == 1 and admin.get('/api/projects/1/confluence').get_json()['mode'] == 'weekly'
+        page.fill('#crSpace', 'NOPE')
+        page.click('#crPublish')
+        page.wait_for_selector('#crStatus.error')
+        page.check('#crEnabled')
+        admin_ui.expect_toast('Еженедельная публикация включена')
+    finally:
+        conf.stop()
+
+
 def test_jira_connection_form(admin_ui, fake_jira):
     page = admin_ui.page
     admin_ui.go('jira')  # в проекте — только состояние общего подключения
@@ -969,7 +1037,7 @@ def test_jira_field_mapping_in_editor(admin_ui, fake_jira, admin):
     page.fill('#jbName', 'Свои поля')
     assert page.input_value('#jbField_remaining') == 'timeestimate' and page.input_value('#jbUnit_remaining') == 'seconds'
     page.click('#jbLoadFields')
-    admin_ui.expect_toast('Числовых полей загружено: 4')
+    admin_ui.expect_toast('Числовых полей загружено: 5')  # с учётом поля «Шанс успеть» для записи прогноза
     page.select_option('#jbField_remaining', 'customfield_10050')
     assert page.input_value('#jbUnit_remaining') == 'hours'  # своё числовое поле — по умолчанию в часах
     page.select_option('#jbField_spent', '')
@@ -1016,6 +1084,11 @@ def test_autofill_page_unlocks_after_snapshot(admin_ui, fake_jira, admin):
     s = admin.get('/api/projects/1/jira').get_json()['buttons'][0]['schedule']
     assert s['enabled'] and s['days'] == [1, 2, 3, 4, 5, 6] and s['timezone'] == 'Asia/Novosibirsk'
     assert '07:30' in admin_ui.text(card) and 'Asia/Novosibirsk' in admin_ui.text(card)
+    page.check(f'{card} [data-f="onEvents"]')
+    page.click(f'{card} button[type="submit"]')
+    admin_ui.expect_toast('Расписание сохранено: Пн, Вт, Ср, Чт, Пт, Сб в 07:30 и по событиям Jira')
+    assert admin.get('/api/projects/1/jira').get_json()['buttons'][0]['schedule']['onEvents'] is True
+    page.wait_for_selector(f'{card} dt:has-text("По событиям Jira")')
     admin_ui.go('jira')
     assert 'автозаполнение: Пн, Вт, Ср, Чт, Пт, Сб в 07:30' in admin_ui.text('#jiraButtonsTable tbody tr')
     # «Запустить сейчас» — замер на сегодня сохранён, статус обновлён
@@ -1353,6 +1426,23 @@ def test_insights_panel_links_to_epic(admin_ui):
     assert page.locator('#insightsBody .insight-stage').count() == 2
     page.locator('#insightsBody .insight-epic > summary').first.click()
     assert page.locator('#insightsBody .insight-epic[open] .insight').count() >= 1
+
+
+def test_weekly_changes_block_and_feed(ui, flask_app):
+    """«Что изменилось за неделю» в «Выводах»: изменения последней недели со ссылкой на эпик и лента по неделям."""
+    from test_changes import recent_measurements
+    recent_measurements(flask_app, [500, 450, 400, 350, 300, 300, 300])
+    admin_ui = ui.login(*ADMIN)
+    page = admin_ui.page
+    page.wait_for_selector('#insightChanges .insight-list')
+    assert 'Что изменилось за неделю' in admin_ui.text('#insightChanges')
+    assert page.locator('#insightChanges .insight-changes-period').count() == 1
+    assert page.locator('#insightChanges > .insight-list .insight').count() >= 1
+    page.click('#insightChanges .insight-feed > summary')
+    assert page.locator('#insightChanges .insight-feed-week').count() >= 1
+    link = page.locator('#insightChanges .insight-subject[data-level="epic"]').first
+    link.click()
+    page.wait_for_function('document.getElementById("chartServiceSelect").value === "1"')
 
 
 def test_stage_insights_open_epic(admin_ui):

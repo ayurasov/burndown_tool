@@ -11,7 +11,10 @@
 import os
 import re
 import math
+import gzip
 import hashlib
+import html
+import pickle
 import secrets
 import shutil
 import sqlite3
@@ -35,6 +38,7 @@ from init_db import (create_auth_tables, create_indexes, create_jira_tables, cre
 import forecast as fc
 import holidays_ru
 import insights as ins
+import confluence
 import jira_integration as jira
 import notify
 
@@ -114,6 +118,8 @@ def migrate_db():
     lock = _migration_lock()
     conn = sqlite3.connect(DB_PATH, timeout=30)
     try:
+        # WAL: чтение не ждёт записи — несколько воркеров и пользователей работают параллельно
+        conn.execute('PRAGMA journal_mode = WAL')
         cols = [r[1] for r in conn.execute('PRAGMA table_info(services)')]
         if 'is_done' not in cols:
             conn.execute('ALTER TABLE services ADD COLUMN is_done INTEGER DEFAULT 0')
@@ -189,9 +195,10 @@ migrate_db()
 
 def get_db():
     if 'db' not in g:
-        g.db = sqlite3.connect(DB_PATH)
+        g.db = sqlite3.connect(DB_PATH, timeout=10)
         g.db.row_factory = sqlite3.Row
         g.db.execute('PRAGMA foreign_keys = ON')
+        g.db.execute('PRAGMA synchronous = NORMAL')  # с WAL: надёжно и без лишних fsync на каждую запись
     return g.db
 
 
@@ -200,6 +207,9 @@ def close_db(error):
     db = g.pop('db', None)
     if db is not None:
         db.close()
+    touched = g.pop('touched_projects', None)
+    if touched and error is None:
+        schedule_warmup(touched)
 
 
 NO_STAGE = 'Без этапа'
@@ -335,6 +345,39 @@ def security_headers(resp):
     resp.headers.setdefault('X-Frame-Options', 'DENY')
     resp.headers.setdefault('Referrer-Policy', 'same-origin')
     resp.headers.setdefault('Content-Security-Policy', "frame-ancestors 'none'")
+    return resp
+
+
+COMPRESS_MIN_BYTES = 1400  # меньше одного сетевого пакета сжимать незачем
+COMPRESSIBLE = {'application/json', 'text/html', 'text/css', 'text/plain', 'text/csv', 'text/javascript',
+                'application/javascript', 'image/svg+xml'}
+
+
+def _etag_matches(header, etag):
+    return any(tag.strip() in (etag, etag[2:], '*') for tag in (header or '').split(','))
+
+
+@app.after_request
+def optimize_response(resp):
+    """ETag для данных (браузер перепроверяет их и получает 304 без тела, если ничего не изменилось)
+    и сжатие gzip текстовых ответов. Файлы (send_file) отдаются как есть."""
+    if resp.direct_passthrough or resp.is_streamed or resp.status_code != 200:
+        return resp
+    if request.method == 'GET' and resp.mimetype == 'application/json' and 'ETag' not in resp.headers:
+        etag = 'W/"' + hashlib.blake2b(resp.get_data(), digest_size=12).hexdigest() + '"'
+        resp.headers['ETag'] = etag
+        resp.headers.setdefault('Cache-Control', 'private, no-cache')
+        if _etag_matches(request.headers.get('If-None-Match'), etag):
+            resp.status_code = 304
+            resp.set_data(b'')
+            return resp
+    if (resp.mimetype in COMPRESSIBLE and 'Content-Encoding' not in resp.headers
+            and 'gzip' in (request.headers.get('Accept-Encoding') or '').lower()):
+        body = resp.get_data()
+        if len(body) >= COMPRESS_MIN_BYTES:
+            resp.set_data(gzip.compress(body, compresslevel=5))
+            resp.headers['Content-Encoding'] = 'gzip'
+            resp.vary.add('Accept-Encoding')
     return resp
 
 
@@ -474,6 +517,8 @@ def audit_log(page, action, entity_type=None, entity_id=None, project_id=None, c
             project_name = p['name']
     if not changes:
         changes = [{'field': None, 'old': None, 'new': None}]
+    if project_id:
+        g.setdefault('touched_projects', set()).add(project_id)
     for ch in changes:
         db.execute('''INSERT INTO audit_log
             (user_id, username, project_id, project_name, page, action,
@@ -550,6 +595,27 @@ def _load_releases():
 
 RELEASES = _load_releases()
 APP_VERSION = RELEASES[0]['version'] if RELEASES else 'dev'  # единственный источник номера версии — docs/versions.md
+
+
+def _asset_version():
+    """Метка версии стилей и скрипта в их адресах: браузер и nginx (кэш статики на 30 дней) получают новые файлы
+    сразу после обновления, а не через месяц."""
+    digest = hashlib.sha1(APP_VERSION.encode('utf-8'))
+    for name in ('js/app.js', 'css/style.css'):
+        try:
+            with open(os.path.join(APP_DIR, 'static', name), 'rb') as f:
+                digest.update(f.read())
+        except OSError:
+            pass
+    return digest.hexdigest()[:10]
+
+
+ASSET_VERSION = _asset_version()
+
+
+@app.context_processor
+def asset_context():
+    return {'asset_v': ASSET_VERSION}
 
 
 @app.route('/api/about')
@@ -787,6 +853,45 @@ def api_delete_project(pid):
     return jsonify({'success': True})
 
 
+_mc_local = threading.local()
+
+
+def _mc_connection():
+    """Отдельное соединение для кэша Монте-Карло: запись в кэш не вмешивается в транзакцию запроса."""
+    conn = getattr(_mc_local, 'conn', None)
+    if conn is None or getattr(_mc_local, 'path', None) != DB_PATH:
+        # mode=rw: кэш не создаёт файл базы, если её ещё нет (расчёт вне приложения, тесты)
+        conn = sqlite3.connect(f'file:{DB_PATH}?mode=rw', uri=True, timeout=0.5, check_same_thread=False)
+        conn.execute('PRAGMA synchronous = NORMAL')
+        _mc_local.conn, _mc_local.path = conn, DB_PATH
+    return conn
+
+
+def _mc_store_key(key):
+    return hashlib.sha1(f'{fc.MC_ALGO}|{key}'.encode('utf-8')).hexdigest()
+
+
+def _mc_store_get(key):
+    try:
+        row = _mc_connection().execute('SELECT value FROM mc_cache WHERE key = ?', (_mc_store_key(key),)).fetchone()
+        return json.loads(row[0]) if row else None
+    except (sqlite3.Error, ValueError):
+        return None
+
+
+def _mc_store_put(key, value):
+    try:
+        conn = _mc_connection()
+        conn.execute('INSERT OR REPLACE INTO mc_cache (key, value, created_at) VALUES (?, ?, ?)',
+                     (_mc_store_key(key), json.dumps(value), _utc_now_iso()))
+        conn.commit()
+    except sqlite3.Error:  # база занята или только для чтения — кэш в памяти процесса всё равно работает
+        pass
+
+
+fc.MC_STORE = (_mc_store_get, _mc_store_put)
+
+
 def org_calendar(db):
     """Общий производственный календарь организации (задаёт администратор) → {'holidays', 'extraWorkdays'}."""
     row = db.execute("SELECT value FROM app_settings WHERE key = 'org_calendar'").fetchone()
@@ -869,7 +974,7 @@ def project_payload(db, pid):
 def api_get_project_data(pid):
     if not can_view_project(session['user_id'], pid):
         return jsonify({'error': 'Нет доступа к проекту'}), 403
-    return jsonify(project_payload(get_db(), pid))
+    return versioned_json('data', pid, lambda: project_payload(get_db(), pid))
 
 
 # ─── API: Services (epics) ───────────────────────────────────────
@@ -1882,9 +1987,12 @@ def api_jira_composition(pid):
     if not can_view_project(session['user_id'], pid):
         return jsonify({'error': 'Нет доступа'}), 403
     db = get_db()
-    history, latest = jira_composition(db, pid)
-    return jsonify({'baseUrl': _jira_base_url(db, pid), 'latest': latest, 'history': history,
-                    'problemLabels': jira.PROBLEMS})
+    base_url = _jira_base_url(db, pid)
+
+    def build():
+        history, latest = jira_composition(db, pid)
+        return {'baseUrl': base_url, 'latest': latest, 'history': history, 'problemLabels': jira.PROBLEMS}
+    return versioned_json('composition', pid, build, extra=base_url, version=snapshots_version(db, pid))
 
 
 def _days(a, b):
@@ -1978,6 +2086,17 @@ def _composition_head(unit):
 
 def jira_composition(db, pid):
     """Состав эпиков проекта по срезам задач → (история по датам, последний срез с проблемами данных)."""
+    return cached_result('composition', pid, snapshots_version(db, pid), lambda: _jira_composition(db, pid))
+
+
+def snapshots_version(db, pid):
+    """Версия состава задач: только срезы Jira (добавляются, id растут) и набор эпиков проекта."""
+    row = db.execute('SELECT group_concat(s.id), MAX((SELECT MAX(j.id) FROM jira_issue_snapshots j '
+                     'WHERE j.service_id = s.id)) FROM services s WHERE s.project_id = ?', (pid,)).fetchone()
+    return f'{row[0]}|{row[1]}'
+
+
+def _jira_composition(db, pid):
     rows = db.execute(
         f'''SELECT s.service_id, s.snap_date, s.category,
                    SUM(CASE WHEN s.container THEN 0 ELSE 1 END) AS cnt,
@@ -2192,10 +2311,13 @@ def _next_run(sched, now_utc=None):
 def _schedule_json(sched):
     if not sched:
         return {'enabled': False, 'days': [1, 2, 3, 4, 5], 'time': '09:00', 'timezone': 'Europe/Moscow',
-                'overwrite': True, 'lastRunAt': None, 'lastStatus': None, 'lastMessage': None, 'nextRunAt': None}
+                'overwrite': True, 'lastRunAt': None, 'lastStatus': None, 'lastMessage': None, 'nextRunAt': None,
+                'onEvents': False, 'eventsRunAt': None, 'eventsStatus': None, 'eventsMessage': None}
     return {'enabled': bool(sched['enabled']), 'days': _schedule_days(sched['days']), 'time': sched['run_time'],
             'timezone': sched['timezone'], 'overwrite': bool(sched['overwrite']), 'lastRunAt': sched['last_run_at'],
-            'lastStatus': sched['last_status'], 'lastMessage': sched['last_message'], 'nextRunAt': _next_run(sched)}
+            'lastStatus': sched['last_status'], 'lastMessage': sched['last_message'], 'nextRunAt': _next_run(sched),
+            'onEvents': bool(sched['on_events']), 'eventsRunAt': sched['events_run_at'],
+            'eventsStatus': sched['events_status'], 'eventsMessage': sched['events_message']}
 
 
 @app.route('/api/jira/buttons/<int:bid>/schedule', methods=['PUT'])
@@ -2224,7 +2346,8 @@ def save_schedule(db, row, data):
     tz = _zone(tz_name)
     if enabled and not days:
         raise ValidationError('Выберите хотя бы один день недели')
-    if enabled and not row['last_success_at']:
+    on_events = bool(data.get('onEvents'))
+    if (enabled or on_events) and not row['last_success_at']:
         raise ValidationError('Автозаполнение доступно после первого успешного среза по этой кнопке')
     existing = db.execute('SELECT * FROM jira_schedules WHERE button_id = ?', (bid,)).fetchone()
     # если сегодняшнее время запуска уже прошло, первый автоматический запуск — в следующий день по расписанию
@@ -2233,18 +2356,21 @@ def save_schedule(db, row, data):
     if enabled and local.strftime('%H:%M') >= run_time and not (existing and existing['enabled']):
         last_run_date = local.date().isoformat()
     values = (1 if enabled else 0, ','.join(str(d) for d in days), run_time, tz_name,
-              1 if data.get('overwrite', True) else 0, last_run_date)
+              1 if data.get('overwrite', True) else 0, last_run_date, 1 if on_events else 0)
     if existing:
         db.execute('UPDATE jira_schedules SET enabled = ?, days = ?, run_time = ?, timezone = ?, overwrite = ?, '
-                   'last_run_date = ? WHERE button_id = ?', values + (bid,))
+                   'last_run_date = ?, on_events = ? WHERE button_id = ?', values + (bid,))
     else:
-        db.execute('INSERT INTO jira_schedules (enabled, days, run_time, timezone, overwrite, last_run_date, button_id) '
-                   'VALUES (?, ?, ?, ?, ?, ?, ?)', values + (bid,))
+        db.execute('INSERT INTO jira_schedules (enabled, days, run_time, timezone, overwrite, last_run_date, on_events, '
+                   'button_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', values + (bid,))
+    if not on_events:
+        db.execute('DELETE FROM jira_event_queue WHERE button_id = ?', (bid,))
     db.commit()
-    audit_log('jira', 'update', 'jira_schedule', bid, row['project_id'],
-              [{'field': 'autofill', 'old': None,
-                'new': (f"{','.join(str(d) for d in days)} в {run_time} ({tz_name})" if enabled else 'выключено')}],
-              entity_name=row['name'])
+    changes = [{'field': 'autofill', 'old': None,
+                'new': (f"{','.join(str(d) for d in days)} в {run_time} ({tz_name})" if enabled else 'выключено')}]
+    if bool(existing and existing['on_events']) != on_events:
+        changes.append({'field': 'onEvents', 'old': None, 'new': 'по событиям Jira' if on_events else 'выключено'})
+    audit_log('jira', 'update', 'jira_schedule', bid, row['project_id'], changes, entity_name=row['name'])
 
 
 def run_autofill(db, button_row, local_date, actor, overwrite=True):
@@ -2580,6 +2706,726 @@ def run_due_schedules(now_utc=None):
     return done
 
 
+# ─── Запись прогноза в задачи Jira ───────────────────────────────
+# Проект (по разрешению администратора) записывает в пользовательские поля задач Jira прогноз завершения,
+# статус сроков, шанс успеть и главный вывод по каждому эпику. Задача эпика — первая задача в его привязке к кнопке
+# среза. Записываются только изменившиеся значения: вручную («Записать сейчас») и автоматически, когда меняются
+# данные проекта (не чаще раза в WRITEBACK_MIN_INTERVAL секунд).
+
+WRITEBACK_MIN_INTERVAL = 600
+WRITEBACK_MAX_ERRORS = 5
+WRITEBACK_STATUS = {'ok': 'Успевает', 'risk': 'Риск', 'danger': 'Не успевает', 'notarget': 'Нет цели',
+                    'unknown': 'Нет прогноза'}
+
+
+def writeback_allowed(db):
+    return _app_setting(db, 'jira_writeback_allowed') == '1'
+
+
+def writeback_config(db, pid):
+    row = db.execute('SELECT * FROM jira_writeback WHERE project_id = ?', (pid,)).fetchone()
+    fields = {}
+    try:
+        raw = json.loads(row['fields']) if row and row['fields'] else {}
+    except ValueError:
+        raw = {}
+    for kind in jira.WRITEBACK_KINDS:
+        f = raw.get(kind) if isinstance(raw, dict) else None
+        if isinstance(f, dict) and f.get('id') and f.get('type') in jira.WRITABLE_TYPES:
+            fields[kind] = {'id': f['id'], 'name': f.get('name') or f['id'], 'type': f['type']}
+    return {'enabled': bool(row and row['enabled']), 'fields': fields,
+            'lastAt': row['last_at'] if row else None, 'lastStatus': row['last_status'] if row else None,
+            'lastMessage': row['last_message'] if row else None}
+
+
+def parse_writeback(data):
+    raw = data.get('fields') or {}
+    if not isinstance(raw, dict):
+        raise ValidationError('Поля Jira — объект {показатель: поле}')
+    fields, used = {}, set()
+    for kind, (label, types) in jira.WRITEBACK_KINDS.items():
+        f = raw.get(kind)
+        if not f:
+            continue
+        if not isinstance(f, dict):
+            raise ValidationError(f'«{label}»: некорректное поле Jira')
+        fid = text_value(f.get('id'), 100)
+        if not fid.startswith('customfield_') or not jira.FIELD_ID_RE.match(fid):
+            raise ValidationError(f'«{label}»: выберите пользовательское поле Jira (customfield_…)')
+        if f.get('type') not in types:
+            raise ValidationError(f'«{label}»: поле типа «{jira.WRITABLE_TYPES.get(f.get("type"), f.get("type"))}» не подходит '
+                                  f'— нужно: {", ".join(jira.WRITABLE_TYPES[t] for t in types)}')
+        if fid in used:
+            raise ValidationError('Одно поле Jira выбрано для двух показателей')
+        used.add(fid)
+        fields[kind] = {'id': fid, 'name': text_value(f.get('name'), 200) or fid, 'type': f['type']}
+    enabled = bool(data.get('enabled'))
+    if enabled and not fields:
+        raise ValidationError('Выберите хотя бы одно поле Jira для записи')
+    return enabled, fields
+
+
+def epic_issue_keys(db, pid):
+    """Задача Jira каждого эпика — первая в его привязке к кнопке среза (кнопки — по порядку)."""
+    out = {}
+    for m in db.execute('SELECT m.service_id, m.issue_keys FROM jira_snapshot_mappings m '
+                        'JOIN jira_snapshot_buttons b ON b.id = m.button_id WHERE b.project_id = ? '
+                        'ORDER BY b.sort_order, b.id, m.id', (pid,)):
+        if m['service_id'] in out:
+            continue
+        keys = jira.parse_issue_keys(m['issue_keys'])[0]
+        if keys:
+            out[m['service_id']] = keys[0]
+    return out
+
+
+def writeback_values(e, fields):
+    """Значения эпика для полей Jira → ({id поля: значение для Jira}, {показатель: значение для показа})."""
+    out, shown = {}, {}
+    for kind, f in fields.items():
+        if kind == 'forecast':
+            blocked = e['noBurn'] or e['tooFar'] or not e['forecast']
+            if f['type'] == 'string':
+                v = '> 3 лет' if e['tooFar'] else ('не сгорает' if e['noBurn'] else (_fmt_date(e['forecast']) if e['forecast'] else None))
+            else:
+                v = None if blocked else e['forecast']
+        elif kind == 'status':
+            v = 'Завершён' if e['finished'] else WRITEBACK_STATUS.get(e['status'])
+        elif kind == 'chance':
+            v = None if e['probability'] is None else fc.js_round(e['probability'] * 100)
+            if v is not None and f['type'] == 'string':
+                v = f'{v} %'
+        else:
+            v = e['headline']['text'] if e.get('headline') else None
+        out[f['id']] = jira.field_value(f['type'], v)
+        shown[kind] = v
+    return out, shown
+
+
+def writeback_plan(db, pid):
+    """Что и куда будет записано: по эпикам — задача, значения, изменились ли они с прошлой записи."""
+    cfg = writeback_config(db, pid)
+    data = project_insights(db, pid)
+    keys = epic_issue_keys(db, pid)
+    state = {r['service_id']: r for r in db.execute(
+        'SELECT w.* FROM jira_writeback_state w JOIN services s ON s.id = w.service_id WHERE s.project_id = ?', (pid,))}
+    rows = []
+    for e in data['epics']:
+        item = {'serviceId': e['id'], 'epic': e['name'], 'issue': keys.get(e['id']), 'values': {}, 'fields': {},
+                'changed': False}
+        if item['issue'] and cfg['fields']:
+            fields, shown = writeback_values(e, cfg['fields'])
+            prev = state.get(e['id'])
+            encoded = json.dumps(fields, sort_keys=True, ensure_ascii=False)
+            item.update(values=shown, fields=fields,
+                        changed=not prev or prev['issue_key'] != item['issue'] or prev['fields'] != encoded)
+        rows.append(item)
+    return cfg, rows
+
+
+def run_writeback(db, pid, actor=None, force=False, client=None):
+    """Записать изменившиеся значения в задачи Jira → (статус ok|warning|error|skip, сообщение)."""
+    cfg, rows = writeback_plan(db, pid)
+    targets = [r for r in rows if r['issue'] and r['fields'] and (force or r['changed'])]
+    written, errors = 0, []
+    if not cfg['fields']:
+        status, message = 'skip', 'Не выбраны поля Jira для записи'
+    elif not targets:
+        status, message = 'ok', 'Изменений нет — в Jira всё актуально'
+    else:
+        try:
+            client = client or _jira_client(db)
+        except jira.JiraError as e:
+            errors.append(str(e))
+        for r in targets if client else []:
+            try:
+                client.update_issue(r['issue'], r['fields'])
+            except jira.JiraError as e:
+                errors.append(f"{r['issue']}: {e}")
+                if len(errors) >= WRITEBACK_MAX_ERRORS:
+                    break
+                continue
+            written += 1
+            db.execute('INSERT OR REPLACE INTO jira_writeback_state (service_id, issue_key, fields, written_at) '
+                       'VALUES (?, ?, ?, ?)', (r['serviceId'], r['issue'],
+                                               json.dumps(r['fields'], sort_keys=True, ensure_ascii=False), _utc_now_iso()))
+        status = 'error' if errors and not written else ('warning' if errors else 'ok')
+        message = f'Записано в Jira: {written} из {len(targets)}'
+        if errors:
+            message += '. Ошибки: ' + '; '.join(errors[:3]) + (f' и ещё {len(errors) - 3}' if len(errors) > 3 else '')
+        record_jira_health(db, written > 0 or not errors, errors[0] if errors else None)
+    db.execute('INSERT INTO jira_writeback (project_id) VALUES (?) ON CONFLICT(project_id) DO NOTHING', (pid,))
+    db.execute('UPDATE jira_writeback SET last_at = ?, last_status = ?, last_message = ? WHERE project_id = ?',
+               (_utc_now_iso(), status, message[:1000], pid))
+    if status == 'error':  # повторить при следующей проверке, даже если данные не менялись
+        db.execute('UPDATE jira_writeback SET last_version = NULL WHERE project_id = ?', (pid,))
+    if actor and written:
+        audit_log('jira', 'writeback', 'jira_writeback', pid, pid, [{'field': 'result', 'old': None, 'new': message}],
+                  entity_name='Прогноз в Jira', commit=False, actor=actor)
+    db.commit()
+    return status, message
+
+
+def run_due_writebacks(now_utc=None):
+    """Автоматическая запись: у проектов с включённой записью изменились данные (или наступил новый день)."""
+    db = get_db()
+    if not writeback_allowed(db):
+        return 0
+    now_utc = now_utc or datetime.now(timezone.utc)
+    done = 0
+    for row in db.execute('SELECT * FROM jira_writeback WHERE enabled = 1').fetchall():
+        pid = row['project_id']
+        version = project_version(db, pid) + '|' + now_utc.date().isoformat()
+        if row['last_version'] == version:
+            continue
+        if row['last_at'] and (now_utc - datetime.strptime(row['last_at'], '%Y-%m-%d %H:%M:%S').replace(
+                tzinfo=timezone.utc)).total_seconds() < WRITEBACK_MIN_INTERVAL:
+            continue
+        claimed = db.execute('UPDATE jira_writeback SET last_version = ? WHERE project_id = ? AND enabled = 1 '
+                             'AND (last_version IS NULL OR last_version != ?)', (version, pid, version)).rowcount
+        db.commit()
+        if not claimed:
+            continue
+        try:
+            run_writeback(db, pid, actor=AUTOFILL_ACTOR)
+        except Exception:  # noqa: BLE001 — сбой одного проекта не останавливает планировщик
+            db.rollback()
+            logger.exception('jira writeback failed for project %s', pid)
+        done += 1
+    return done
+
+
+def _writeback_json(db, pid):
+    cfg, rows = writeback_plan(db, pid)
+    return dict(cfg, allowed=writeback_allowed(db), connected=bool(jira_connection(db)),
+                kinds=[{'kind': k, 'label': label, 'types': list(types)} for k, (label, types) in jira.WRITEBACK_KINDS.items()],
+                epics=[{k: r[k] for k in ('serviceId', 'epic', 'issue', 'values', 'changed')} for r in rows])
+
+
+def _project_editor_or_403(pid):
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    if not get_db().execute('SELECT 1 FROM projects WHERE id = ?', (pid,)).fetchone():
+        return jsonify({'error': 'Проект не найден'}), 404
+    return None
+
+
+@app.route('/api/projects/<int:pid>/jira/writeback')
+@login_required
+def api_get_writeback(pid):
+    err = _project_editor_or_403(pid)
+    return err or jsonify(_writeback_json(get_db(), pid))
+
+
+@app.route('/api/projects/<int:pid>/jira/writeback', methods=['PUT'])
+@login_required
+def api_save_writeback(pid):
+    err = _project_editor_or_403(pid)
+    if err:
+        return err
+    db = get_db()
+    if not writeback_allowed(db):
+        return jsonify({'error': 'Запись в Jira не разрешена администратором (раздел «Интеграции»)'}), 403
+    enabled, fields = parse_writeback(json_body())
+    old = writeback_config(db, pid)
+    db.execute('INSERT INTO jira_writeback (project_id, enabled, fields) VALUES (?, ?, ?) ON CONFLICT(project_id) '
+               'DO UPDATE SET enabled = excluded.enabled, fields = excluded.fields, last_version = NULL',
+               (pid, 1 if enabled else 0, json.dumps(fields, ensure_ascii=False)))
+    db.commit()
+    changes = []
+    if old['enabled'] != enabled:
+        changes.append({'field': 'enabled', 'old': old['enabled'], 'new': enabled})
+    for kind, (label, _types) in jira.WRITEBACK_KINDS.items():
+        a, b = (old['fields'].get(kind) or {}).get('name'), (fields.get(kind) or {}).get('name')
+        if a != b:
+            changes.append({'field': kind, 'old': a, 'new': b})
+    if changes:
+        audit_log('jira', 'update', 'jira_writeback', pid, pid, changes, entity_name='Прогноз в Jira')
+    return jsonify(_writeback_json(db, pid))
+
+
+@app.route('/api/projects/<int:pid>/jira/writable-fields')
+@login_required
+def api_jira_writable_fields(pid):
+    err = _project_editor_or_403(pid)
+    if err:
+        return err
+    db = get_db()
+    try:
+        client = _jira_client(db, detailed=get_current_user()['role'] == 'admin')
+        return jsonify(jira.writable_fields(client.fields()))
+    except jira.JiraError as e:
+        return _jira_error(e)
+
+
+@app.route('/api/projects/<int:pid>/jira/writeback/run', methods=['POST'])
+@login_required
+def api_run_writeback(pid):
+    err = _project_editor_or_403(pid)
+    if err:
+        return err
+    db = get_db()
+    if not writeback_allowed(db):
+        return jsonify({'error': 'Запись в Jira не разрешена администратором (раздел «Интеграции»)'}), 403
+    status, message = run_writeback(db, pid, actor=get_current_user()['username'], force=bool(json_body().get('force')))
+    return jsonify(dict(_writeback_json(db, pid), result={'status': status, 'message': message}))
+
+
+# ─── Вебхуки Jira: обновление по событиям ────────────────────────
+# Jira сообщает об изменении задачи → кнопки среза, в которых она участвует (по привязке или последнему срезу)
+# и у которых включено «по событиям Jira», ставятся в очередь. Через WEBHOOK_DELAY секунд (серия правок —
+# один запуск, не чаще раза в WEBHOOK_MIN_INTERVAL) выполняется автозаполнение на сегодня.
+
+WEBHOOK_DELAY = 120
+WEBHOOK_MIN_INTERVAL = 600
+WEBHOOK_ACTOR = 'Изменения в Jira'
+
+
+def webhook_issue_keys(payload):
+    """Ключи задач из события Jira: сама задача, родитель и ссылки на эпик в полях."""
+    issue = payload.get('issue') if isinstance(payload, dict) else None
+    if not isinstance(issue, dict):
+        return set()
+    keys = set()
+    if isinstance(issue.get('key'), str):
+        keys.add(issue['key'])
+    fields = issue.get('fields') if isinstance(issue.get('fields'), dict) else {}
+    for value in fields.values():
+        if isinstance(value, dict) and isinstance(value.get('key'), str):
+            value = value['key']
+        if isinstance(value, str) and jira.ISSUE_KEY_RE.match(value):
+            keys.add(value)
+    return {k for k in keys if jira.ISSUE_KEY_RE.match(k)}
+
+
+def buttons_for_issues(db, keys):
+    """Кнопки с «по событиям Jira», к которым относятся задачи: по привязке эпиков или по последним срезам."""
+    if not keys:
+        return set()
+    rows = db.execute('SELECT m.button_id, m.service_id, m.issue_keys FROM jira_snapshot_mappings m '
+                      'JOIN jira_schedules s ON s.button_id = m.button_id WHERE s.on_events = 1').fetchall()
+    if not rows:
+        return set()
+    marks = ','.join('?' * len(keys))
+    services = {r[0] for r in db.execute(f'SELECT DISTINCT service_id FROM jira_issue_snapshots WHERE issue_key IN ({marks})',
+                                         tuple(keys))}
+    out = set()
+    for r in rows:
+        if r['service_id'] in services or set(jira.parse_issue_keys(r['issue_keys'])[0]) & keys:
+            out.add(r['button_id'])
+    return out
+
+
+def enqueue_button_events(db, buttons, keys, now_utc=None):
+    now_utc = now_utc or datetime.now(timezone.utc)
+    stamp = lambda t: t.strftime('%Y-%m-%d %H:%M:%S')  # noqa: E731
+    for bid in buttons:
+        sched = db.execute('SELECT events_run_at FROM jira_schedules WHERE button_id = ?', (bid,)).fetchone()
+        due = now_utc + timedelta(seconds=WEBHOOK_DELAY)
+        if sched and sched['events_run_at']:
+            last = datetime.strptime(sched['events_run_at'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            due = max(due, last + timedelta(seconds=WEBHOOK_MIN_INTERVAL))
+        db.execute('INSERT INTO jira_event_queue (button_id, due_at, events, last_keys) VALUES (?, ?, 1, ?) '
+                   'ON CONFLICT(button_id) DO UPDATE SET events = events + 1, last_keys = excluded.last_keys',
+                   (bid, stamp(due), ', '.join(sorted(keys))[:300]))
+
+
+@app.route('/api/jira/webhook/<secret>', methods=['POST'])
+def api_jira_webhook(secret):
+    """Приём событий Jira (адрес с секретом выдаёт администратор в «Интеграциях»). Без сессии: Jira не входит в систему."""
+    db = get_db()
+    expected = _app_setting(db, 'jira_webhook_secret')
+    if not expected or not secrets.compare_digest(secret.encode('utf-8'), expected.encode('utf-8')):
+        return jsonify({'error': 'Неизвестный адрес'}), 404
+    payload = request.get_json(silent=True) or {}
+    keys = webhook_issue_keys(payload)
+    buttons = buttons_for_issues(db, keys)
+    enqueue_button_events(db, buttons, keys)
+    _set_setting(db, 'jira_webhook_last', json.dumps({
+        'at': _utc_now_iso(), 'event': str(payload.get('webhookEvent') or '')[:80] if isinstance(payload, dict) else '',
+        'keys': sorted(keys)[:5], 'buttons': len(buttons)}, ensure_ascii=False))
+    db.commit()
+    return jsonify({'queued': len(buttons)})
+
+
+def run_due_events(now_utc=None):
+    """Автозаполнение по событиям Jira, срок которого наступил (одна кнопка — один процесс)."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    db = get_db()
+    done = 0
+    for item in db.execute('SELECT * FROM jira_event_queue WHERE due_at <= ? ORDER BY due_at',
+                           (now_utc.strftime('%Y-%m-%d %H:%M:%S'),)).fetchall():
+        claimed = db.execute('DELETE FROM jira_event_queue WHERE button_id = ? AND due_at = ?',
+                             (item['button_id'], item['due_at'])).rowcount
+        db.commit()
+        if not claimed:
+            continue
+        sched = db.execute('SELECT * FROM jira_schedules WHERE button_id = ? AND on_events = 1', (item['button_id'],)).fetchone()
+        button = db.execute('SELECT * FROM jira_snapshot_buttons WHERE id = ?', (item['button_id'],)).fetchone()
+        if not sched or not button:
+            continue
+        try:
+            today = now_utc.astimezone(ZoneInfo(sched['timezone'])).date().isoformat()
+        except (ZoneInfoNotFoundError, ValueError):
+            today = now_utc.date().isoformat()
+        try:
+            status, message = run_autofill(db, button, today, WEBHOOK_ACTOR, overwrite=bool(sched['overwrite']))
+        except Exception as e:  # noqa: BLE001
+            db.rollback()
+            logger.exception('event autofill failed for button %s', item['button_id'])
+            status, message = 'error', f'Внутренняя ошибка: {e}'
+        message = f"{message} (событий Jira: {item['events']}, задачи: {item['last_keys']})"
+        db.execute('UPDATE jira_schedules SET events_run_at = ?, events_status = ?, events_message = ? WHERE button_id = ?',
+                   (_utc_now_iso(), status, message[:1000], item['button_id']))
+        audit_log('jira', 'autofill', 'jira_button', button['id'], button['project_id'],
+                  [{'field': 'result', 'old': None, 'new': message}], entity_name=button['name'], commit=False,
+                  actor=WEBHOOK_ACTOR)
+        if status == 'error':
+            queue_autofill_error(db, button, message)
+        db.commit()
+        done += 1
+    return done
+
+
+def _jira_options_json(db):
+    secret = _app_setting(db, 'jira_webhook_secret')
+    base = (notify_settings(db).get('public_url') or request.host_url).rstrip('/')
+    return {'writebackAllowed': writeback_allowed(db),
+            'webhook': {'enabled': bool(secret), 'url': f'{base}/api/jira/webhook/{secret}' if secret else '',
+                        'last': _json_setting(db, 'jira_webhook_last', {}) or None}}
+
+
+@app.route('/api/admin/jira-options')
+@admin_required
+def api_get_jira_options():
+    return jsonify(_jira_options_json(get_db()))
+
+
+@app.route('/api/admin/jira-options', methods=['PUT'])
+@admin_required
+def api_save_jira_options():
+    db = get_db()
+    data = json_body()
+    changes = []
+    if 'writebackAllowed' in data:
+        allowed = bool(data['writebackAllowed'])
+        if allowed != writeback_allowed(db):
+            changes.append({'field': 'writebackAllowed', 'old': not allowed, 'new': allowed})
+        _set_setting(db, 'jira_writeback_allowed', '1' if allowed else None)
+    if 'webhook' in data:
+        enable = bool(data['webhook'])
+        had = bool(_app_setting(db, 'jira_webhook_secret'))
+        if enable and (not had or data.get('rotate')):
+            _set_setting(db, 'jira_webhook_secret', secrets.token_urlsafe(24))
+            changes.append({'field': 'webhook', 'old': None, 'new': 'новый адрес' if had else 'включён'})
+        elif not enable and had:
+            _set_setting(db, 'jira_webhook_secret', None)
+            db.execute('DELETE FROM jira_event_queue')
+            changes.append({'field': 'webhook', 'old': None, 'new': 'выключен'})
+    db.commit()
+    if changes:
+        audit_log('integrations', 'update', 'jira_options', None, None, changes, entity_name='Jira: запись и вебхуки')
+    return jsonify(_jira_options_json(db))
+
+
+# ─── Отчёт в Confluence ──────────────────────────────────────────
+# Подключение к Confluence общее (администратор, «Интеграции»); проект публикует отчёт — сводку, риски, изменения
+# за неделю, этапы и эпики — вручную или раз в неделю по расписанию: обновляет одну страницу или создаёт новую
+# страницу недели.
+
+CONF_KEYS = ('conf_base_url', 'conf_instance_type', 'conf_login', 'conf_token', 'conf_insecure')
+CONFLUENCE_NOT_CONFIGURED = 'Подключение к Confluence не настроено — обратитесь к администратору (раздел «Интеграции»)'
+CONFLUENCE_ACTOR = 'Отчёт в Confluence'
+CONFLUENCE_MODES = ('single', 'weekly')
+DEFAULT_REPORT_TITLE = 'Burndown — {project}'
+
+
+def confluence_connection(db):
+    cfg = {r['key']: r['value'] for r in db.execute(
+        'SELECT key, value FROM app_settings WHERE key IN (' + ','.join('?' * len(CONF_KEYS)) + ')', CONF_KEYS)}
+    if not cfg.get('conf_base_url'):
+        return None
+    return {'base_url': cfg['conf_base_url'], 'instance_type': cfg.get('conf_instance_type') or 'server',
+            'login': cfg.get('conf_login') or '', 'token_encrypted': cfg.get('conf_token'),
+            'accept_invalid_certs': cfg.get('conf_insecure') == '1'}
+
+
+def _confluence_json(c):
+    if not c:
+        return None
+    return {'baseUrl': c['base_url'], 'instanceType': c['instance_type'], 'login': c['login'],
+            'acceptInvalidCerts': c['accept_invalid_certs'], 'hasToken': bool(c['token_encrypted'])}
+
+
+def _confluence_client(db, override=None):
+    saved = confluence_connection(db)
+    if override is None:
+        if not saved:
+            raise confluence.ConfluenceError(CONFLUENCE_NOT_CONFIGURED)
+        conf = {'baseUrl': saved['base_url'], 'instanceType': saved['instance_type'], 'login': saved['login'],
+                'acceptInvalidCerts': saved['accept_invalid_certs'], 'token': ''}
+    else:
+        conf = override
+    base_url = text_value(conf.get('baseUrl')).rstrip('/')
+    token = conf.get('token') or ''
+    if not isinstance(token, str):
+        raise confluence.ConfluenceError('Некорректный токен')
+    if not token:
+        # сохранённый токен уходит только на тот же адрес, для которого он был введён
+        if not saved or not saved['token_encrypted'] or base_url != saved['base_url']:
+            raise confluence.ConfluenceError('Укажите токен или пароль')
+        try:
+            token = jira.decrypt_token(app.secret_key, saved['token_encrypted'])
+        except jira.JiraError as e:
+            raise confluence.ConfluenceError(str(e))
+    login = text_value(conf.get('login'), 300)
+    if conf.get('instanceType') != 'server' and not login:
+        raise confluence.ConfluenceError('Укажите email или логин')
+    return confluence.ConfluenceClient(base_url, conf.get('instanceType'), login, token,
+                                       accept_invalid_certs=bool(conf.get('acceptInvalidCerts')))
+
+
+@app.route('/api/admin/confluence-connection')
+@admin_required
+def api_get_confluence_connection():
+    return jsonify(_confluence_json(confluence_connection(get_db())))
+
+
+@app.route('/api/admin/confluence-connection', methods=['PUT'])
+@admin_required
+def api_save_confluence_connection():
+    data = json_body()
+    try:
+        base_url = confluence.check_base_url(text_value(data.get('baseUrl')))
+    except confluence.ConfluenceError as e:
+        raise ValidationError(str(e))
+    instance_type = data.get('instanceType')
+    if instance_type not in confluence.INSTANCE_TYPES:
+        raise ValidationError('Недопустимый тип подключения')
+    login = text_value(data.get('login'), 300)
+    if instance_type != 'server' and not login:
+        raise ValidationError('Укажите email или логин')
+    token = data.get('token') or ''
+    if not isinstance(token, str):
+        raise ValidationError('Токен — строка')
+    db = get_db()
+    existing = confluence_connection(db)
+    if not token and not (existing and existing['token_encrypted']):
+        raise ValidationError('Укажите токен или пароль')
+    if not token and existing['base_url'] != base_url:
+        raise ValidationError('Адрес Confluence изменён — введите токен или пароль заново')
+    encrypted = jira.encrypt_token(app.secret_key, token) if token else existing['token_encrypted']
+    for key, value in (('conf_base_url', base_url), ('conf_instance_type', instance_type), ('conf_login', login or None),
+                       ('conf_token', encrypted), ('conf_insecure', '1' if data.get('acceptInvalidCerts') else None)):
+        _set_setting(db, key, value)
+    db.commit()
+    changes = [c for c in (text_change(existing['base_url'] if existing else None, base_url, 'confluenceUrl'),
+                           text_change(existing['instance_type'] if existing else None, instance_type, 'confluenceAuth'),
+                           text_change(existing['login'] if existing else None, login, 'confluenceLogin'))
+               if c['old'] != c['new']]
+    if token:
+        changes.append({'field': 'confluenceToken', 'old': None, 'new': 'изменён'})
+    if changes:
+        audit_log('integrations', 'update' if existing else 'create', 'confluence_connection', None, None, changes,
+                  entity_name='Confluence')
+    return jsonify(_confluence_json(confluence_connection(db)))
+
+
+@app.route('/api/admin/confluence-connection', methods=['DELETE'])
+@admin_required
+def api_delete_confluence_connection():
+    db = get_db()
+    if confluence_connection(db):
+        for key in CONF_KEYS:
+            _set_setting(db, key, None)
+        db.commit()
+        audit_log('integrations', 'delete', 'confluence_connection', None, None, entity_name='Confluence')
+    return jsonify({'success': True})
+
+
+@app.route('/api/admin/confluence-connection/test', methods=['POST'])
+@admin_required
+def api_test_confluence_connection():
+    data = json_body()
+    try:
+        client = _confluence_client(get_db(), data if data.get('baseUrl') else None)
+        return jsonify({'user': client.current_user()})
+    except confluence.ConfluenceError as e:
+        return jsonify({'error': str(e)}), 502
+
+
+def confluence_config(db, pid):
+    row = db.execute('SELECT * FROM confluence_reports WHERE project_id = ?', (pid,)).fetchone()
+    if not row:
+        return {'enabled': False, 'spaceKey': '', 'parentId': '', 'title': DEFAULT_REPORT_TITLE, 'mode': 'single',
+                'weekday': 1, 'time': '09:00', 'timezone': 'Europe/Moscow', 'pageId': None, 'pageUrl': None,
+                'lastAt': None, 'lastStatus': None, 'lastMessage': None}
+    return {'enabled': bool(row['enabled']), 'spaceKey': row['space_key'] or '', 'parentId': row['parent_id'] or '',
+            'title': row['title'] or DEFAULT_REPORT_TITLE, 'mode': row['mode'] or 'single', 'weekday': row['weekday'] or 1,
+            'time': row['run_time'] or '09:00', 'timezone': row['timezone'] or 'Europe/Moscow', 'pageId': row['page_id'],
+            'pageUrl': row['page_url'], 'lastAt': row['last_at'], 'lastStatus': row['last_status'],
+            'lastMessage': row['last_message']}
+
+
+def report_page_title(cfg, project_name, today):
+    title = (cfg['title'] or DEFAULT_REPORT_TITLE).replace('{project}', project_name)
+    if cfg['mode'] == 'weekly':
+        day = datetime.strptime(today, '%Y-%m-%d').date()
+        monday = day - timedelta(days=day.weekday())
+        sunday = monday + timedelta(days=6)
+        title += f' — неделя {day.isocalendar()[1]} ({monday:%d.%m}–{sunday:%d.%m.%Y})'
+    return title[:255]
+
+
+def confluence_report_data(db, pid):
+    data = project_insights(db, pid)
+    settings = project_settings(db, pid)
+    s = data['summary']
+    weeks = insight_changes(db, pid, 1)['weeks']
+
+    def row(x):
+        return {'name': x['name'], 'status': x['status'], 'remaining': ins.fmt_work(x['remaining'], settings),
+                'forecast': _forecast_text(x), 'target': _fmt_date(x['target']), 'chance': _pct(x['probability']),
+                'headline': x['headline']['text'] if x.get('headline') else ''}
+    url = (notify_settings(db).get('public_url') or '').rstrip('/')
+    return {'project': data['project']['name'], 'date': _fmt_date(data['date']), 'status': s['status'],
+            'headline': s['headline'], 'facts': s['facts'], 'top': s['top'], 'health': s['health'],
+            'week': dict(weeks[0], **{'from': _fmt_date(weeks[0]['from']), 'to': _fmt_date(weeks[0]['to'])}) if weeks else None,
+            'stages': [row(x) for x in data['stages']], 'epics': [row(x) for x in data['epics']],
+            'url': f'{url}/?project={pid}' if url else ''}
+
+
+def publish_report(db, pid, actor=None, client=None):
+    """Опубликовать отчёт проекта в Confluence → (статус ok|error, сообщение, адрес страницы)."""
+    cfg = confluence_config(db, pid)
+    project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
+    today = datetime.now().date().isoformat()
+    title = report_page_title(cfg, project['name'], today)
+    url = cfg['pageUrl']
+    try:
+        if not cfg['spaceKey']:
+            raise confluence.ConfluenceError('Укажите пространство Confluence')
+        client = client or _confluence_client(db)
+        result = client.publish(cfg['spaceKey'], title, confluence.report_storage(confluence_report_data(db, pid)),
+                                parent_id=cfg['parentId'] or None,
+                                page_id=cfg['pageId'] if cfg['mode'] == 'single' else None)
+        url = result['url']
+        status, message = 'ok', f"{'Создана' if result['created'] else 'Обновлена'} страница «{title}»"
+        page_id = result['id'] if cfg['mode'] == 'single' else cfg['pageId']
+    except confluence.ConfluenceError as e:
+        status, message, page_id = 'error', str(e), cfg['pageId']
+    db.execute('INSERT INTO confluence_reports (project_id) VALUES (?) ON CONFLICT(project_id) DO NOTHING', (pid,))
+    db.execute('UPDATE confluence_reports SET page_id = ?, page_url = ?, last_at = ?, last_status = ?, last_message = ? '
+               'WHERE project_id = ?', (page_id, url, _utc_now_iso(), status, message[:1000], pid))
+    audit_log('confluence', 'publish', 'confluence_report', pid, pid, [{'field': 'result', 'old': None, 'new': message}],
+              entity_name=title, commit=False, actor=actor)
+    db.commit()
+    return status, message, url
+
+
+def run_due_reports(now_utc=None):
+    """Еженедельные отчёты в Confluence, время которых наступило (один запуск в день, захват в базе)."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    db = get_db()
+    done = 0
+    for row in db.execute('SELECT * FROM confluence_reports WHERE enabled = 1').fetchall():
+        try:
+            local = now_utc.astimezone(ZoneInfo(row['timezone'] or 'Europe/Moscow'))
+        except (ZoneInfoNotFoundError, ValueError):
+            continue
+        today = local.date().isoformat()
+        if local.isoweekday() != (row['weekday'] or 1) or local.strftime('%H:%M') < (row['run_time'] or '09:00') \
+                or row['last_run_date'] == today:
+            continue
+        claimed = db.execute('UPDATE confluence_reports SET last_run_date = ? WHERE project_id = ? AND enabled = 1 AND '
+                             '(last_run_date IS NULL OR last_run_date != ?)', (today, row['project_id'], today)).rowcount
+        db.commit()
+        if not claimed:
+            continue
+        try:
+            publish_report(db, row['project_id'], actor=CONFLUENCE_ACTOR)
+        except Exception:  # noqa: BLE001 — сбой одного проекта не останавливает планировщик
+            db.rollback()
+            logger.exception('confluence report failed for project %s', row['project_id'])
+        done += 1
+    return done
+
+
+def _confluence_report_json(db, pid):
+    return dict(confluence_config(db, pid), connected=bool(confluence_connection(db)))
+
+
+@app.route('/api/projects/<int:pid>/confluence')
+@login_required
+def api_get_confluence_report(pid):
+    err = _project_editor_or_403(pid)
+    return err or jsonify(_confluence_report_json(get_db(), pid))
+
+
+@app.route('/api/projects/<int:pid>/confluence', methods=['PUT'])
+@login_required
+def api_save_confluence_report(pid):
+    err = _project_editor_or_403(pid)
+    if err:
+        return err
+    data = json_body()
+    db = get_db()
+    space = text_value(data.get('spaceKey'), 255)
+    if space and not confluence.SPACE_KEY_RE.match(space):
+        raise ValidationError('Ключ пространства Confluence — латиница, цифры, «_» или «~» (например, PROJ)')
+    parent = text_value(data.get('parentId'), 30)
+    if parent and not parent.isdigit():
+        raise ValidationError('Родительская страница — числовой id страницы Confluence (из адреса страницы)')
+    title = text_value(data.get('title'), 200) or DEFAULT_REPORT_TITLE
+    mode = data.get('mode') or 'single'
+    if mode not in CONFLUENCE_MODES:
+        raise ValidationError('Режим — одна страница или новая страница каждую неделю')
+    weekday = data.get('weekday', 1)
+    if not isinstance(weekday, int) or isinstance(weekday, bool) or not 1 <= weekday <= 7:
+        raise ValidationError('День недели — число от 1 (пн) до 7 (вс)')
+    run_time = text_value(data.get('time')) or '09:00'
+    if not TIME_RE.match(run_time):
+        raise ValidationError('Время публикации — в формате ЧЧ:ММ')
+    tz_name = text_value(data.get('timezone')) or 'Europe/Moscow'
+    _zone(tz_name)
+    enabled = bool(data.get('enabled'))
+    if enabled and not space:
+        raise ValidationError('Укажите пространство Confluence')
+    if enabled and not confluence_connection(db):
+        raise ValidationError(CONFLUENCE_NOT_CONFIGURED)
+    old = confluence_config(db, pid)
+    page_id = old['pageId'] if (space == old['spaceKey'] and mode == old['mode']) else None
+    page_url = old['pageUrl'] if page_id else None
+    db.execute('INSERT INTO confluence_reports (project_id, enabled, space_key, parent_id, title, mode, weekday, run_time, '
+               'timezone, page_id, page_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET '
+               'enabled = excluded.enabled, space_key = excluded.space_key, parent_id = excluded.parent_id, '
+               'title = excluded.title, mode = excluded.mode, weekday = excluded.weekday, run_time = excluded.run_time, '
+               'timezone = excluded.timezone, page_id = excluded.page_id, page_url = excluded.page_url',
+               (pid, 1 if enabled else 0, space or None, parent or None, title, mode, weekday, run_time, tz_name, page_id,
+                page_url))
+    db.commit()
+    new = confluence_config(db, pid)
+    changes = [{'field': k, 'old': old[k], 'new': new[k]} for k in ('enabled', 'spaceKey', 'parentId', 'title', 'mode',
+                                                                     'weekday', 'time', 'timezone') if old[k] != new[k]]
+    if changes:
+        audit_log('confluence', 'update', 'confluence_report', pid, pid, changes, entity_name='Отчёт в Confluence')
+    return jsonify(_confluence_report_json(db, pid))
+
+
+@app.route('/api/projects/<int:pid>/confluence/publish', methods=['POST'])
+@login_required
+def api_publish_confluence_report(pid):
+    err = _project_editor_or_403(pid)
+    if err:
+        return err
+    db = get_db()
+    status, message, url = publish_report(db, pid, actor=get_current_user()['username'])
+    body = dict(_confluence_report_json(db, pid), result={'status': status, 'message': message, 'url': url})
+    if status != 'ok':
+        body['error'] = message
+    return jsonify(body), (200 if status == 'ok' else 502)
+
+
 # ─── Уведомления: настройки отправки, подписки, дайджест, оповещения ───
 
 ALERT_TYPES = ('autofill', 'status', 'chance', 'scope', 'problems')
@@ -2613,16 +3459,18 @@ def smtp_config(cfg):
             'login': cfg.get('smtp_login'), 'password': cfg.get('smtp_password'), 'sender': cfg.get('smtp_from')}
 
 
-def telegram_client(cfg):
+def telegram_client(cfg, timeout=20):
     return notify.Telegram(cfg.get('telegram_token'),
-                           app.config.get('TELEGRAM_API') or os.environ.get('TELEGRAM_API') or 'https://api.telegram.org')
+                           app.config.get('TELEGRAM_API') or os.environ.get('TELEGRAM_API') or 'https://api.telegram.org',
+                           timeout=timeout)
 
 
 def _notify_settings_json(cfg):
     return {'smtp': {'host': cfg.get('smtp_host') or '', 'port': int(cfg.get('smtp_port') or 587),
                      'security': cfg.get('smtp_security') or 'starttls', 'login': cfg.get('smtp_login') or '',
                      'sender': cfg.get('smtp_from') or '', 'hasPassword': bool(cfg.get('smtp_password'))},
-            'telegram': {'hasToken': bool(cfg.get('telegram_token')), 'botName': cfg.get('telegram_bot_name') or ''},
+            'telegram': {'hasToken': bool(cfg.get('telegram_token')), 'botName': cfg.get('telegram_bot_name') or '',
+                         'commands': cfg.get('telegram_commands') != '0', 'pollTick': cfg.get('telegram_poll_tick') or ''},
             'publicUrl': cfg.get('public_url') or ''}
 
 
@@ -2686,11 +3534,18 @@ def api_save_notify_settings():
         changes.append({'field': 'telegramToken', 'old': None, 'new': 'удалён'})
     elif token:
         _set_setting(db, 'telegram_token', jira.encrypt_token(app.secret_key, token))
+        _set_setting(db, 'telegram_menu', None)  # новый бот — заново отправить меню команд
+        _set_setting(db, 'telegram_offset', None)
         try:
             _set_setting(db, 'telegram_bot_name', telegram_client({'telegram_token': token}).bot_name() or None)
         except notify.NotifyError:
             _set_setting(db, 'telegram_bot_name', None)
         changes.append({'field': 'telegramToken', 'old': None, 'new': 'изменён'})
+    if 'commands' in tg:
+        commands = '1' if tg.get('commands') else '0'
+        if (old.get('telegram_commands') or '1') != commands:
+            changes.append({'field': 'telegramCommands', 'old': old.get('telegram_commands') or '1', 'new': commands})
+        _set_setting(db, 'telegram_commands', commands)
     db.commit()
     if changes:
         audit_log('integrations', 'update', 'notify_settings', None, None, changes, entity_name='Почта и Telegram')
@@ -2765,9 +3620,13 @@ def api_telegram_link():
 def api_telegram_check():
     db = get_db()
     user = get_current_user()
+    if not user['telegram_link_code'] and user['telegram_chat_id']:
+        return jsonify({'linked': True})  # бот уже обработал «/start <код>»
     if not user['telegram_link_code']:
         raise ValidationError('Сначала получите ссылку для привязки')
     cfg = notify_settings(db)
+    if telegram_poller_alive(db):  # «/start» обработает бот; второй getUpdates Telegram не разрешает
+        return jsonify({'linked': False})
     try:
         client = telegram_client(cfg)
         chat_id = client.find_start(user['telegram_link_code'])
@@ -2824,7 +3683,8 @@ def _subscription_json(db, user, sub):
                    'scopeThreshold': sub['scope_threshold'] if sub else 10},
         'channels': {'email': user['email'] or '', 'emailReady': bool(cfg.get('smtp_host') and cfg.get('smtp_from')),
                      'telegramReady': bool(cfg.get('telegram_token')),
-                     'telegramLinked': bool(user['telegram_chat_id'])},
+                     'telegramLinked': bool(user['telegram_chat_id']),
+                     'telegramCommands': bool(cfg.get('telegram_token')) and cfg.get('telegram_commands') != '0'},
     }
 
 
@@ -2944,13 +3804,181 @@ def api_digest_test(pid):
 
 # ── Состояние проекта для писем: та же логика, что в интерфейсе (forecast.py)
 
+# ─── Кэш расчётов по версии данных проекта ───────────────────────
+# Выводы, сводка для писем и состав задач пересчитываются, только когда изменились данные проекта (замеры, эпики,
+# цели, настройки, срезы Jira, общий календарь) или наступил новый день. Версия — отпечаток этих данных; результаты
+# Монте-Карло дополнительно хранятся в базе (mc_cache) и общие для всех процессов.
+
+_RESULT_CACHE = {}
+_RESULT_CACHE_LIMIT = 512
+_cache_lock = threading.Lock()
+
+
+def project_version(db, pid):
+    """Отпечаток данных проекта, от которых зависят расчёты (несколько быстрых запросов по индексам).
+    Все правки проекта пишутся в журнал изменений, срезы Jira только добавляются (AUTOINCREMENT), поэтому
+    достаточно последних id, агрегатов замеров и строк эпиков, целей, настроек и общего календаря."""
+    head = db.execute(
+        """SELECT (SELECT COALESCE(MAX(id), 0) FROM audit_log WHERE project_id = :p),
+                  (SELECT COALESCE(MAX(m), 0) FROM (SELECT (SELECT MAX(j.id) FROM jira_issue_snapshots j
+                                                          WHERE j.service_id = s.id) AS m
+                                                  FROM services s WHERE s.project_id = :p)),
+                  (SELECT COUNT(*) || ':' || COALESCE(MAX(e.id), 0) || ':' || TOTAL(e.remaining) || ':'
+                          || TOTAL(e.spent) || ':' || TOTAL(e.estimate)
+                   FROM entries e JOIN services s ON s.id = e.service_id WHERE s.project_id = :p),
+                  (SELECT value FROM app_settings WHERE key = 'org_calendar')""", {'p': pid}).fetchone()
+    parts = [tuple(head)]
+    for sql in ('SELECT * FROM projects WHERE id = ?', 'SELECT * FROM settings WHERE project_id = ?',
+                'SELECT * FROM services WHERE project_id = ? ORDER BY id',
+                'SELECT * FROM stage_targets WHERE project_id = ? ORDER BY id'):
+        parts.append([tuple(r) for r in db.execute(sql, (pid,))])
+    return hashlib.sha1(repr(parts).encode('utf-8')).hexdigest()
+
+
+_compute_locks = {}
+SHARED_RESULTS = {'insights', 'overview'}  # эти расчёты хранятся и в базе — общие для воркеров gunicorn
+
+
+def _shared_result_get(kind, key, version):
+    try:
+        row = _mc_connection().execute('SELECT value FROM result_cache WHERE kind = ? AND key = ? AND version = ?',
+                                       (kind, repr(key), f'{APP_VERSION}|{version}')).fetchone()
+        return json.loads(row[0]) if row else None
+    except (sqlite3.Error, ValueError):
+        return None
+
+
+def _shared_result_put(kind, key, version, value):
+    try:
+        conn = _mc_connection()
+        conn.execute('INSERT OR REPLACE INTO result_cache (kind, key, version, value, created_at) VALUES (?, ?, ?, ?, ?)',
+                     (kind, repr(key), f'{APP_VERSION}|{version}', json.dumps(value), _utc_now_iso()))
+        conn.commit()
+    except (sqlite3.Error, TypeError, ValueError):  # база занята — результат остаётся в кэше процесса
+        pass
+_PAYLOAD_CACHE = {}  # (вид, проект) → (ETag, JSON, JSON в gzip | None): готовые ответы самых тяжёлых запросов
+_PAYLOAD_CACHE_LIMIT = 48
+_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
+
+
+def versioned_json(kind, pid, build, extra='', version=None):
+    """JSON-ответ с ETag по версии данных проекта (version — своя версия, если ответ зависит от части данных).
+    Совпал ETag из запроса браузера — 304 без расчёта и сериализации; иначе — готовый (в том числе сжатый)
+    ответ из кэша процесса или собранный build()."""
+    tag = '|'.join((kind, str(pid), datetime.now().date().isoformat(), APP_VERSION, str(extra),
+                    version or project_version(get_db(), pid)))
+    etag = 'W/"' + hashlib.blake2b(tag.encode('utf-8'), digest_size=12).hexdigest() + '"'
+    headers = {'ETag': etag, 'Cache-Control': 'private, no-cache'}
+    if _etag_matches(request.headers.get('If-None-Match'), etag):
+        return app.response_class(status=304, headers=headers)
+    with _cache_lock:
+        hit = _PAYLOAD_CACHE.get((kind, pid))
+    if hit and hit[0] == etag:
+        body, gz = hit[1], hit[2]
+    else:
+        body, gz = jsonify(build()).get_data(), None
+    wants_gzip = 'gzip' in (request.headers.get('Accept-Encoding') or '').lower() and len(body) >= COMPRESS_MIN_BYTES
+    if wants_gzip and gz is None:
+        gz = gzip.compress(body, compresslevel=5)
+    if len(body) <= _PAYLOAD_MAX_BYTES:
+        with _cache_lock:
+            if len(_PAYLOAD_CACHE) >= _PAYLOAD_CACHE_LIMIT:
+                _PAYLOAD_CACHE.clear()
+            _PAYLOAD_CACHE[(kind, pid)] = (etag, body, gz)
+    resp = app.response_class(gz if wants_gzip else body, mimetype='application/json', headers=headers)
+    if wants_gzip:
+        resp.headers['Content-Encoding'] = 'gzip'
+    resp.vary.add('Accept-Encoding')
+    return resp
+
+
+def cached_result(kind, key, version, compute):
+    """Результат расчёта из кэша процесса или вычисленный заново; возвращается копия (её можно менять).
+    Одновременные запросы одного и того же расчёта ждут первый, а не считают его параллельно."""
+    cache_key = (kind, key)
+    with _cache_lock:
+        hit = _RESULT_CACHE.get(cache_key)
+        lock = _compute_locks.setdefault(cache_key, threading.Lock())
+    if hit and hit[0] == version:
+        return pickle.loads(hit[1])
+    shared = kind in SHARED_RESULTS
+    with lock:
+        with _cache_lock:
+            hit = _RESULT_CACHE.get(cache_key)
+        if hit and hit[0] == version:
+            return pickle.loads(hit[1])
+        value = _shared_result_get(kind, key, version) if shared else None
+        if value is None:
+            value = compute()
+            if shared:
+                _shared_result_put(kind, key, version, value)
+        with _cache_lock:
+            if len(_RESULT_CACHE) >= _RESULT_CACHE_LIMIT:
+                _RESULT_CACHE.clear()
+                _compute_locks.clear()
+            _RESULT_CACHE[cache_key] = (version, pickle.dumps(value, pickle.HIGHEST_PROTOCOL))
+    return value
+
+
+# Фоновый предрасчёт: после изменения данных проекта «Выводы» (и Монте-Карло эпиков в общем кэше базы)
+# пересчитываются заранее, чтобы следующий открывший дашборд или портфель получил их сразу.
+WARMUP_DELAY = 2  # с — серия правок подряд пересчитывается один раз
+_warm_pending = set()
+_warm_cond = threading.Condition()
+_warm_thread = None
+
+
+def schedule_warmup(pids):
+    global _warm_thread
+    if not pids or app.config.get('TESTING') or os.environ.get('BURNDOWN_WARMUP', '1') == '0':
+        return
+    with _warm_cond:
+        _warm_pending.update(pids)
+        if _warm_thread is None or not _warm_thread.is_alive():
+            _warm_thread = threading.Thread(target=_warm_loop, name='burndown-warmup', daemon=True)
+            _warm_thread.start()
+        _warm_cond.notify()
+
+
+def warm_projects(pids):
+    """Пересчитать «Выводы» проектов (ошибка одного проекта не мешает остальным)."""
+    done = 0
+    for pid in pids:
+        try:
+            with app.app_context():
+                db = get_db()
+                if db.execute('SELECT 1 FROM projects WHERE id = ?', (pid,)).fetchone():
+                    project_insights(db, pid)
+                    insight_changes(db, pid)
+                    done += 1
+        except Exception:  # noqa: BLE001
+            logger.exception('warm-up of project %s failed', pid)
+    return done
+
+
+def _warm_loop():  # pragma: no cover — фоновый поток; логика — в warm_projects
+    while True:
+        with _warm_cond:
+            while not _warm_pending:
+                _warm_cond.wait()
+        time.sleep(WARMUP_DELAY)
+        with _warm_cond:
+            pids = sorted(_warm_pending)
+            _warm_pending.clear()
+        warm_projects(pids)
+
+
 def project_overview(db, pid, today=None):
+    today = today or datetime.now().date().isoformat()
+    return cached_result('overview', (pid, today), project_version(db, pid), lambda: _project_overview(db, pid, today))
+
+
+def _project_overview(db, pid, today=None):
     project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
     settings = project_settings(db, pid)
     services = db.execute('SELECT * FROM services WHERE project_id = ? AND NOT COALESCE(is_done, 0) '
                           'ORDER BY sort_order, id', (pid,)).fetchall()
-    rows = {s['id']: [dict(r) for r in db.execute('SELECT date, remaining, spent, estimate FROM entries WHERE '
-                                                  'service_id = ? ORDER BY date', (s['id'],))] for s in services}
+    rows = project_rows(db, pid, services)
     history, latest = jira_composition(db, pid)
     epics = []
     for s in services:
@@ -2988,7 +4016,21 @@ def digest_overview(db, pid, today=None):
     """Сводка для дайджеста: статусы эпиков (project_overview) и «Выводы» проекта (project_insights)."""
     ov = project_overview(db, pid, today)
     ov['insights'] = project_insights(db, pid, ov['date'])['summary']
+    weeks = insight_changes(db, pid, 1, ov['date'])['weeks']
+    ov['changes'] = weeks[0]['items'][:6] if weeks else []
     return ov
+
+
+def project_rows(db, pid, services):
+    """Замеры эпиков одним запросом → {id эпика: [{date, remaining, spent, estimate}] по датам}."""
+    rows = {s['id']: [] for s in services}
+    for r in db.execute('SELECT e.service_id, e.date, e.remaining, e.spent, e.estimate FROM entries e '
+                        'JOIN services s ON s.id = e.service_id WHERE s.project_id = ? ORDER BY e.service_id, e.date',
+                        (pid,)):
+        if r['service_id'] in rows:
+            rows[r['service_id']].append({'date': r['date'], 'remaining': r['remaining'], 'spent': r['spent'],
+                                          'estimate': r['estimate']})
+    return rows
 
 
 def _autofill_state(db, pid):
@@ -3001,20 +4043,40 @@ def _autofill_state(db, pid):
 
 def project_insights(db, pid, today=None):
     """«Выводы» по проекту (insights.py): эпики и этапы с драйверами прогноза и сводка для руководителя.
-    Учитываются несданные эпики; today — дата, относительно которой оценивается свежесть данных и прошедшие цели."""
+    Учитываются несданные эпики; today — дата, относительно которой оценивается свежесть данных и прошедшие цели.
+    Результат кэшируется до изменения данных проекта или наступления нового дня; выводы на сегодня сохраняются
+    снимком для ленты изменений."""
+    real_today = datetime.now().date().isoformat()
+    today = today or real_today
+
+    def compute():
+        data = _project_insights(db, pid, today)
+        if today == real_today:
+            store_insight_snapshot(pid, today, ins.insight_state(data), 'live')
+        return data
+    return cached_result('insights', (pid, today), project_version(db, pid), compute)
+
+
+def _project_insights(db, pid, today=None, as_of=None):
+    """as_of — выводы «как на дату»: только замеры и срезы Jira до этой даты (для прошлых недель ленты изменений);
+    без Монте-Карло — статусы и прогнозы те же, шанс успеть есть только в сохранённых снимках."""
     project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
     settings = project_settings(db, pid)
     today = today or datetime.now().date().isoformat()
     services = db.execute('SELECT * FROM services WHERE project_id = ? AND NOT COALESCE(is_done, 0) '
                           'ORDER BY sort_order, id', (pid,)).fetchall()
-    rows = {s['id']: [dict(r) for r in db.execute('SELECT date, remaining, spent, estimate FROM entries WHERE '
-                                                  'service_id = ? ORDER BY date', (s['id'],))] for s in services}
+    rows = project_rows(db, pid, services)
     history, latest = jira_composition(db, pid)
+    if as_of:
+        rows = {sid: [r for r in items if r['date'] <= as_of] for sid, items in rows.items()}
+        history = {sid: [p for p in pts if p['date'] <= as_of] for sid, pts in history.items()}
+        history = {sid: pts for sid, pts in history.items() if pts}
+        latest = {sid: dict(pts[-1], problems={}, problemIssues=0) for sid, pts in history.items()}
     epics, by_id, groups = [], {}, {}
     for s in services:
         e = ins.epic_insight({'id': s['id'], 'name': s['name'], 'etap': s['etap'], 'stage': stage_key(s),
                               'target': s['target_date'] or None}, rows[s['id']], settings, today,
-                             history.get(s['id']), latest.get(s['id']))
+                             history.get(s['id']), latest.get(s['id']), with_mc=not as_of)
         epics.append(e)
         by_id[s['id']] = e
         groups.setdefault(stage_key(s), []).append(s['id'])
@@ -3028,14 +4090,105 @@ def project_insights(db, pid, today=None):
     for name, ids in groups.items():
         dates, series = fc.aggregate_series([rows[i] for i in ids])
         stages.append(ins.stage_insight(name, stage_targets.get(name) or None, [by_id[i] for i in ids], dates, series,
-                                        settings, today, scope_of(ids)))
+                                        settings, today, scope_of(ids), with_mc=not as_of))
     dates, series = fc.aggregate_series([rows[s['id']] for s in services])
     project_drv = ins.series_drivers(dates, series['remaining'], series['estimate'], None, settings, today,
                                      scope_of([s['id'] for s in services]), with_mc=False)
-    summary = ins.project_summary(project_drv, epics, stages, settings, _autofill_state(db, pid))
+    summary = ins.project_summary(project_drv, epics, stages, settings, () if as_of else _autofill_state(db, pid))
     return {'project': {'id': project['id'], 'name': project['name']}, 'date': today,
             'settings': {k: settings[k] for k in ('units', 'hoursPerDay', 'workdays', 'rangeConfidence', 'insightWindowDays')},
             'summary': summary, 'epics': epics, 'stages': stages}
+
+
+# ─── Лента изменений выводов ─────────────────────────────────────
+# Выводы на сегодня сохраняются снимком (insight_snapshots) при каждом пересчёте и раз в день планировщиком.
+# Неделя ленты — сравнение снимков на её начало и конец; для дат, когда снимков ещё не было (до обновления
+# до 1.9.0), выводы восстанавливаются по замерам на дату и тоже сохраняются.
+
+CHANGES_WEEKS = 8
+SNAPSHOT_TOLERANCE_DAYS = 3  # снимок за 1–3 дня до границы недели годится вместо снимка на саму дату
+
+
+def store_insight_snapshot(pid, day, state, source):
+    try:
+        conn = _mc_connection()
+        conn.execute('INSERT OR REPLACE INTO insight_snapshots (project_id, snap_date, state, source, created_at) '
+                     'VALUES (?, ?, ?, ?, ?)', (pid, day, json.dumps(state, ensure_ascii=False), source, _utc_now_iso()))
+        conn.commit()
+    except sqlite3.Error:  # база занята — снимок сохранится при следующем пересчёте
+        pass
+
+
+def insight_state_on(db, pid, day):
+    """Снимок выводов на дату: сохранённый (не раньше чем за SNAPSHOT_TOLERANCE_DAYS) или восстановленный по замерам."""
+    since = (datetime.strptime(day, '%Y-%m-%d').date() - timedelta(days=SNAPSHOT_TOLERANCE_DAYS)).isoformat()
+    row = db.execute('SELECT state FROM insight_snapshots WHERE project_id = ? AND snap_date <= ? AND snap_date >= ? '
+                     'ORDER BY snap_date DESC LIMIT 1', (pid, day, since)).fetchone()
+    if row:
+        try:
+            return json.loads(row['state'])
+        except ValueError:
+            pass
+    state = ins.insight_state(_project_insights(db, pid, today=day, as_of=day))
+    store_insight_snapshot(pid, day, state, 'backfill')
+    return state
+
+
+def _has_measurements(state):
+    return any(e.get('remaining') is not None for e in state['epics'].values())
+
+
+def insight_changes(db, pid, weeks=CHANGES_WEEKS, today=None):
+    """Лента изменений выводов по неделям (от последней): {'weeks': [{'from', 'to', 'items'}]}. Недели до
+    первых замеров проекта не показываются."""
+    today = today or datetime.now().date().isoformat()
+
+    def compute():
+        settings = project_settings(db, pid)
+        states = [ins.insight_state(project_insights(db, pid, today))]
+        out = []
+        day = datetime.strptime(today, '%Y-%m-%d').date()
+        for k in range(1, weeks + 1):
+            old = insight_state_on(db, pid, (day - timedelta(days=7 * k)).isoformat())
+            if not _has_measurements(old) and k > 1:
+                break
+            out.append({'from': old['date'], 'to': states[-1]['date'],
+                        'items': ins.state_changes(old, states[-1], settings)})
+            states.append(old)
+            if not _has_measurements(old):
+                break
+        return {'weeks': out, 'date': today}
+    return cached_result('changes', (pid, today, weeks), project_version(db, pid), compute)
+
+
+def record_daily_insights():
+    """Раз в день — снимок выводов каждого проекта, даже если его никто не открывал (для ленты изменений)."""
+    db = get_db()
+    today = datetime.now().date().isoformat()
+    done = 0
+    for row in db.execute("SELECT id FROM projects WHERE id NOT IN (SELECT project_id FROM insight_snapshots "
+                          "WHERE snap_date = ? AND source = 'live')", (today,)).fetchall():
+        try:
+            project_insights(db, row['id'])
+            done += 1
+        except Exception:  # noqa: BLE001 — один проект не мешает остальным
+            logger.exception('daily insights of project %s failed', row['id'])
+    return done
+
+
+@app.route('/api/projects/<int:pid>/insights/changes')
+@login_required
+def api_insight_changes(pid):
+    if not can_view_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет доступа к проекту'}), 403
+    db = get_db()
+    if not db.execute('SELECT 1 FROM projects WHERE id = ?', (pid,)).fetchone():
+        return jsonify({'error': 'Проект не найден'}), 404
+    try:
+        weeks = min(max(int(request.args.get('weeks', CHANGES_WEEKS)), 1), 26)
+    except ValueError:
+        weeks = CHANGES_WEEKS
+    return versioned_json(f'changes{weeks}', pid, lambda: insight_changes(db, pid, weeks))
 
 
 @app.route('/api/projects/<int:pid>/insights')
@@ -3046,7 +4199,7 @@ def api_project_insights(pid):
     db = get_db()
     if not db.execute('SELECT 1 FROM projects WHERE id = ?', (pid,)).fetchone():
         return jsonify({'error': 'Проект не найден'}), 404
-    return jsonify(project_insights(db, pid))
+    return versioned_json('insights', pid, lambda: project_insights(db, pid))
 
 
 def accessible_projects(db, uid):
@@ -3123,10 +4276,12 @@ def render_digest(ov, prev, public_url):
         return f"{f['subject']}: " if f.get('subject') else ''
     top = (summary or {}).get('top', [])[:5]
     health = (summary or {}).get('health', [])[:3]
+    week = ov.get('changes') or []  # что изменилось в выводах за неделю (лента изменений)
     lines = [subject, head, '']
     if summary:
         lines += ['Главное: ' + summary['headline']]
         lines += [f"• {subject_of(f)}{f['text']}" for f in top]
+        lines += (['За неделю:'] + [f"• {subject_of(f)}{f['text']}" for f in week]) if week else []
         lines += (['Данные:'] + [f"• {f['text']}" for f in health]) if health else []
         lines += ['']
     for e in ov['epics']:
@@ -3171,6 +4326,8 @@ def render_digest(ov, prev, public_url):
             "padding:10px 14px;margin:0 0 14px'>"
             f"<div style='font-weight:600;font-size:15px;margin-bottom:6px'>{esc(summary['headline'])}</div>"
             + (f"<ul style='margin:0;padding-left:0;list-style:none;font-size:13px'>{''.join(li(f) for f in top)}</ul>" if top else '')
+            + (f"<div style='font-size:12px;color:#5c6470;margin-top:6px'>За неделю:</div><ul style='margin:0;padding-left:0;"
+               f"list-style:none;font-size:13px'>{''.join(li(f) for f in week)}</ul>" if week else '')
             + (f"<div style='font-size:12px;color:#5c6470;margin-top:6px'>Данные:</div><ul style='margin:0;padding-left:0;"
                f"list-style:none;font-size:12px'>{''.join(li(f) for f in health)}</ul>" if health else '')
             + '</div>')
@@ -3193,7 +4350,10 @@ def render_digest(ov, prev, public_url):
     sev_icons = {'danger': '⛔', 'risk': '⚠️', 'info': 'ℹ️', 'ok': '✅'}
     if summary:
         tg += [f"<b>{esc(summary['headline'])}</b>"] + [
-            f"{sev_icons[f['severity']]} {esc(subject_of(f))}{esc(f['text'])}" for f in top[:3]] + ['']
+            f"{sev_icons[f['severity']]} {esc(subject_of(f))}{esc(f['text'])}" for f in top[:3]]
+        if week:
+            tg += ['<i>За неделю:</i>'] + [f"{sev_icons[f['severity']]} {esc(subject_of(f))}{esc(f['text'])}" for f in week[:3]]
+        tg += ['']
     icons = {'ok': '✅', 'risk': '⚠️', 'danger': '⛔', 'notarget': '◽', 'unknown': '◽'}
     for e in ov['epics']:
         ch = change(e)
@@ -3402,6 +4562,8 @@ def deliver_outbox():
     db.execute("DELETE FROM notification_outbox WHERE status != 'pending' AND created_at < ?",
                ((now - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S'),))
     db.execute('DELETE FROM notification_log WHERE created_at < ?', ((now - timedelta(days=365)).strftime('%Y-%m-%d %H:%M:%S'),))
+    db.execute('DELETE FROM mc_cache WHERE created_at < ?', ((now - timedelta(days=60)).strftime('%Y-%m-%d %H:%M:%S'),))
+    db.execute('DELETE FROM result_cache WHERE created_at < ?', ((now - timedelta(days=2)).strftime('%Y-%m-%d %H:%M:%S'),))
     db.commit()
     for item in db.execute("SELECT * FROM notification_outbox WHERE status = 'pending' ORDER BY id").fetchall():
         claimed = db.execute("UPDATE notification_outbox SET status = 'sending' WHERE id = ? AND status = 'pending'",
@@ -3753,6 +4915,227 @@ def run_notifications(now_utc=None):
             logger.exception('notifications step failed')
 
 
+# ─── Команды Telegram-бота ───────────────────────────────────────
+# Один процесс (файловая блокировка рядом с базой) опрашивает бота long polling'ом и отвечает привязанным
+# пользователям: статус проекта, главные риски, изменения за неделю — по их проектам. Привязка «/start <код>»
+# тоже обрабатывается здесь. Выключается в «Интеграциях» (telegram_commands = 0).
+
+TELEGRAM_POLL_TIMEOUT = 25
+TELEGRAM_COMMANDS = [('status', 'Сводка: статус проекта и главное'), ('risks', 'Главные риски'),
+                     ('week', 'Что изменилось за неделю'), ('projects', 'Мои проекты'), ('help', 'Команды бота')]
+TELEGRAM_ALIASES = {'status': 'status', 'статус': 'status', 'risks': 'risks', 'риски': 'risks', 'week': 'week',
+                    'неделя': 'week', 'изменения': 'week', 'projects': 'projects', 'проекты': 'projects',
+                    'help': 'help', 'помощь': 'help', 'start': 'help'}
+TG_STATUS_ICONS = {'ok': '✅', 'risk': '⚠️', 'danger': '⛔', 'notarget': '◽', 'unknown': '◽'}
+TG_SEVERITY_ICONS = {'danger': '⛔', 'risk': '⚠️', 'info': 'ℹ️', 'ok': '✅'}
+
+
+def telegram_help():
+    return ('<b>Burndown</b> — команды:\n'
+            '/status — статус проекта и главное (/статус)\n'
+            '/risks — главные риски (/риски)\n'
+            '/week — что изменилось за неделю (/неделя)\n'
+            '/projects — ваши проекты (/проекты)\n\n'
+            'После команды можно указать проект — номером из /projects или частью названия: <code>/risks 2</code>, '
+            '<code>/status АИСУЗ</code>.')
+
+
+def _tg_subject(f):
+    return f"<b>{notify.esc(f['subject'])}:</b> " if f.get('subject') else ''
+
+
+def _tg_findings(items, limit):
+    lines = [f"{TG_SEVERITY_ICONS[f['severity']]} {_tg_subject(f)}{notify.esc(f['text'])}" for f in items[:limit]]
+    if len(items) > limit:
+        lines.append(f'… и ещё {len(items) - limit}')
+    return lines
+
+
+def _tg_pick_project(projects, arg):
+    """Проект по номеру из /projects или части названия → (проект, None) или (None, текст ошибки)."""
+    if arg.isdigit() and 1 <= int(arg) <= len(projects):
+        return projects[int(arg) - 1], None
+    found = [p for p in projects if arg.lower() in (p['name'] or '').lower()]
+    if len(found) == 1:
+        return found[0], None
+    if not found:
+        return None, f'Проект «{notify.esc(arg)}» не найден. Список — /projects.'
+    return None, 'Под это название подходит несколько проектов: ' + ', '.join(
+        f'«{notify.esc(p["name"])}»' for p in found[:5]) + '. Уточните название или укажите номер из /projects.'
+
+
+def _tg_project_link(db, pid):
+    url = (notify_settings(db).get('public_url') or '').rstrip('/')
+    return f'\n<a href="{html.escape(url, quote=True)}/?project={pid}">Открыть в Burndown</a>' if url else ''
+
+
+def _tg_status(db, project):
+    data = project_insights(db, project['id'])
+    s = data['summary']
+    lines = [f"{TG_STATUS_ICONS.get(s['status'], '◽')} <b>{notify.esc(project['name'])}</b> — на {_fmt_date(data['date'])}",
+             notify.esc(s['headline'])]
+    lines += [f"• {notify.esc(f['label'])}: {notify.esc(f['value'])}" for f in s['facts']]
+    c = s['counts']
+    lines.append(f"Эпики: успевают {c['ok']} · риск {c['risk']} · не успевают {c['danger']}")
+    return '\n'.join(lines) + _tg_project_link(db, project['id'])
+
+
+def _tg_risks(db, project, limit=6):
+    s = project_insights(db, project['id'])['summary']
+    lines = [f"<b>{notify.esc(project['name'])}</b> — главные риски"]
+    lines += _tg_findings(s['top'], limit) or ['Рисков по срокам не видно.']
+    if s['health']:
+        lines += ['<i>Данные:</i>'] + _tg_findings(s['health'], 3)
+    return '\n'.join(lines)
+
+
+def _tg_week(db, project, limit=8):
+    weeks = insight_changes(db, project['id'], 1)['weeks']
+    head = f"<b>{notify.esc(project['name'])}</b> — за неделю"
+    if not weeks:
+        return head + '\nСравнивать пока не с чем: замеры появились меньше недели назад.'
+    w = weeks[0]
+    return '\n'.join([f"{head} ({_fmt_date(w['from'])} — {_fmt_date(w['to'])})"] +
+                      (_tg_findings(w['items'], limit) or ['Существенных изменений в статусах и прогнозах нет.']))
+
+
+def telegram_reply(db, chat_id, text):
+    """Ответ бота на сообщение пользователя (HTML Telegram) или None, если отвечать не нужно."""
+    text = (text or '').strip()
+    if not text:
+        return None
+    if not text.startswith('/'):
+        text = '/help'
+    head, _, arg = text.partition(' ')
+    cmd, arg = head[1:].split('@')[0].lower(), arg.strip()
+    if cmd == 'start' and arg:
+        user = db.execute('SELECT * FROM users WHERE telegram_link_code = ?', (arg,)).fetchone()
+        if not user:
+            return 'Ссылка для привязки устарела. Получите новую в Burndown: «Уведомления» → «Привязать Telegram».'
+        db.execute('UPDATE users SET telegram_chat_id = NULL WHERE telegram_chat_id = ? AND id != ?', (chat_id, user['id']))
+        db.execute('UPDATE users SET telegram_chat_id = ?, telegram_link_code = NULL WHERE id = ?', (chat_id, user['id']))
+        db.commit()
+        return ('<b>Burndown</b>\nУведомления подключены. Настройте дайджест и оповещения в разделе «Уведомления» '
+                'проекта.\n\n' + telegram_help())
+    user = db.execute('SELECT * FROM users WHERE telegram_chat_id = ?', (chat_id,)).fetchone()
+    if not user:
+        return ('Этот чат не привязан к Burndown. Откройте в Burndown раздел «Уведомления» проекта и нажмите '
+                '«Привязать Telegram».')
+    command = TELEGRAM_ALIASES.get(cmd)
+    if command is None:
+        return 'Не знаю такую команду.\n\n' + telegram_help()
+    if command == 'help':
+        return telegram_help()
+    projects = accessible_projects(db, user['id'])
+    if not projects:
+        return 'У вас пока нет доступа ни к одному проекту.'
+    if command == 'projects' or (command == 'status' and not arg and len(projects) > 1):
+        lines = ['<b>Ваши проекты</b>']
+        for i, p in enumerate(projects, 1):
+            s = project_insights(db, p['id'])['summary']
+            lines.append(f"{i}. {TG_STATUS_ICONS.get(s['status'], '◽')} <b>{notify.esc(p['name'])}</b> — "
+                         f"{notify.esc(s['headline'])}")
+        return '\n'.join(lines + ['', 'Подробнее: /status 1, риски: /risks 1, за неделю: /week 1.'])
+    if arg or len(projects) == 1:
+        project, error = _tg_pick_project(projects, arg) if arg else (projects[0], None)
+        if error:
+            return error
+        return {'status': _tg_status, 'risks': _tg_risks, 'week': _tg_week}[command](db, project)
+    parts = [{'risks': _tg_risks, 'week': _tg_week}[command](db, p, limit=3) for p in projects[:8]]
+    return '\n\n'.join(parts)
+
+
+def handle_telegram_update(db, client, update):
+    message = update.get('message') or {}
+    chat_id = str((message.get('chat') or {}).get('id') or '')
+    if not chat_id:
+        return None
+    reply = telegram_reply(db, chat_id, message.get('text'))
+    if reply:
+        client.send_message(chat_id, reply)
+    return reply
+
+
+def telegram_poller_alive(db):
+    """Бот опрашивается фоновым процессом (последний опрос — меньше 90 с назад)."""
+    tick = _app_setting(db, 'telegram_poll_tick')
+    if not tick:
+        return False
+    return datetime.now(timezone.utc) - datetime.strptime(tick, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc) \
+        < timedelta(seconds=90)
+
+
+def telegram_poll_step(timeout=TELEGRAM_POLL_TIMEOUT):
+    """Один цикл опроса бота → число обработанных сообщений; None — бот не подключён или команды выключены."""
+    db = get_db()
+    cfg = notify_settings(db)
+    if not cfg.get('telegram_token') or cfg.get('telegram_commands') == '0':
+        return None
+    _set_setting(db, 'telegram_poll_tick', _utc_now_iso())
+    db.commit()
+    client = telegram_client(cfg, timeout=timeout + 10)
+    if cfg.get('telegram_menu') != '1':
+        try:
+            client.set_commands(TELEGRAM_COMMANDS)
+            _set_setting(db, 'telegram_menu', '1')
+            db.commit()
+        except notify.NotifyError as e:
+            logger.warning('telegram setMyCommands failed: %s', e)
+    offset = int(cfg.get('telegram_offset') or 0)
+    updates = client.get_updates(offset, timeout)
+    for update in updates:
+        offset = max(offset, int(update.get('update_id') or 0) + 1)
+        try:
+            handle_telegram_update(db, client, update)
+        except notify.NotifyError as e:
+            logger.warning('telegram reply failed: %s', e)
+        except Exception:  # noqa: BLE001 — одно сообщение не останавливает бота
+            db.rollback()
+            logger.exception('telegram command failed')
+        _set_setting(db, 'telegram_offset', offset)  # подтверждаем сразу: ответ не повторится после сбоя
+        db.commit()
+    return len(updates)
+
+
+_tg_lock = None
+
+
+def _telegram_poll_lock():
+    """Опрашивает бота только один процесс: Telegram не разрешает два одновременных getUpdates."""
+    global _tg_lock
+    if _tg_lock is not None:
+        return True
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover — Windows: один процесс разработки
+        return True
+    f = open(DB_PATH + '.telegram.lock', 'a')
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return False
+    _tg_lock = f
+    return True
+
+
+def _telegram_loop():  # pragma: no cover — фоновый поток; логика — в telegram_poll_step
+    while True:
+        if not _telegram_poll_lock():
+            time.sleep(60)
+            continue
+        try:
+            with app.app_context():
+                if telegram_poll_step() is None:
+                    time.sleep(30)
+        except notify.NotifyError as e:
+            logger.warning('telegram polling: %s', e)
+            time.sleep(30)
+        except Exception:  # noqa: BLE001
+            logger.exception('telegram polling failed')
+            time.sleep(30)
+
+
 def mark_scheduler_tick():
     """Отметка «планировщик жив» для «Состояния системы»."""
     db = get_db()
@@ -3767,7 +5150,11 @@ def _scheduler_loop():
             with app.app_context():
                 mark_scheduler_tick()
                 run_due_schedules()
+                run_due_events()
                 run_notifications()
+                record_daily_insights()
+                run_due_writebacks()
+                run_due_reports()
         except Exception:  # noqa: BLE001
             logger.exception('scheduler tick failed')
 
@@ -3778,6 +5165,7 @@ def start_scheduler():
         return None
     thread = threading.Thread(target=_scheduler_loop, name='burndown-autofill', daemon=True)
     thread.start()
+    threading.Thread(target=_telegram_loop, name='burndown-telegram', daemon=True).start()
     return thread
 
 

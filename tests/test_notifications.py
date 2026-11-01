@@ -104,7 +104,7 @@ def test_test_email_and_log(admin, fake_smtp, mail_ready):
 
 def test_telegram_bot_and_linking(admin, telegram, make_user):
     r = admin.put('/api/admin/notify-settings', json={'telegram': {'token': '123:ABC'}})
-    assert r.get_json()['telegram'] == {'hasToken': True, 'botName': 'burndown_test_bot'}
+    assert r.get_json()['telegram'] == {'hasToken': True, 'botName': 'burndown_test_bot', 'commands': True, 'pollTick': ''}
     assert admin.post('/api/admin/notify-settings/test-telegram').get_json() == {'botName': 'burndown_test_bot'}
     user = make_user('petrova', project_id=1)
     link = user.post('/api/profile/telegram/link').get_json()
@@ -121,7 +121,8 @@ def test_telegram_bot_and_linking(admin, telegram, make_user):
 
 def test_telegram_wrong_token(admin, telegram):
     admin.put('/api/admin/notify-settings', json={'telegram': {'token': 'wrong'}})
-    assert admin.get('/api/admin/notify-settings').get_json()['telegram'] == {'hasToken': True, 'botName': ''}
+    assert admin.get('/api/admin/notify-settings').get_json()['telegram'] == {'hasToken': True, 'botName': '', 'commands': True,
+                                                                              'pollTick': ''}
     r = admin.post('/api/admin/notify-settings/test-telegram')
     assert r.status_code == 502 and 'токен' in r.get_json()['error']
 

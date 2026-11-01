@@ -112,6 +112,57 @@ def create_jira_tables(conn):
     snap_cols = {r[1] for r in conn.execute('PRAGMA table_info(jira_issue_snapshots)')}
     if 'restored' not in snap_cols:
         conn.execute('ALTER TABLE jira_issue_snapshots ADD COLUMN restored INTEGER DEFAULT 0')
+    # 1.9.0: автозаполнение по событиям Jira (вебхук) и запись прогноза в задачи Jira
+    sched_cols = {r[1] for r in conn.execute('PRAGMA table_info(jira_schedules)')}
+    for col, kind in (('on_events', 'INTEGER DEFAULT 0'), ('events_run_at', 'TEXT'), ('events_status', 'TEXT'),
+                      ('events_message', 'TEXT')):
+        if col not in sched_cols:
+            conn.execute(f'ALTER TABLE jira_schedules ADD COLUMN {col} {kind}')
+    conn.executescript('''
+        CREATE TABLE IF NOT EXISTS jira_event_queue (
+            button_id INTEGER PRIMARY KEY,
+            due_at TEXT NOT NULL,
+            events INTEGER DEFAULT 1,
+            last_keys TEXT,
+            FOREIGN KEY (button_id) REFERENCES jira_snapshot_buttons(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_jira_issue_snapshots_key ON jira_issue_snapshots(issue_key);
+        CREATE TABLE IF NOT EXISTS jira_writeback (
+            project_id INTEGER PRIMARY KEY,
+            enabled INTEGER DEFAULT 0,
+            fields TEXT,
+            last_version TEXT,
+            last_at TEXT,
+            last_status TEXT,
+            last_message TEXT,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS confluence_reports (
+            project_id INTEGER PRIMARY KEY,
+            enabled INTEGER DEFAULT 0,
+            space_key TEXT,
+            parent_id TEXT,
+            title TEXT,
+            mode TEXT DEFAULT 'single',
+            weekday INTEGER DEFAULT 1,
+            run_time TEXT DEFAULT '09:00',
+            timezone TEXT DEFAULT 'Europe/Moscow',
+            page_id TEXT,
+            page_url TEXT,
+            last_run_date TEXT,
+            last_at TEXT,
+            last_status TEXT,
+            last_message TEXT,
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS jira_writeback_state (
+            service_id INTEGER PRIMARY KEY,
+            issue_key TEXT,
+            fields TEXT,
+            written_at TEXT,
+            FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
+        );
+    ''')
 
 
 def create_notify_tables(conn):
@@ -286,6 +337,15 @@ def create_indexes(conn):
     conn.execute('DROP INDEX IF EXISTS idx_entries_service_date')  # заменён уникальным
     conn.execute('CREATE INDEX IF NOT EXISTS idx_services_project ON services(project_id)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_audit_project ON audit_log(project_id)')
+    # 1.9.0: быстрый отпечаток данных проекта (последний срез эпика) и кэш Монте-Карло, общий для процессов
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_jira_issue_snapshots_id ON jira_issue_snapshots(service_id, id)')
+    conn.execute('CREATE TABLE IF NOT EXISTS mc_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at TEXT)')
+    conn.execute('CREATE TABLE IF NOT EXISTS result_cache (kind TEXT NOT NULL, key TEXT NOT NULL, version TEXT NOT NULL, '
+                 'value TEXT NOT NULL, created_at TEXT, PRIMARY KEY (kind, key))')
+    # 1.9.0: ежедневные снимки выводов — лента «что изменилось за неделю»
+    conn.execute('CREATE TABLE IF NOT EXISTS insight_snapshots (project_id INTEGER NOT NULL, snap_date TEXT NOT NULL, '
+                 "state TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'live', created_at TEXT, "
+                 'PRIMARY KEY (project_id, snap_date), FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE)')
 
 
 def init_db():

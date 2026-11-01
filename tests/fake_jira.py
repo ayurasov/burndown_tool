@@ -40,7 +40,14 @@ FIELDS = [
     {'id': 'timeoriginalestimate', 'name': 'Original Estimate', 'custom': False, 'schema': {'type': 'number'}},
     {'id': 'customfield_10050', 'name': 'Трудозатраты, ч', 'custom': True, 'schema': {'type': 'number'}},
     {'id': 'customfield_10060', 'name': 'Комментарий', 'custom': True, 'schema': {'type': 'string'}},
+    # поля для записи прогноза Burndown
+    {'id': 'customfield_10100', 'name': 'Прогноз Burndown', 'custom': True, 'schema': {'type': 'date'}},
+    {'id': 'customfield_10101', 'name': 'Статус сроков', 'custom': True, 'schema': {'type': 'option'}},
+    {'id': 'customfield_10102', 'name': 'Шанс успеть', 'custom': True, 'schema': {'type': 'number'}},
+    {'id': 'customfield_10103', 'name': 'Прогноз (дата и время)', 'custom': True, 'schema': {'type': 'datetime'}},
+    {'id': 'customfield_10104', 'name': 'Метки', 'custom': True, 'schema': {'type': 'array'}},
 ]
+OPTIONS = {'customfield_10101': {'Успевает', 'Риск', 'Не успевает', 'Нет цели', 'Нет прогноза', 'Завершён'}}
 FORMULA = '1:0:101,2:1:102,6:1:105,3:1:5/9,4:2:103,5:0:104'
 STRUCTURES = [{'id': 7, 'name': 'Релиз 2026'}, {'id': 8, 'name': 'Бэклог'}]
 
@@ -189,7 +196,8 @@ def create_app(state):
         if not ok:
             return jsonify({'errorMessages': ['Unauthorized']}), 401
         api = '/rest/api/3/' if state['mode'] == 'cloud' else '/rest/api/2/'
-        if request.path.startswith('/rest/api/') and not request.path.startswith(api):
+        writing = request.method == 'PUT' and request.path.startswith('/rest/api/2/issue/')  # v2 есть и в Cloud
+        if request.path.startswith('/rest/api/') and not request.path.startswith(api) and not writing:
             return jsonify({'errorMessages': ['wrong api version']}), 404
         if request.path.startswith('/rest/structure/') and not state['structure']:
             return 'Not Found', 404
@@ -245,6 +253,25 @@ def create_app(state):
     @app.post('/rest/api/3/search/jql')
     def search_cloud():
         return search()
+
+    @app.put('/rest/api/2/issue/<key>')
+    def update_issue(key):
+        if not any(d['key'] == key and not d.get('hidden') for d in ISSUES.values()):
+            return jsonify({'errorMessages': ['Issue does not exist or you do not have permission to see it.']}), 404
+        fields = (request.get_json() or {}).get('fields') or {}
+        known = {f['id']: f for f in FIELDS}
+        errors = {}
+        for fid, value in fields.items():
+            if fid not in known or fid in state.get('readonly_fields', ()):
+                errors[fid] = f"Field '{fid}' cannot be set. It is not on the appropriate screen, or unknown."
+            elif fid in OPTIONS and value is not None and (value or {}).get('value') not in OPTIONS[fid]:
+                errors[fid] = f"Option value '{(value or {}).get('value')}' is not valid"
+            elif known[fid]['schema']['type'] == 'date' and value is not None and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+                errors[fid] = 'Invalid date'
+        if errors:
+            return jsonify({'errorMessages': [], 'errors': errors}), 400
+        state.setdefault('writes', []).append((key, fields))
+        return '', 204
 
     @app.get('/rest/api/<v>/field')
     def fields(v):

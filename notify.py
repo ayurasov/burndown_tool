@@ -1,6 +1,7 @@
 """Доставка уведомлений: электронная почта (SMTP) и Telegram-бот. Без Flask — только транспорт."""
 
 import html
+import json
 import smtplib
 import ssl
 from email.message import EmailMessage
@@ -96,6 +97,15 @@ class Telegram:
     def send_document(self, chat_id, filename, data, caption=''):
         self.call('sendDocument', {'chat_id': chat_id, 'caption': caption[:1000]},
                   files={'document': (filename, data, 'application/pdf')})
+
+    def get_updates(self, offset=0, timeout=0):
+        """Новые сообщения боту (long polling: ждать до timeout секунд); offset подтверждает обработанные."""
+        return self.call('getUpdates', {'offset': offset, 'timeout': timeout, 'allowed_updates': '["message"]'}) or []
+
+    def set_commands(self, commands):
+        """Меню команд бота в Telegram: [(команда, описание)]."""
+        self.call('setMyCommands', {'commands': json.dumps([{'command': c, 'description': d} for c, d in commands],
+                                                            ensure_ascii=False)})
 
     def find_start(self, code):
         """chat_id из сообщения «/start <code>», которое пользователь отправил боту по ссылке привязки."""

@@ -6,10 +6,13 @@
 """
 
 import math
+from bisect import bisect_left
 from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 MC_RUNS = 2000
+MC_BLOCK_AFTER = 30  # интервалов больше — короткие интервалы объединяются в недельные блоки
+MC_BLOCK_DAYS, MC_BLOCK_WORKDAYS = 7, 5
 MC_HORIZON_DAYS = 3 * 365
 MC_HORIZON_WORKDAYS = 3 * 261  # три года в рабочих днях
 MC_QUANTILES = {50: (0.25, 0.75), 70: (0.15, 0.85), 80: (0.1, 0.9), 90: (0.05, 0.95)}  # уровень доверия диапазона
@@ -224,13 +227,34 @@ def _fixed6(x):
     return ('-' if x < 0 else '') + format(q, 'f')  # как в JS: (-1e-7).toFixed(6) === '-0.000000'
 
 
-def burn_intervals(pts, settings, cal=None):
-    cal = cal or calendar_for(settings)
+def _intervals(pts, cal):
     out = []
     for (d0, y0), (d1, y1) in zip(pts, pts[1:]):
         length = cal.span(d0, d1)
         if length > 0:
             out.append({'end': d1, 'len': length, 'rate': (y0 - y1) / length})
+    return out
+
+
+def block_points(pts, cal):
+    """Частые замеры (например, ежедневное автозаполнение) — недельными блоками: точка берётся, когда от предыдущей
+    взятой прошла неделя (5 рабочих дней), последняя точка — всегда. Так сценарии Монте-Карло опираются на недельный
+    темп команды, а не на дневной шум, и считаются в разы быстрее."""
+    block = MC_BLOCK_WORKDAYS if cal.workdays else MC_BLOCK_DAYS
+    out = [pts[0]]
+    for p in pts[1:]:
+        if cal.span(out[-1][0], p[0]) >= block:
+            out.append(p)
+    if out[-1] is not pts[-1]:
+        out.append(pts[-1])
+    return out
+
+
+def burn_intervals(pts, settings, cal=None):
+    cal = cal or calendar_for(settings)
+    out = _intervals(pts, cal)
+    if len(out) > MC_BLOCK_AFTER:
+        out = _intervals(block_points(pts, cal), cal)
     if settings.get('burnrateMethod') == 'rolling' and out:
         cutoff = add_days(pts[-1][0], -(settings.get('burnrateWindowDays') or 14))
         windowed = [it for it in out if it['end'] > cutoff]
@@ -255,6 +279,8 @@ def zero_reached_date(pts):
 
 _MC_CACHE = {}
 _MC_CACHE_LIMIT = 4096
+MC_STORE = None  # (get(key) → результат | None, put(key, результат)) — постоянный кэш, общий для процессов (база)
+MC_ALGO = 2  # версия алгоритма Монте-Карло: при изменении расчёта сохранённые в базе результаты не используются
 
 
 def monte_carlo(dates, rems, target, settings, cal=None):
@@ -272,42 +298,39 @@ def monte_carlo(dates, rems, target, settings, cal=None):
     cache_key = seed_key + '|' + cal.signature + '|' + str(confidence)
     if cache_key in _MC_CACHE:
         return dict(_MC_CACHE[cache_key])
+    stored = MC_STORE[0](cache_key) if MC_STORE else None
+    if stored:
+        _MC_CACHE[cache_key] = stored
+        return dict(stored)
     done = zero_reached_date(pts)
     if done:  # остаток уже обнулён — дата завершения известна
         res = {'lo': done, 'p50': done, 'hi': done, 'confidence': confidence,
                'probability': (1.0 if done <= target else 0.0) if target else None, 'intervals': len(intervals)}
     else:
-        total = sum(it['len'] for it in intervals)
         lens = [it['len'] for it in intervals]
         rates = [it['rate'] for it in intervals]
+        cum, acc = [], 0
+        for length in lens:
+            acc += length
+            cum.append(acc)
+        total = acc
         horizon = cal.horizon
-        days = []
-        if max(rates) <= 0:  # остаток ни на одном интервале не уменьшался — ни один сценарий не завершится
-            days = [math.inf] * MC_RUNS
+        max_rate = max(rates)
+        max_len = max(lens)
         state = _hash_string(seed_key) & _M
-        # Сценарий, который уже точно не успеет до горизонта (даже на самой высокой скорости), можно не досчитывать:
-        # при одинаковой длине интервалов число оставшихся шагов известно, а генератор mulberry32 — счётчик с шагом
-        # 0x6D2B79F5, поэтому пропуск шагов не меняет последовательность — результат тот же, что в интерфейсе.
-        uniform = lens[0] if len(set(lens)) == 1 else None
-        bound = max(rates) * 1.000000001
-        for _ in range(MC_RUNS if not days else 0):
+        days = []
+        for _ in range(MC_RUNS if max_rate > 0 else 0):  # нигде не сгорало — ни один сценарий не завершится
             rem, day = last[1], 0
             while day < horizon:
-                if uniform and rem > bound * (horizon - day + uniform):
-                    state = (state + -(-(horizon - day) // uniform) * 0x6D2B79F5) & _M
+                # уже не успеть до горизонта даже на самой высокой скорости — сценарий не завершится (как в интерфейсе)
+                if rem > max_rate * (horizon - day + max_len):
                     break
                 # mulberry32 (как seededRandom в интерфейсе) — встроен в цикл ради скорости
                 state = (state + 0x6D2B79F5) & _M
                 t = ((state ^ (state >> 15)) * (1 | state)) & _M
                 t = ((t + (((t ^ (t >> 7)) * (61 | t)) & _M)) & _M) ^ t
                 pick = (((t ^ (t >> 14)) & _M) / 4294967296) * total
-                k = 0
-                for k, length in enumerate(lens):
-                    pick -= length
-                    if pick <= 0:
-                        break
-                else:
-                    k = 0  # как в интерфейсе: без попадания — первый интервал
+                k = bisect_left(cum, pick)  # интервал выбирается с весом по длине
                 rate, length = rates[k], lens[k]
                 if rate > 0 and rem <= rate * length:
                     day += rem / rate
@@ -316,6 +339,8 @@ def monte_carlo(dates, rems, target, settings, cal=None):
                 rem -= rate * length
                 day += length
             days.append(day if rem <= 0 else math.inf)
+        if max_rate <= 0:
+            days = [math.inf] * MC_RUNS
         days.sort()
 
         def at(q):
@@ -330,6 +355,8 @@ def monte_carlo(dates, rems, target, settings, cal=None):
     if len(_MC_CACHE) >= _MC_CACHE_LIMIT:
         _MC_CACHE.clear()
     _MC_CACHE[cache_key] = res
+    if MC_STORE:
+        MC_STORE[1](cache_key, res)
     return dict(res)
 
 
@@ -394,26 +421,34 @@ def aggregate_series(rows_by_service):
     последнее известное значение, до первого замера — первое; дата, на которую ни у одного эпика нет значения
     показателя, для этого показателя пропускается (None)."""
     fields = ('remaining', 'spent', 'estimate')
-    dates = sorted({r['date'] for rows in rows_by_service for r in rows if any(is_num(r[f]) for f in fields)})
+    # числовые значения замеров заранее: [(дата, (остаток, затрачено, оценка))], нечисловые — None
+    clean = [[(r['date'], tuple(r[f] if is_num(r[f]) else None for f in fields)) for r in rows]
+             for rows in rows_by_service]
+    dates = sorted({d for rows in clean for d, vals in rows if vals != (None, None, None)})
     series = {f: [] for f in fields}
-    first = [{f: next((r[f] for r in rows if is_num(r[f])), None) for f in fields} for rows in rows_by_service]
-    last = [{f: None for f in fields} for _ in rows_by_service]
-    pos = [0] * len(rows_by_service)
+    # текущее значение эпика по показателю: последнее известное, до первого замера — первое
+    cur = [[next((vals[k] for _d, vals in rows if vals[k] is not None), None) for rows in clean] for k in range(3)]
+    pos = [0] * len(clean)
     for day in dates:
-        measured = set()
-        for i, rows in enumerate(rows_by_service):
-            while pos[i] < len(rows) and rows[pos[i]]['date'] <= day:
-                row = rows[pos[i]]
-                pos[i] += 1
-                for f in fields:
-                    if is_num(row[f]):
-                        last[i][f] = row[f]
-                        if row['date'] == day:
-                            measured.add(f)
-        for f in fields:
-            if f not in measured:
+        measured = [False, False, False]
+        for i, rows in enumerate(clean):
+            p = pos[i]
+            while p < len(rows) and rows[p][0] <= day:
+                d, vals = rows[p]
+                p += 1
+                for k in range(3):
+                    if vals[k] is not None:
+                        cur[k][i] = vals[k]
+                        if d == day:
+                            measured[k] = True
+            pos[i] = p
+        for k, f in enumerate(fields):
+            if not measured[k]:
                 series[f].append(None)
                 continue
-            vals = [lv[f] if lv[f] is not None else fv[f] for lv, fv in zip(last, first)]
-            series[f].append(js_sum(v for v in vals if v is not None))
+            total = 0
+            for v in cur[k]:
+                if v is not None:
+                    total += v
+            series[f].append(total)
     return dates, series

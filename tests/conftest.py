@@ -21,6 +21,7 @@ def db_path(tmp_path, monkeypatch):
     path = str(tmp_path / 'test.db')
     monkeypatch.setattr(init_db_module, 'DB_PATH', path)
     monkeypatch.setattr(app_module, 'DB_PATH', path)
+    app_module._RESULT_CACHE.clear()  # кэш расчётов — по процессу; каждый тест начинает с чистого
     init_db_module.init_db()
     return path
 
