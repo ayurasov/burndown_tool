@@ -611,6 +611,8 @@
             <div class="setting-item"><label class="small" for="naToken">Токен бота</label><input type="password" id="naToken" autocomplete="new-password"></div>
             <div class="setting-item"><span class="field-label">Состояние</span><div class="jira-status" id="naBotStatus"></div></div>
           </div>
+          <label class="switch na-commands"><input type="checkbox" id="naCommands"> <span>Отвечать на команды в чате: /status, /risks, /week, /projects</span></label>
+          <div class="section-note" id="naCommandsNote">Привязанный пользователь спрашивает бота о своих проектах — статус и главное, риски, изменения за неделю.</div>
           <div class="form-actions">
             <button type="button" class="btn btn-danger btn-sm" id="naBotRemove" hidden>Отключить бота</button>
             <button type="button" class="btn btn-ghost btn-sm" id="naBotTest">Проверить бота</button>

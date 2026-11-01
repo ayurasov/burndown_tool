@@ -5,3 +5,6 @@ docs/manuals/*.build.html
 .coverage
 .coverage.*
 htmlcov/
+*.db-wal
+*.db-shm
+*.lock

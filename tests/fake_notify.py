@@ -1,5 +1,6 @@
 """Поддельные почтовый сервер (подмена smtplib) и Telegram Bot API для тестов уведомлений."""
 
+import json
 import smtplib
 import threading
 
@@ -45,7 +46,8 @@ class FakeTelegram:
     """Bot API: getMe, getUpdates, sendMessage, sendDocument. updates — что «написали» боту пользователи."""
 
     def __init__(self, token='123:ABC', username='burndown_test_bot'):
-        self.state = {'token': token, 'username': username, 'updates': [], 'messages': [], 'documents': []}
+        self.state = {'token': token, 'username': username, 'updates': [], 'messages': [], 'documents': [], 'polls': [],
+                      'commands': None}
         app = Flask('fake_telegram')
 
         @app.post('/bot<token>/<method>')
@@ -55,7 +57,12 @@ class FakeTelegram:
             if method == 'getMe':
                 return jsonify({'ok': True, 'result': {'id': 1, 'is_bot': True, 'username': self.state['username']}})
             if method == 'getUpdates':
-                return jsonify({'ok': True, 'result': self.state['updates']})
+                offset = int(request.form.get('offset') or 0)
+                self.state['polls'].append(dict(request.form))
+                return jsonify({'ok': True, 'result': [u for u in self.state['updates'] if u['update_id'] >= offset]})
+            if method == 'setMyCommands':
+                self.state['commands'] = json.loads(request.form['commands'])
+                return jsonify({'ok': True, 'result': True})
             if method == 'sendMessage':
                 if request.form.get('chat_id') == 'blocked':
                     return jsonify({'ok': False, 'error_code': 403, 'description': 'Forbidden: bot was blocked by the user'}), 403
@@ -75,8 +82,11 @@ class FakeTelegram:
 
     def user_starts(self, code, chat_id=555):
         """Пользователь открыл ссылку привязки и нажал «Start»."""
+        self.user_says(f'/start {code}', chat_id)
+
+    def user_says(self, text, chat_id=555):
         self.state['updates'].append({'update_id': len(self.state['updates']) + 1,
-                                      'message': {'text': f'/start {code}', 'chat': {'id': chat_id}}})
+                                      'message': {'text': text, 'chat': {'id': chat_id}}})
 
     def stop(self):
         self.server.shutdown()

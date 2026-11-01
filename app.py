@@ -2727,16 +2727,18 @@ def smtp_config(cfg):
             'login': cfg.get('smtp_login'), 'password': cfg.get('smtp_password'), 'sender': cfg.get('smtp_from')}
 
 
-def telegram_client(cfg):
+def telegram_client(cfg, timeout=20):
     return notify.Telegram(cfg.get('telegram_token'),
-                           app.config.get('TELEGRAM_API') or os.environ.get('TELEGRAM_API') or 'https://api.telegram.org')
+                           app.config.get('TELEGRAM_API') or os.environ.get('TELEGRAM_API') or 'https://api.telegram.org',
+                           timeout=timeout)
 
 
 def _notify_settings_json(cfg):
     return {'smtp': {'host': cfg.get('smtp_host') or '', 'port': int(cfg.get('smtp_port') or 587),
                      'security': cfg.get('smtp_security') or 'starttls', 'login': cfg.get('smtp_login') or '',
                      'sender': cfg.get('smtp_from') or '', 'hasPassword': bool(cfg.get('smtp_password'))},
-            'telegram': {'hasToken': bool(cfg.get('telegram_token')), 'botName': cfg.get('telegram_bot_name') or ''},
+            'telegram': {'hasToken': bool(cfg.get('telegram_token')), 'botName': cfg.get('telegram_bot_name') or '',
+                         'commands': cfg.get('telegram_commands') != '0', 'pollTick': cfg.get('telegram_poll_tick') or ''},
             'publicUrl': cfg.get('public_url') or ''}
 
 
@@ -2800,11 +2802,18 @@ def api_save_notify_settings():
         changes.append({'field': 'telegramToken', 'old': None, 'new': 'удалён'})
     elif token:
         _set_setting(db, 'telegram_token', jira.encrypt_token(app.secret_key, token))
+        _set_setting(db, 'telegram_menu', None)  # новый бот — заново отправить меню команд
+        _set_setting(db, 'telegram_offset', None)
         try:
             _set_setting(db, 'telegram_bot_name', telegram_client({'telegram_token': token}).bot_name() or None)
         except notify.NotifyError:
             _set_setting(db, 'telegram_bot_name', None)
         changes.append({'field': 'telegramToken', 'old': None, 'new': 'изменён'})
+    if 'commands' in tg:
+        commands = '1' if tg.get('commands') else '0'
+        if (old.get('telegram_commands') or '1') != commands:
+            changes.append({'field': 'telegramCommands', 'old': old.get('telegram_commands') or '1', 'new': commands})
+        _set_setting(db, 'telegram_commands', commands)
     db.commit()
     if changes:
         audit_log('integrations', 'update', 'notify_settings', None, None, changes, entity_name='Почта и Telegram')
@@ -2879,9 +2888,13 @@ def api_telegram_link():
 def api_telegram_check():
     db = get_db()
     user = get_current_user()
+    if not user['telegram_link_code'] and user['telegram_chat_id']:
+        return jsonify({'linked': True})  # бот уже обработал «/start <код>»
     if not user['telegram_link_code']:
         raise ValidationError('Сначала получите ссылку для привязки')
     cfg = notify_settings(db)
+    if telegram_poller_alive(db):  # «/start» обработает бот; второй getUpdates Telegram не разрешает
+        return jsonify({'linked': False})
     try:
         client = telegram_client(cfg)
         chat_id = client.find_start(user['telegram_link_code'])
@@ -2938,7 +2951,8 @@ def _subscription_json(db, user, sub):
                    'scopeThreshold': sub['scope_threshold'] if sub else 10},
         'channels': {'email': user['email'] or '', 'emailReady': bool(cfg.get('smtp_host') and cfg.get('smtp_from')),
                      'telegramReady': bool(cfg.get('telegram_token')),
-                     'telegramLinked': bool(user['telegram_chat_id'])},
+                     'telegramLinked': bool(user['telegram_chat_id']),
+                     'telegramCommands': bool(cfg.get('telegram_token')) and cfg.get('telegram_commands') != '0'},
     }
 
 
@@ -4169,6 +4183,227 @@ def run_notifications(now_utc=None):
             logger.exception('notifications step failed')
 
 
+# ─── Команды Telegram-бота ───────────────────────────────────────
+# Один процесс (файловая блокировка рядом с базой) опрашивает бота long polling'ом и отвечает привязанным
+# пользователям: статус проекта, главные риски, изменения за неделю — по их проектам. Привязка «/start <код>»
+# тоже обрабатывается здесь. Выключается в «Интеграциях» (telegram_commands = 0).
+
+TELEGRAM_POLL_TIMEOUT = 25
+TELEGRAM_COMMANDS = [('status', 'Сводка: статус проекта и главное'), ('risks', 'Главные риски'),
+                     ('week', 'Что изменилось за неделю'), ('projects', 'Мои проекты'), ('help', 'Команды бота')]
+TELEGRAM_ALIASES = {'status': 'status', 'статус': 'status', 'risks': 'risks', 'риски': 'risks', 'week': 'week',
+                    'неделя': 'week', 'изменения': 'week', 'projects': 'projects', 'проекты': 'projects',
+                    'help': 'help', 'помощь': 'help', 'start': 'help'}
+TG_STATUS_ICONS = {'ok': '✅', 'risk': '⚠️', 'danger': '⛔', 'notarget': '◽', 'unknown': '◽'}
+TG_SEVERITY_ICONS = {'danger': '⛔', 'risk': '⚠️', 'info': 'ℹ️', 'ok': '✅'}
+
+
+def telegram_help():
+    return ('<b>Burndown</b> — команды:\n'
+            '/status — статус проекта и главное (/статус)\n'
+            '/risks — главные риски (/риски)\n'
+            '/week — что изменилось за неделю (/неделя)\n'
+            '/projects — ваши проекты (/проекты)\n\n'
+            'После команды можно указать проект — номером из /projects или частью названия: <code>/risks 2</code>, '
+            '<code>/status АИСУЗ</code>.')
+
+
+def _tg_subject(f):
+    return f"<b>{notify.esc(f['subject'])}:</b> " if f.get('subject') else ''
+
+
+def _tg_findings(items, limit):
+    lines = [f"{TG_SEVERITY_ICONS[f['severity']]} {_tg_subject(f)}{notify.esc(f['text'])}" for f in items[:limit]]
+    if len(items) > limit:
+        lines.append(f'… и ещё {len(items) - limit}')
+    return lines
+
+
+def _tg_pick_project(projects, arg):
+    """Проект по номеру из /projects или части названия → (проект, None) или (None, текст ошибки)."""
+    if arg.isdigit() and 1 <= int(arg) <= len(projects):
+        return projects[int(arg) - 1], None
+    found = [p for p in projects if arg.lower() in (p['name'] or '').lower()]
+    if len(found) == 1:
+        return found[0], None
+    if not found:
+        return None, f'Проект «{notify.esc(arg)}» не найден. Список — /projects.'
+    return None, 'Под это название подходит несколько проектов: ' + ', '.join(
+        f'«{notify.esc(p["name"])}»' for p in found[:5]) + '. Уточните название или укажите номер из /projects.'
+
+
+def _tg_project_link(db, pid):
+    url = (notify_settings(db).get('public_url') or '').rstrip('/')
+    return f'\n<a href="{notify.esc(url)}/?project={pid}">Открыть в Burndown</a>' if url else ''
+
+
+def _tg_status(db, project):
+    data = project_insights(db, project['id'])
+    s = data['summary']
+    lines = [f"{TG_STATUS_ICONS.get(s['status'], '◽')} <b>{notify.esc(project['name'])}</b> — на {_fmt_date(data['date'])}",
+             notify.esc(s['headline'])]
+    lines += [f"• {notify.esc(f['label'])}: {notify.esc(f['value'])}" for f in s['facts']]
+    c = s['counts']
+    lines.append(f"Эпики: успевают {c['ok']} · риск {c['risk']} · не успевают {c['danger']}")
+    return '\n'.join(lines) + _tg_project_link(db, project['id'])
+
+
+def _tg_risks(db, project, limit=6):
+    s = project_insights(db, project['id'])['summary']
+    lines = [f"<b>{notify.esc(project['name'])}</b> — главные риски"]
+    lines += _tg_findings(s['top'], limit) or ['Рисков по срокам не видно.']
+    if s['health']:
+        lines += ['<i>Данные:</i>'] + _tg_findings(s['health'], 3)
+    return '\n'.join(lines)
+
+
+def _tg_week(db, project, limit=8):
+    weeks = insight_changes(db, project['id'], 1)['weeks']
+    head = f"<b>{notify.esc(project['name'])}</b> — за неделю"
+    if not weeks:
+        return head + '\nСравнивать пока не с чем: замеры появились меньше недели назад.'
+    w = weeks[0]
+    return '\n'.join([f"{head} ({_fmt_date(w['from'])} — {_fmt_date(w['to'])})"] +
+                      (_tg_findings(w['items'], limit) or ['Существенных изменений в статусах и прогнозах нет.']))
+
+
+def telegram_reply(db, chat_id, text):
+    """Ответ бота на сообщение пользователя (HTML Telegram) или None, если отвечать не нужно."""
+    text = (text or '').strip()
+    if not text:
+        return None
+    if not text.startswith('/'):
+        text = '/help'
+    head, _, arg = text.partition(' ')
+    cmd, arg = head[1:].split('@')[0].lower(), arg.strip()
+    if cmd == 'start' and arg:
+        user = db.execute('SELECT * FROM users WHERE telegram_link_code = ?', (arg,)).fetchone()
+        if not user:
+            return 'Ссылка для привязки устарела. Получите новую в Burndown: «Уведомления» → «Привязать Telegram».'
+        db.execute('UPDATE users SET telegram_chat_id = NULL WHERE telegram_chat_id = ? AND id != ?', (chat_id, user['id']))
+        db.execute('UPDATE users SET telegram_chat_id = ?, telegram_link_code = NULL WHERE id = ?', (chat_id, user['id']))
+        db.commit()
+        return ('<b>Burndown</b>\nУведомления подключены. Настройте дайджест и оповещения в разделе «Уведомления» '
+                'проекта.\n\n' + telegram_help())
+    user = db.execute('SELECT * FROM users WHERE telegram_chat_id = ?', (chat_id,)).fetchone()
+    if not user:
+        return ('Этот чат не привязан к Burndown. Откройте в Burndown раздел «Уведомления» проекта и нажмите '
+                '«Привязать Telegram».')
+    command = TELEGRAM_ALIASES.get(cmd)
+    if command is None:
+        return 'Не знаю такую команду.\n\n' + telegram_help()
+    if command == 'help':
+        return telegram_help()
+    projects = accessible_projects(db, user['id'])
+    if not projects:
+        return 'У вас пока нет доступа ни к одному проекту.'
+    if command == 'projects' or (command == 'status' and not arg and len(projects) > 1):
+        lines = ['<b>Ваши проекты</b>']
+        for i, p in enumerate(projects, 1):
+            s = project_insights(db, p['id'])['summary']
+            lines.append(f"{i}. {TG_STATUS_ICONS.get(s['status'], '◽')} <b>{notify.esc(p['name'])}</b> — "
+                         f"{notify.esc(s['headline'])}")
+        return '\n'.join(lines + ['', 'Подробнее: /status 1, риски: /risks 1, за неделю: /week 1.'])
+    if arg or len(projects) == 1:
+        project, error = _tg_pick_project(projects, arg) if arg else (projects[0], None)
+        if error:
+            return error
+        return {'status': _tg_status, 'risks': _tg_risks, 'week': _tg_week}[command](db, project)
+    parts = [{'risks': _tg_risks, 'week': _tg_week}[command](db, p, limit=3) for p in projects[:8]]
+    return '\n\n'.join(parts)
+
+
+def handle_telegram_update(db, client, update):
+    message = update.get('message') or {}
+    chat_id = str((message.get('chat') or {}).get('id') or '')
+    if not chat_id:
+        return None
+    reply = telegram_reply(db, chat_id, message.get('text'))
+    if reply:
+        client.send_message(chat_id, reply)
+    return reply
+
+
+def telegram_poller_alive(db):
+    """Бот опрашивается фоновым процессом (последний опрос — меньше 90 с назад)."""
+    tick = _app_setting(db, 'telegram_poll_tick')
+    if not tick:
+        return False
+    return datetime.now(timezone.utc) - datetime.strptime(tick, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc) \
+        < timedelta(seconds=90)
+
+
+def telegram_poll_step(timeout=TELEGRAM_POLL_TIMEOUT):
+    """Один цикл опроса бота → число обработанных сообщений; None — бот не подключён или команды выключены."""
+    db = get_db()
+    cfg = notify_settings(db)
+    if not cfg.get('telegram_token') or cfg.get('telegram_commands') == '0':
+        return None
+    _set_setting(db, 'telegram_poll_tick', _utc_now_iso())
+    db.commit()
+    client = telegram_client(cfg, timeout=timeout + 10)
+    if cfg.get('telegram_menu') != '1':
+        try:
+            client.set_commands(TELEGRAM_COMMANDS)
+            _set_setting(db, 'telegram_menu', '1')
+            db.commit()
+        except notify.NotifyError as e:
+            logger.warning('telegram setMyCommands failed: %s', e)
+    offset = int(cfg.get('telegram_offset') or 0)
+    updates = client.get_updates(offset, timeout)
+    for update in updates:
+        offset = max(offset, int(update.get('update_id') or 0) + 1)
+        try:
+            handle_telegram_update(db, client, update)
+        except notify.NotifyError as e:
+            logger.warning('telegram reply failed: %s', e)
+        except Exception:  # noqa: BLE001 — одно сообщение не останавливает бота
+            db.rollback()
+            logger.exception('telegram command failed')
+        _set_setting(db, 'telegram_offset', offset)  # подтверждаем сразу: ответ не повторится после сбоя
+        db.commit()
+    return len(updates)
+
+
+_tg_lock = None
+
+
+def _telegram_poll_lock():
+    """Опрашивает бота только один процесс: Telegram не разрешает два одновременных getUpdates."""
+    global _tg_lock
+    if _tg_lock is not None:
+        return True
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover — Windows: один процесс разработки
+        return True
+    f = open(DB_PATH + '.telegram.lock', 'a')
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return False
+    _tg_lock = f
+    return True
+
+
+def _telegram_loop():  # pragma: no cover — фоновый поток; логика — в telegram_poll_step
+    while True:
+        if not _telegram_poll_lock():
+            time.sleep(60)
+            continue
+        try:
+            with app.app_context():
+                if telegram_poll_step() is None:
+                    time.sleep(30)
+        except notify.NotifyError as e:
+            logger.warning('telegram polling: %s', e)
+            time.sleep(30)
+        except Exception:  # noqa: BLE001
+            logger.exception('telegram polling failed')
+            time.sleep(30)
+
+
 def mark_scheduler_tick():
     """Отметка «планировщик жив» для «Состояния системы»."""
     db = get_db()
@@ -4195,6 +4430,7 @@ def start_scheduler():
         return None
     thread = threading.Thread(target=_scheduler_loop, name='burndown-autofill', daemon=True)
     thread.start()
+    threading.Thread(target=_telegram_loop, name='burndown-telegram', daemon=True).start()
     return thread
 
 

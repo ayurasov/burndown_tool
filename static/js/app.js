@@ -4109,7 +4109,8 @@ function fillNotifyForm(d){
     (ch.email ? escapeHtml(ch.email) : '<span class="prob-low">В профиле не указан email — обратитесь к администратору</span>');
   document.getElementById('nfTelegramState').innerHTML = !ch.telegramReady ?
     '<span class="muted-cell">Администратор ещё не подключил Telegram-бота</span>' :
-    (ch.telegramLinked ? '<span class="prob-high">✓ Привязан</span>' :
+    (ch.telegramLinked ? '<span class="prob-high">✓ Привязан</span>' +
+      (ch.telegramCommands ? ' <span class="muted-cell">· спросите бота: /status, /risks, /week</span>' : '') :
       '<span class="muted-cell">Не привязан</span>');
   document.getElementById('nfTelegramLink').hidden = !ch.telegramReady || ch.telegramLinked;
   document.getElementById('nfTelegramUnlink').hidden = !ch.telegramLinked;
@@ -4231,6 +4232,10 @@ function fillNotifyAdmin(d){
   st.textContent = !d.telegram.hasToken ? 'Бот не подключён' : (d.telegram.botName ? '✓ Бот @' + d.telegram.botName : 'Токен сохранён, бот не проверен');
   st.className = 'jira-status' + (d.telegram.botName ? ' ok' : '');
   document.getElementById('naBotRemove').hidden = !d.telegram.hasToken;
+  document.getElementById('naCommands').checked = d.telegram.commands;
+  document.getElementById('naCommandsNote').textContent = 'Привязанный пользователь спрашивает бота о своих проектах — статус и главное, ' +
+    'риски, изменения за неделю.' + (d.telegram.hasToken && d.telegram.commands ? (d.telegram.pollTick ?
+    ' Бот на связи: последний опрос — ' + fmtDateTime(d.telegram.pollTick) + '.' : ' Бот начнёт отвечать в течение минуты.') : '');
   document.getElementById('naUrl').value = d.publicUrl;
 }
 
@@ -4239,7 +4244,7 @@ function notifyAdminData(extra){
     smtp: {host: document.getElementById('naHost').value.trim(), port: parseInt(document.getElementById('naPort').value, 10) || null,
            security: document.getElementById('naSecurity').value, sender: document.getElementById('naSender').value.trim(),
            login: document.getElementById('naLogin').value.trim(), password: document.getElementById('naPassword').value},
-    telegram: {token: document.getElementById('naToken').value.trim()},
+    telegram: {token: document.getElementById('naToken').value.trim(), commands: document.getElementById('naCommands').checked},
     publicUrl: document.getElementById('naUrl').value.trim()
   }, extra || {});
 }
@@ -4267,6 +4272,9 @@ document.getElementById('naTestEmail').addEventListener('click', function(){
     btn.disabled = false;
     loadNotifyLog();
   });
+});
+document.getElementById('naCommands').addEventListener('change', function(e){
+  saveNotifyAdmin(null, e.target.checked ? 'Бот отвечает на команды' : 'Команды бота выключены').catch(function(){});
 });
 document.getElementById('naBotTest').addEventListener('click', function(){
   saveNotifyAdmin().then(function(){
@@ -4699,6 +4707,14 @@ function init(){
     currentUser = data.user;
     currentUser.defaultPassword = !!data.defaultPassword;
     updateRoleUI();
+    /* ссылка на проект из письма или ответа бота: /?project=3 */
+    try {
+      var linked = parseInt(new URLSearchParams(window.location.search).get('project'), 10);
+      if(linked > 0){
+        currentProjectId = linked;
+        if(window.history && window.history.replaceState) window.history.replaceState(null, '', window.location.pathname);
+      }
+    } catch(e){}
     loadProjects();
     if(isGlobalAdmin()) api('/api/admin/health').then(function(h){ setHealthDot(h.status); }).catch(function(){});
   }).catch(function(){

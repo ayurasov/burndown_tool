@@ -762,3 +762,5 @@ textarea:disabled{opacity:0.55;cursor:not-allowed;}
 .jb-str-var .mono{min-width:8rem;}
 .jb-unit-current{background:var(--color-primary-highlight);font-weight:600;}
 .jb-unit-switch{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-2);margin-top:var(--space-2);} .jb-unit-switch .btn.active{background:var(--color-primary);color:#fff;border-color:var(--color-primary);}
+.na-commands{margin-top:var(--space-3);}
+#naCommandsNote{margin:var(--space-1) 0 0;}
