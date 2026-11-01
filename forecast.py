@@ -280,6 +280,7 @@ def zero_reached_date(pts):
 _MC_CACHE = {}
 _MC_CACHE_LIMIT = 4096
 MC_STORE = None  # (get(key) → результат | None, put(key, результат)) — постоянный кэш, общий для процессов (база)
+MC_ALGO = 2  # версия алгоритма Монте-Карло: при изменении расчёта сохранённые в базе результаты не используются
 
 
 def monte_carlo(dates, rems, target, settings, cal=None):

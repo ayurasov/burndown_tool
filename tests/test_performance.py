@@ -206,3 +206,18 @@ def test_schedule_warmup_starts_worker(flask_app, monkeypatch):
     app_module._warm_thread.join(2)
     assert started == [1] and 1 in app_module._warm_pending
     app_module._warm_pending.clear()
+
+
+def test_shared_caches_ignore_other_versions(admin, flask_app, monkeypatch):
+    admin.get('/api/projects/1/insights')
+    app_module._RESULT_CACHE.clear()
+    app_module._PAYLOAD_CACHE.clear()
+    monkeypatch.setattr(app_module, 'APP_VERSION', '99.0.0')  # обновили приложение — расчёты прежней версии не берём
+    calls = []
+    original = app_module._project_insights
+    monkeypatch.setattr(app_module, '_project_insights', lambda *a, **k: calls.append(1) or original(*a, **k))
+    admin.get('/api/projects/1/insights')
+    assert calls == [1]
+    assert app_module._mc_store_key('k') != app_module.hashlib.sha1(b'k').hexdigest()
+    monkeypatch.setattr(app_module.fc, 'MC_ALGO', 99)
+    assert app_module._mc_store_key('k') != app_module.hashlib.sha1(b'2|k').hexdigest()

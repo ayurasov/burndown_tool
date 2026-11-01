@@ -49,7 +49,7 @@
       <a href="#" class="nav-item" data-view="data">Данные по датам</a>
       <a href="#" class="nav-item" data-view="services">Эпики (блоки задач)</a>
       <a href="#" class="nav-item" data-view="settings" id="navSettings">Настройки проекта</a>
-      <a href="#" class="nav-item" data-view="jira" id="navJira">Связь с Jira</a>
+      <a href="#" class="nav-item" data-view="jira" id="navJira">Jira и Confluence</a>
       <a href="#" class="nav-item" data-view="autofill" id="navAutofill">Автозаполнение</a>
       <a href="#" class="nav-item" data-view="notify" id="navNotify">Уведомления</a>
     </nav>
@@ -409,6 +409,50 @@
         </div>
         <div class="table-scroll"><table class="data-table" id="jiraButtonsTable"></table></div>
       </div>
+      <div class="panel" id="wbPanel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Прогноз в Jira</div>
+            <div class="section-note">Burndown записывает в задачи эпиков прогноз завершения, статус сроков, шанс успеть и главный вывод — в выбранные поля Jira. Задача эпика — первая в его привязке к кнопке среза. Записываются только изменившиеся значения: автоматически при изменении данных проекта и по кнопке «Записать сейчас».</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="wbEnabled"> <span>Записывать автоматически</span></label>
+        </div>
+        <div class="jira-status" id="wbStatus" role="status"></div>
+        <div class="form-grid" id="wbFields"></div>
+        <div class="form-actions">
+          <button type="button" class="btn btn-ghost btn-sm" id="wbLoadFields">Загрузить поля из Jira</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="wbRun">Записать сейчас</button>
+          <button type="button" class="btn btn-primary btn-sm" id="wbSave">Сохранить</button>
+        </div>
+        <div class="table-scroll"><table class="data-table" id="wbTable"></table></div>
+      </div>
+      <div class="panel" id="crPanel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Отчёт в Confluence</div>
+            <div class="section-note">Страница с главным по проекту: статус и ключевые цифры, главные риски, что изменилось за неделю, этапы и эпики. Публикуется раз в неделю по расписанию и по кнопке «Опубликовать сейчас».</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="crEnabled"> <span>Публиковать еженедельно</span></label>
+        </div>
+        <div class="jira-status" id="crStatus" role="status"></div>
+        <div class="form-grid">
+          <div class="setting-item"><label class="small" for="crSpace">Ключ пространства</label><input type="text" id="crSpace" placeholder="PROJ" autocomplete="off"></div>
+          <div class="setting-item"><label class="small" for="crParent">Родительская страница (id)</label><input type="text" id="crParent" inputmode="numeric" placeholder="необязательно" autocomplete="off"></div>
+          <div class="setting-item"><label class="small" for="crTitle">Название страницы</label><input type="text" id="crTitle" placeholder="Burndown — {project}"></div>
+          <div class="setting-item"><label class="small" for="crMode">Страницы</label>
+            <select id="crMode"><option value="single">Одна страница — обновляется</option><option value="weekly">Новая страница каждую неделю</option></select></div>
+          <div class="setting-item"><label class="small" for="crWeekday">День публикации</label>
+            <select id="crWeekday"><option value="1">Понедельник</option><option value="2">Вторник</option><option value="3">Среда</option><option value="4">Четверг</option><option value="5">Пятница</option><option value="6">Суббота</option><option value="7">Воскресенье</option></select></div>
+          <div class="setting-item"><label class="small" for="crTime">Время</label><input type="time" id="crTime" value="09:00"></div>
+          <div class="setting-item"><label class="small" for="crTz">Часовой пояс</label><select id="crTz"></select></div>
+        </div>
+        <p class="section-note">В названии <code>{project}</code> заменяется названием проекта. Id родительской страницы — число из адреса страницы в Confluence (pageId=…).</p>
+        <div class="form-actions">
+          <a class="btn btn-ghost btn-sm" id="crOpen" href="#" target="_blank" rel="noopener" hidden>Открыть страницу</a>
+          <button type="button" class="btn btn-ghost btn-sm" id="crPublish">Опубликовать сейчас</button>
+          <button type="button" class="btn btn-primary btn-sm" id="crSave">Сохранить</button>
+        </div>
+      </div>
     </section>
 
     <!-- ПРОИЗВОДСТВЕННЫЙ КАЛЕНДАРЬ (администратор) -->
@@ -575,6 +619,58 @@
             <button type="button" class="btn btn-danger btn-sm" id="jiraDisconnect" hidden>Отключить</button>
             <button type="button" class="btn btn-ghost btn-sm" id="jiraTest">Проверить подключение</button>
             <button type="submit" class="btn btn-primary btn-sm" id="jiraSave">Сохранить</button>
+          </div>
+        </form>
+      </div>
+      <div class="panel" id="jiraOptionsPanel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Запись в Jira и события Jira</div>
+            <div class="section-note">Проекты могут записывать прогноз в задачи Jira (учётной записи подключения нужно право редактировать задачи) и обновлять замеры сразу при изменениях задач — по вебхуку Jira.</div>
+          </div>
+        </div>
+        <label class="switch"><input type="checkbox" id="joWriteback"> <span>Разрешить проектам записывать прогноз, статус и шанс успеть в поля задач Jira</span></label>
+        <div class="webhook-box">
+          <div class="field-label">Вебхук Jira</div>
+          <div class="jira-status" id="joWebhookStatus" role="status"></div>
+          <div class="webhook-url" id="joWebhookUrlRow" hidden>
+            <input type="text" id="joWebhookUrl" readonly aria-label="Адрес вебхука">
+            <button type="button" class="btn btn-ghost btn-sm" id="joWebhookCopy">Копировать</button>
+          </div>
+          <p class="section-note" id="joWebhookHint">В Jira: «Администрирование» → «Система» → «Веб-хуки» → «Создать»: URL — этот адрес, события — задача создана, обновлена, удалена. В проекте включите «По событиям Jira» у кнопки в разделе «Автозаполнение».</p>
+          <div class="form-actions">
+            <button type="button" class="btn btn-danger btn-sm" id="joWebhookOff" hidden>Выключить вебхук</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="joWebhookRotate" hidden>Новый адрес</button>
+            <button type="button" class="btn btn-primary btn-sm" id="joWebhookOn">Включить вебхук</button>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">Подключение к Confluence</div>
+            <div class="section-note">Для еженедельного отчёта проектов в Confluence. Учётной записи нужно право создавать и изменять страницы в пространствах отчётов. Токен хранится зашифрованным.</div>
+          </div>
+        </div>
+        <form id="confForm" novalidate autocomplete="off">
+          <div class="form-grid">
+            <div class="setting-item"><label class="small" for="confUrl">Confluence URL</label><input type="url" id="confUrl" placeholder="https://wiki.company.ru (для Cloud — https://company.atlassian.net/wiki)"></div>
+            <div class="setting-item"><label class="small" for="confType">Тип подключения</label>
+              <select id="confType">
+                <option value="server">Confluence Server/DC — Personal Access Token</option>
+                <option value="server_basic">Confluence Server/DC — логин и пароль</option>
+                <option value="cloud">Confluence Cloud — email + API-токен</option>
+              </select>
+            </div>
+            <div class="setting-item"><label class="small" for="confLogin">Логин или email</label><input type="text" id="confLogin" autocomplete="off"></div>
+            <div class="setting-item"><label class="small" for="confToken">Токен или пароль</label><input type="password" id="confToken" autocomplete="new-password"></div>
+          </div>
+          <label class="quick-filter-item check-wrap"><input type="checkbox" id="confInsecure"> Не проверять TLS-сертификат сервера</label>
+          <div class="jira-status" id="confStatus" role="status"></div>
+          <div class="form-actions">
+            <button type="button" class="btn btn-danger btn-sm" id="confDisconnect" hidden>Отключить</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="confTest">Проверить подключение</button>
+            <button type="submit" class="btn btn-primary btn-sm" id="confSave">Сохранить</button>
           </div>
         </form>
       </div>

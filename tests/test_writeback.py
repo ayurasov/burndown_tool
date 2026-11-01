@@ -219,6 +219,7 @@ def test_webhook_admin_options(admin, client, make_user):
     off = admin.put('/api/admin/jira-options', json={'webhook': False}).get_json()['webhook']
     assert off == {'enabled': False, 'url': '', 'last': None}
     assert client.post(rotated['url'].replace('https://burndown.example.ru', ''), json={}).status_code == 404
+    assert client.post('/api/jira/webhook/секрет', json={}).status_code == 404  # не-ASCII в адресе — тоже 404
     assert make_user('ivan').get('/api/admin/jira-options').status_code == 403
     audit = admin.get('/api/audit?page=integrations').get_json()['entries']
     assert any(a['entityType'] == 'jira_options' for a in audit)

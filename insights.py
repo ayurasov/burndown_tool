@@ -503,8 +503,10 @@ def _item_changes(old, new, level, ref, settings):
                            weight=200 + 50 * abs(rank_new - rank_old)))
     blocked_old, blocked_new = old['noBurn'] or old['tooFar'], new['noBurn'] or new['tooFar']
     if blocked_new and not blocked_old:
-        out.append(finding('risk', 'stalled', f'Прогноз потерян: {"остаток не сгорает" if new["noBurn"] else "срок больше 3 лет"} '
-                                               f'(был {_forecast_words(old)}).', weight=150))
+        why = 'остаток не сгорает' if new['noBurn'] else 'срок больше 3 лет'
+        text = f'Прогноз потерян: {why} (был {_forecast_words(old)}).' if old['forecast'] else \
+            f'Прогноза нет: {why}.'  # прогноза не было и раньше (мало замеров) — терять было нечего
+        out.append(finding('risk', 'stalled', text, weight=150))
     elif blocked_old and not blocked_new and new['forecast']:
         out.append(finding('ok', 'resumed', f'Работа возобновилась: прогноз {fmt_date(new["forecast"])}.', weight=120))
     elif old['forecast'] and new['forecast']:

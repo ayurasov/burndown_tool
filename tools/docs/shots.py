@@ -47,8 +47,11 @@ app_module.datetime = _DemoDatetime
 INSIGHTS_DAY = '2026-07-31'
 _project_insights = app_module.project_insights
 app_module.project_insights = lambda db, pid, today=None: _project_insights(db, pid, today or INSIGHTS_DAY)
+_insight_changes = app_module.insight_changes
+app_module.insight_changes = lambda db, pid, weeks=8, today=None: _insight_changes(db, pid, weeks, today or INSIGHTS_DAY)
 import fake_jira  # noqa: E402
 import notify  # noqa: E402
+from fake_confluence import FakeConfluence  # noqa: E402
 from fake_notify import FakeSMTP, FakeTelegram  # noqa: E402
 import init_db  # noqa: E402
 
@@ -105,7 +108,11 @@ def demo_jira(step=3):
                             {'id': 9, 'name': 'Бэклог сопровождения'}]
     fake_jira.FIELDS = fake_jira.FIELDS[:5] + [
         {'id': 'customfield_10051', 'name': 'Трудозатраты по плану, ч', 'custom': True, 'schema': {'type': 'number'}},
-        {'id': 'customfield_10016', 'name': 'Story Points', 'custom': True, 'schema': {'type': 'number'}}]
+        {'id': 'customfield_10016', 'name': 'Story Points', 'custom': True, 'schema': {'type': 'number'}},
+        # поля для записи прогноза Burndown в задачи эпиков
+        {'id': 'customfield_10100', 'name': 'Прогноз Burndown', 'custom': True, 'schema': {'type': 'date'}},
+        {'id': 'customfield_10101', 'name': 'Статус сроков', 'custom': True, 'schema': {'type': 'option'}},
+        {'id': 'customfield_10102', 'name': 'Шанс успеть, %', 'custom': True, 'schema': {'type': 'number'}}]
     fake_jira.FIELDS[4] = dict(fake_jira.FIELDS[4], name='Трудозатраты, чел.-дни')
 
 
@@ -225,6 +232,14 @@ def main():
         pg.wait_for_timeout(300)
         shot(pg.locator('#insightsBody .insight-details'), 'user/51-insights-details.png')
         pg.click('#insightsBody .insight-details > summary')
+        # что изменилось за неделю и лента по неделям
+        pg.wait_for_selector('#insightChanges .insight-col-title')
+        if pg.locator('#insightChanges .insight-feed > summary').count():
+            pg.click('#insightChanges .insight-feed > summary')
+        pg.wait_for_timeout(300)
+        shot(pg.locator('#insightChanges'), 'user/60-insights-changes.png')
+        if pg.locator('#insightChanges .insight-feed[open] > summary').count():
+            pg.click('#insightChanges .insight-feed > summary')
         pg.click('.view-blocks-btn[data-blocks="dashboard"]')
         modal('user/54-view-blocks.png')
         pg.keyboard.press('Escape')
@@ -443,7 +458,8 @@ def main():
             'mappings': [{'serviceId': 3, 'issueKeys': 'AISUZ-301, AISUZ-302', 'includeSubtree': True}]}).json()['id']
         bid1 = api.get(base + '/api/projects/1/jira').json()['buttons'][0]['id']
         api.put(f'{base}/api/jira/buttons/{bid1}/schedule', json={
-            'enabled': True, 'days': [1, 2, 3, 4, 5], 'time': '09:00', 'timezone': 'Europe/Moscow', 'overwrite': True})
+            'enabled': True, 'days': [1, 2, 3, 4, 5], 'time': '09:00', 'timezone': 'Europe/Moscow', 'overwrite': True,
+            'onEvents': True})
         with app_module.app.app_context():  # сегодняшний автозапуск в 09:00 уже прошёл
             app_module.get_db().execute('UPDATE jira_schedules SET last_run_date = NULL')
             app_module.get_db().commit()
@@ -454,6 +470,56 @@ def main():
         shot(pg.locator('#view-autofill .panel'), 'user/31-autofill.png')
         shot(pg.locator(f'.autofill-card[data-bid="{bid1}"]'), 'user/32-autofill-card.png')
         shot(pg.locator(f'.autofill-card[data-bid="{bid2}"]'), 'user/33-autofill-locked.png')
+
+        # ── Запись в Jira и вебхук (администратор), подключение к Confluence
+        api.put(base + '/api/admin/jira-options', json={'writebackAllowed': True, 'webhook': True})
+        api.post(api.get(base + '/api/admin/jira-options').json()['webhook']['url'].replace('https://burndown.example.ru', base),
+                 json={'webhookEvent': 'jira:issue_updated', 'issue': {'key': 'AISUZ-100', 'fields': {}}})
+        go('integrations', '#joWebhookUrl')
+        pg.wait_for_function("document.getElementById('joWebhookStatus').textContent.includes('Последнее событие')")
+        shot(pg.locator('#jiraOptionsPanel'), 'admin/15-jira-options.png')
+        confluence = FakeConfluence(mode='server', token='conf-pat', spaces=('PMO',))
+        pg.wait_for_function("document.getElementById('confStatus').textContent !== ''")
+        pg.fill('#confUrl', confluence.url)
+        pg.fill('#confToken', 'conf-pat')
+        pg.click('#confTest')
+        pg.wait_for_function("document.getElementById('confStatus').classList.contains('ok')")
+        pg.click('#confSave')
+        pg.wait_for_timeout(500)
+        hide_toast()
+        pg.click('#confTest')
+        pg.wait_for_function("document.getElementById('confStatus').textContent.includes('работает')")
+        pg.fill('#confUrl', 'https://wiki.example.ru')  # на снимке — адрес как в компании, а не учебного стенда
+        pg.evaluate('document.activeElement.blur()')
+        shot(pg.locator('#confForm').locator('xpath=ancestor::div[contains(@class,"panel")]'), 'admin/16-confluence.png')
+        pg.fill('#confUrl', confluence.url)
+
+        # ── Прогноз в Jira и отчёт в Confluence (проект)
+        go('jira', '#wbFields select')
+        pg.click('#wbLoadFields')
+        pg.wait_for_selector('#wbField-forecast option[value="customfield_10100"]', state='attached')
+        pg.select_option('#wbField-forecast', 'customfield_10100')
+        pg.select_option('#wbField-status', 'customfield_10101')
+        pg.select_option('#wbField-chance', 'customfield_10102')
+        pg.click('#wbSave')
+        pg.wait_for_selector('#wbTable td:has-text("будет записано")')
+        pg.click('#wbRun')
+        pg.wait_for_selector('#wbStatus:has-text("Записано в Jira")')
+        pg.check('#wbEnabled')
+        pg.wait_for_timeout(500)
+        hide_toast()
+        shot(pg.locator('#wbPanel'), 'user/61-writeback.png')
+        pg.fill('#crSpace', 'PMO')
+        pg.select_option('#crMode', 'single')
+        pg.select_option('#crWeekday', '1')
+        pg.fill('#crTime', '09:00')
+        pg.click('#crPublish')
+        pg.wait_for_selector('#crStatus.ok')
+        pg.check('#crEnabled')
+        pg.wait_for_timeout(500)
+        hide_toast()
+        shot(pg.locator('#crPanel'), 'user/62-confluence-report.png')
+        confluence.stop()
 
         # ── Восстановление истории по журналу изменений Jira
         go('jira', '#jiraButtonsTable [data-action="history"]')

@@ -58,6 +58,9 @@ def test_finished_stalled_resumed_target():
     assert found['Второй']['text'] == 'Прогноз потерян: остаток не сгорает (был 01.12.2026).'
     too_far = ins.state_changes(old, state({'2': item(name='Второй', too_far=True, forecast=None)}), SETTINGS)
     assert 'срок больше 3 лет' in too_far[0]['text']
+    never = ins.state_changes(state({'2': item(forecast=None, status='unknown')}),
+                              state({'2': item(no_burn=True, forecast=None)}), SETTINGS)
+    assert never[0]['text'] == 'Прогноза нет: остаток не сгорает.'  # прогноза не было — «потерян» не пишем
     third = [f for f in ins.state_changes(old, new, SETTINGS) if f['subject'] == 'Третий']
     assert kinds(third) == [('target', 'info'), ('resumed', 'ok')]
     assert third[0]['text'] == 'Цель изменена: 10.12.2026 → 01.02.2027.'

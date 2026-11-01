@@ -13,6 +13,7 @@ import re
 import math
 import gzip
 import hashlib
+import html
 import pickle
 import secrets
 import shutil
@@ -866,10 +867,13 @@ def _mc_connection():
     return conn
 
 
+def _mc_store_key(key):
+    return hashlib.sha1(f'{fc.MC_ALGO}|{key}'.encode('utf-8')).hexdigest()
+
+
 def _mc_store_get(key):
     try:
-        row = _mc_connection().execute('SELECT value FROM mc_cache WHERE key = ?',
-                                       (hashlib.sha1(key.encode('utf-8')).hexdigest(),)).fetchone()
+        row = _mc_connection().execute('SELECT value FROM mc_cache WHERE key = ?', (_mc_store_key(key),)).fetchone()
         return json.loads(row[0]) if row else None
     except (sqlite3.Error, ValueError):
         return None
@@ -879,7 +883,7 @@ def _mc_store_put(key, value):
     try:
         conn = _mc_connection()
         conn.execute('INSERT OR REPLACE INTO mc_cache (key, value, created_at) VALUES (?, ?, ?)',
-                     (hashlib.sha1(key.encode('utf-8')).hexdigest(), json.dumps(value), _utc_now_iso()))
+                     (_mc_store_key(key), json.dumps(value), _utc_now_iso()))
         conn.commit()
     except sqlite3.Error:  # база занята или только для чтения — кэш в памяти процесса всё равно работает
         pass
@@ -3031,7 +3035,7 @@ def api_jira_webhook(secret):
     """Приём событий Jira (адрес с секретом выдаёт администратор в «Интеграциях»). Без сессии: Jira не входит в систему."""
     db = get_db()
     expected = _app_setting(db, 'jira_webhook_secret')
-    if not expected or not secrets.compare_digest(secret, expected):
+    if not expected or not secrets.compare_digest(secret.encode('utf-8'), expected.encode('utf-8')):
         return jsonify({'error': 'Неизвестный адрес'}), 404
     payload = request.get_json(silent=True) or {}
     keys = webhook_issue_keys(payload)
@@ -3416,8 +3420,10 @@ def api_publish_confluence_report(pid):
         return err
     db = get_db()
     status, message, url = publish_report(db, pid, actor=get_current_user()['username'])
-    return jsonify(dict(_confluence_report_json(db, pid), result={'status': status, 'message': message, 'url': url})), \
-        (200 if status == 'ok' else 502)
+    body = dict(_confluence_report_json(db, pid), result={'status': status, 'message': message, 'url': url})
+    if status != 'ok':
+        body['error'] = message
+    return jsonify(body), (200 if status == 'ok' else 502)
 
 
 # ─── Уведомления: настройки отправки, подписки, дайджест, оповещения ───
@@ -3836,7 +3842,7 @@ SHARED_RESULTS = {'insights', 'overview'}  # эти расчёты хранят�
 def _shared_result_get(kind, key, version):
     try:
         row = _mc_connection().execute('SELECT value FROM result_cache WHERE kind = ? AND key = ? AND version = ?',
-                                       (kind, repr(key), version)).fetchone()
+                                       (kind, repr(key), f'{APP_VERSION}|{version}')).fetchone()
         return json.loads(row[0]) if row else None
     except (sqlite3.Error, ValueError):
         return None
@@ -3846,7 +3852,7 @@ def _shared_result_put(kind, key, version, value):
     try:
         conn = _mc_connection()
         conn.execute('INSERT OR REPLACE INTO result_cache (kind, key, version, value, created_at) VALUES (?, ?, ?, ?, ?)',
-                     (kind, repr(key), version, json.dumps(value), _utc_now_iso()))
+                     (kind, repr(key), f'{APP_VERSION}|{version}', json.dumps(value), _utc_now_iso()))
         conn.commit()
     except (sqlite3.Error, TypeError, ValueError):  # база занята — результат остаётся в кэше процесса
         pass
@@ -4960,7 +4966,7 @@ def _tg_pick_project(projects, arg):
 
 def _tg_project_link(db, pid):
     url = (notify_settings(db).get('public_url') or '').rstrip('/')
-    return f'\n<a href="{notify.esc(url)}/?project={pid}">Открыть в Burndown</a>' if url else ''
+    return f'\n<a href="{html.escape(url, quote=True)}/?project={pid}">Открыть в Burndown</a>' if url else ''
 
 
 def _tg_status(db, project):
