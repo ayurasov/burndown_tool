@@ -12,7 +12,13 @@
 timeoriginalestimate — оценка; в секундах), и суммируются в часы. Если у кнопки указана
 структура и включено «с вложенными», суммируются все задачи поддерева этих задач в структуре
 (каждая задача — один раз); без структуры «с вложенными» — задача вместе с подзадачами.
+
+Показатель может браться и из колонки Structure — поля, суммы по поддереву или формулы, как она настроена
+в структуре: значение колонки у строки задачи эпика читается через Value API Structure
+(/rest/structure/2.0/value) и совпадает с тем, что видно в структуре.
 """
+
+import json
 
 import base64
 import hashlib
@@ -47,9 +53,11 @@ PROBLEMS = {
 TIME_FIELDS = {'remaining': 'timeestimate', 'spent': 'timespent', 'estimate': 'timeoriginalestimate'}
 TIME_FIELD_NAMES = {'timeestimate': 'Оставшаяся оценка', 'timespent': 'Затраченное время',
                     'timeoriginalestimate': 'Первоначальная оценка'}
-# единица значения поля Jira → множитель для перевода в часы
-UNITS = {'seconds': 1 / 3600, 'hours': 1.0}
-DEFAULT_FIELD_MAP = {m: {'field': TIME_FIELDS[m], 'unit': 'seconds'} for m in METRICS}
+# единица значения поля Jira или колонки Structure → множитель для перевода в часы (рабочий день — 8 ч)
+UNITS = {'ms': 1 / 3600000, 'seconds': 1 / 3600, 'minutes': 1 / 60, 'hours': 1.0, 'days': 8.0}
+ATTRIBUTE_ID_RE = re.compile(r'^[A-Za-z0-9_.:\-]{1,200}$')
+ATTRIBUTE_MAX_JSON = 20000
+DEFAULT_FIELD_MAP = {m: {'field': TIME_FIELDS[m], 'unit': 'seconds', 'structure': None} for m in METRICS}
 FIELD_ID_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]*$')
 SEARCH_BATCH = 100  # задач в одном запросе Jira Cloud
 SERVER_BATCH = 500  # Server/DC отдаёт до 1000 задач за запрос (если в Jira предел меньше — дочитываем постранично)
@@ -131,6 +139,21 @@ def parse_issue_keys(text):
     return keys, invalid
 
 
+def parse_forest_rows(formula):
+    """Формула Structure «rowId:depth:item,…» → [(rowId, depth, issueId|None)] — с номерами строк для Value API."""
+    rows = []
+    for part in (formula or '').split(','):
+        pieces = part.split(':')
+        if len(pieces) < 3:
+            continue
+        try:
+            row_id, depth = int(pieces[0]), int(pieces[1])
+        except ValueError:
+            continue
+        rows.append((row_id, depth, int(pieces[2]) if pieces[2].isdigit() else None))
+    return rows
+
+
 def parse_forest_formula(formula):
     """Формула Structure «rowId:depth:item[:semantic],…» → [(depth, issueId|None)].
 
@@ -182,10 +205,37 @@ def sum_hours(values, unit):
     return round(sum(filled) * UNITS[unit], 2) if filled else None
 
 
-def normalize_field_map(raw):
-    """Проверенное сопоставление метрик и полей: {metric: {'field': id|'', 'unit': 'seconds'|'hours'}}.
+def normalize_attribute(spec, depth=0):
+    """Спецификация колонки (атрибута) Structure: {'id', 'format', 'params'} — как её отправляет доска Structure.
+    Вложенные спецификации (переменные формулы, атрибут суммы) проверяются так же. → ValueError при ошибке."""
+    if depth > 6 or not isinstance(spec, dict):
+        raise ValueError('Спецификация колонки Structure — объект JSON с полями id и format')
+    attr_id = spec.get('id')
+    if not isinstance(attr_id, str) or not ATTRIBUTE_ID_RE.match(attr_id):
+        raise ValueError('В спецификации колонки Structure нет корректного id')
+    out = {'id': attr_id, 'format': spec.get('format') if isinstance(spec.get('format'), str) else 'number'}
+    params = spec.get('params')
+    if params is not None:
+        if not isinstance(params, dict):
+            raise ValueError('Параметры колонки Structure (params) — объект JSON')
+        for value in params.values():  # вложенные спецификации тоже проверяем
+            if isinstance(value, dict) and 'id' in value and 'format' in value:
+                normalize_attribute(value, depth + 1)
+            if isinstance(value, dict) and all(isinstance(v, dict) and 'id' in v for v in value.values()) and value:
+                for v in value.values():
+                    normalize_attribute(v, depth + 1)
+        out['params'] = params
+    if depth == 0 and len(json.dumps(out, ensure_ascii=False)) > ATTRIBUTE_MAX_JSON:
+        raise ValueError('Спецификация колонки Structure слишком большая')
+    return out
 
-    Пустое поле — метрику не заполнять. Некорректные значения → ValueError с понятным текстом.
+
+def normalize_field_map(raw):
+    """Проверенное сопоставление метрик: {metric: {'field': id|'', 'unit', 'structure': None | {'attribute',
+    'unit', 'label'}}}. field — поле Jira (сумма по задачам; для показателя из колонки Structure — для состава задач
+    и восстановления истории); structure — колонка Structure, из которой берётся сам показатель эпика.
+
+    Пустое поле и нет колонки — метрику не заполнять. Некорректные значения → ValueError с понятным текстом.
     """
     raw = raw or {}
     out = {}
@@ -198,10 +248,20 @@ def normalize_field_map(raw):
         if field and not FIELD_ID_RE.match(field):
             raise ValueError(f'Некорректный идентификатор поля Jira: {field}')
         if unit not in UNITS:
-            raise ValueError('Единица измерения — секунды или часы')
-        out[metric] = {'field': field, 'unit': unit}
-    if not any(v['field'] for v in out.values()):
-        raise ValueError('Сопоставьте с полями Jira хотя бы одну метрику')
+            raise ValueError('Единица измерения — миллисекунды, секунды, минуты, часы или дни')
+        structure = item.get('structure')
+        if structure:
+            if not isinstance(structure, dict):
+                raise ValueError('Некорректная колонка Structure')
+            s_unit = structure.get('unit') or 'hours'
+            if s_unit not in UNITS:
+                raise ValueError('Единица колонки Structure — миллисекунды, секунды, минуты, часы или дни')
+            label = structure.get('label') if isinstance(structure.get('label'), str) else ''
+            structure = {'attribute': normalize_attribute(structure.get('attribute')), 'unit': s_unit,
+                         'label': label.strip()[:200]}
+        out[metric] = {'field': field, 'unit': unit, 'structure': structure or None}
+    if not any(v['field'] or v['structure'] for v in out.values()):
+        raise ValueError('Сопоставьте с полями Jira или колонками Structure хотя бы одну метрику')
     return out
 
 
@@ -346,10 +406,37 @@ class JiraClient:
         return [{'id': s.get('id'), 'name': s.get('name') or f"Структура {s.get('id')}"}
                 for s in (data.get('structures') or []) if isinstance(s, dict) and isinstance(s.get('id'), int)]
 
+    def forest(self, structure_id):
+        """Строки структуры [(rowId, depth, issueId|None)]; за срез структура загружается один раз."""
+        cache = self.__dict__.setdefault('_forests', {})
+        if structure_id not in cache:
+            data = self.json('POST', self.structure_api('forest/latest'), json={'structureId': structure_id},
+                             not_found=f'Структура {structure_id} не найдена или плагин Structure недоступен')
+            cache[structure_id] = parse_forest_rows(str(data.get('formula') or ''))
+        return cache[structure_id]
+
     def forest_rows(self, structure_id):
-        data = self.json('POST', self.structure_api('forest/latest'), json={'structureId': structure_id},
-                         not_found=f'Структура {structure_id} не найдена или плагин Structure недоступен')
-        return parse_forest_formula(str(data.get('formula') or ''))
+        return [(depth, issue_id) for _row, depth, issue_id in self.forest(structure_id)]
+
+    def structure_values(self, structure_id, rows, attributes):
+        """Значения колонок Structure для строк структуры (Value API) → [{rowId: значение}] по порядку attributes.
+        Формат значений — число: так Structure отдаёт значение колонки без оформления."""
+        out = [dict() for _ in attributes]
+        rows = sorted(set(rows))
+        specs = [dict(a, format='number') for a in attributes]
+        for start in range(0, len(rows), 500):
+            batch = rows[start:start + 500]
+            data = self.json('POST', self.structure_api('value'), json={'requests': [
+                {'forestSpec': {'structureId': structure_id}, 'rows': batch, 'attributes': specs}]},
+                not_found='API значений Structure недоступно — нужен Structure 4 или новее')
+            for response in data.get('responses') or []:
+                got_rows = response.get('rows') or batch
+                for i, item in enumerate(response.get('data') or []):
+                    if i >= len(out) or not isinstance(item, dict):
+                        continue
+                    for row_id, value in zip(got_rows, item.get('values') or []):
+                        out[i][row_id] = value
+        return out
 
     def issue(self, key, fields, changelog=False):
         """Задача по ключу (исходный JSON Jira); None, если её нет или нет прав на просмотр."""
@@ -590,13 +677,109 @@ def compute_snapshot(client, structure_id, mappings, field_map=None):
     """Срез для кнопки.
 
     mappings: [{'serviceId', 'issueKeys': 'ABC-1, ABC-2', 'includeSubtree': bool}]
-    field_map: {metric: {'field', 'unit'}} (по умолчанию — учёт времени Jira)
+    field_map: {metric: {'field', 'unit', 'structure'}} (по умолчанию — учёт времени Jira)
     → [{'serviceId', 'remaining', 'spent', 'estimate', 'issueCount', 'warnings': [...]}]
     """
     field_map = field_map or DEFAULT_FIELD_MAP
     fields = sorted({v['field'] for v in field_map.values() if v['field']} | set(ISSUE_FIELDS))
     groups, _histories = collect_issues(client, structure_id, mappings, fields)
-    return [_snapshot_item(g, field_map) for g in groups]
+    items = [_snapshot_item(g, field_map) for g in groups]
+    columns = {m: field_map[m]['structure'] for m in METRICS if field_map[m].get('structure')}
+    if columns:
+        apply_structure_columns(client, structure_id, groups, items, columns)
+    return items
+
+
+def _number(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip().replace('\u00a0', '').replace(' ', '').replace(',', '.')
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
+def root_rows(rows):
+    """Задача → первая строка структуры, где она стоит, и сколько раз она встречается."""
+    first, count = {}, {}
+    for row_id, _depth, issue_id in rows:
+        if issue_id is None:
+            continue
+        first.setdefault(issue_id, row_id)
+        count[issue_id] = count.get(issue_id, 0) + 1
+    return first, count
+
+
+def apply_structure_columns(client, structure_id, groups, items, columns):
+    """Показатели из колонок Structure: значение колонки у строки задачи эпика (как в структуре); у эпика из
+    нескольких задач — сумма их строк. Задача, которой нет в структуре, в показатель не входит (с предупреждением)."""
+    if not structure_id:
+        for item in items:
+            for metric in columns:
+                item[metric] = None
+            item['warnings'].append('Колонки Structure работают только у кнопки со структурой — показатели из них не заполнены')
+        return
+    first, count = root_rows(client.forest(structure_id))
+    specs, index, slot = [], {}, {}
+    for metric, col in columns.items():
+        key = json.dumps(col['attribute'], sort_keys=True, ensure_ascii=False)
+        if key not in index:
+            index[key] = len(specs)
+            specs.append(col['attribute'])
+        slot[metric] = index[key]
+    need = []
+    for g, item in zip(groups, items):
+        rows = []
+        for key, issue_id, _f in g['roots']:
+            row = first.get(issue_id)
+            if row is None:
+                item['warnings'].append(f'{key}: задачи нет в структуре — колонки Structure для неё не посчитаны')
+                continue
+            if count.get(issue_id, 0) > 1:
+                item['warnings'].append(f'{key}: задача стоит в структуре несколько раз — взято значение первой строки')
+            rows.append(row)
+        need.append(rows)
+    all_rows = sorted({r for rows in need for r in rows})
+    values = client.structure_values(structure_id, all_rows, specs) if all_rows else [{} for _ in specs]
+    for rows, item in zip(need, items):
+        for metric, col in columns.items():
+            raw = [values[slot[metric]].get(row) for row in rows]
+            nums = [n for n in (_number(v) for v in raw) if n is not None]
+            item[metric] = round(sum(nums) * UNITS[col['unit']], 2) if nums else None
+            if not nums and any(v not in (None, '') for v in raw):
+                item['warnings'].append(f"Колонка Structure «{col.get('label') or col['attribute']['id']}» вернула не число — "
+                                        'проверьте её формат')
+
+
+def structure_preview(client, structure_id, keys, attribute, unit):
+    """Значения колонки Structure у строк задач (проверка в редакторе кнопки) →
+    [{'key', 'rowId', 'raw', 'hours'}] и предупреждения."""
+    found = client.issues_by_keys(keys, ['summary'])
+    first, _count = root_rows(client.forest(structure_id))
+    rows, warnings = [], []
+    for key in keys:
+        issue = found.get(key)
+        row = first.get(int(issue['id'])) if issue else None
+        if issue is None:
+            warnings.append(f'{key}: задача не найдена или нет прав на просмотр')
+        elif row is None:
+            warnings.append(f'{key}: задачи нет в структуре')
+        else:
+            rows.append((key, row))
+    values = client.structure_values(structure_id, [r for _k, r in rows], [attribute])[0] if rows else {}
+    out = []
+    for key, row in rows:
+        raw = values.get(row)
+        num = _number(raw)
+        out.append({'key': key, 'rowId': row, 'raw': raw,
+                    'hours': None if num is None else round(num * UNITS[unit], 2),
+                    'asUnits': {u: (None if num is None else round(num * k, 2)) for u, k in UNITS.items()}})
+    return out, warnings
 
 
 # ─── Состав эпика по задачам и качество данных ───────────────────

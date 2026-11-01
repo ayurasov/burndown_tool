@@ -1320,6 +1320,8 @@ def _parse_jira_button(db, pid, data):
         field_map = jira.normalize_field_map(data.get('fieldMap'))
     except ValueError as e:
         raise ValidationError(str(e))
+    if not structure_id and any(v['structure'] for v in field_map.values()):
+        raise ValidationError('Колонки Structure можно выбрать только у кнопки со структурой')
     return name, structure_id, text_value(data.get('structureName')) or None, mappings, field_map
 
 
@@ -1702,6 +1704,35 @@ def run_epic_sync(db, button_row, actor=None, dry_run=False, client=None):
     db.execute('UPDATE jira_snapshot_buttons SET epic_sync_at = ?, epic_sync_message = ? WHERE id = ?',
                (_utc_now_iso(), message, button_row['id']))
     return plan, message
+
+
+@app.route('/api/projects/<int:pid>/jira/structure-preview', methods=['POST'])
+@login_required
+def api_jira_structure_preview(pid):
+    """Проверка колонки Structure в редакторе кнопки: значения у строк задач — для сверки со структурой."""
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    data = json_body()
+    structure_id = _structure_id(data.get('structureId'))
+    if not structure_id:
+        raise ValidationError('Выберите структуру — колонки Structure работают только у кнопки со структурой')
+    try:
+        attribute = jira.normalize_attribute(data.get('attribute'))
+    except ValueError as e:
+        raise ValidationError(str(e))
+    unit = data.get('unit') or 'hours'
+    if unit not in jira.UNITS:
+        raise ValidationError('Недопустимая единица')
+    keys, invalid = jira.parse_issue_keys(text_value(data.get('keys'), 2000))
+    if invalid:
+        raise ValidationError('Некорректные ключи задач: ' + ', '.join(invalid))
+    if not keys:
+        raise ValidationError('Укажите задачи Jira у эпиков — значения колонки проверяются по ним')
+    try:
+        rows, warnings = jira.structure_preview(_jira_client(get_db()), structure_id, keys[:20], attribute, unit)
+    except jira.JiraError as e:
+        return _jira_error(e)
+    return jsonify({'values': rows, 'warnings': warnings})
 
 
 @app.route('/api/projects/<int:pid>/jira/epics/preview', methods=['POST'])
@@ -2480,6 +2511,16 @@ def run_history_job(jid):
                 days_saved.add(day)
             db.commit()
         message = f'Восстановлено замеров: {saved} на {len(days_saved)} дат(ы)'
+        field_map = button['fieldMap']
+        columns = [m for m in jira.METRICS if field_map[m]['structure']]
+        if columns:  # колонка Structure хранит только текущие значения — прошлые даты считаются по полям Jira
+            titles = {'remaining': 'остаток', 'spent': 'затрачено', 'estimate': 'оценка'}
+            by_field = [titles[m] for m in columns if field_map[m]['field']]
+            skipped_cols = [titles[m] for m in columns if not field_map[m]['field']]
+            if by_field:
+                message += '; по полям Jira, а не по колонкам Structure: ' + ', '.join(by_field)
+            if skipped_cols:
+                message += '; не восстановлено (колонка Structure без поля Jira): ' + ', '.join(skipped_cols)
         if skipped:
             message += f'; пропущено (замер уже был): {skipped}'
         if warnings:

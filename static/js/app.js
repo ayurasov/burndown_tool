@@ -2709,15 +2709,68 @@ var JIRA_METRICS = [['remaining', 'Остаток'], ['spent', 'Затрачен
 var JIRA_TIME_FIELDS = [{id: 'timeestimate', name: 'Оставшаяся оценка', time: true},
   {id: 'timespent', name: 'Затраченное время', time: true},
   {id: 'timeoriginalestimate', name: 'Первоначальная оценка', time: true}];
-var JIRA_DEFAULT_FIELD_MAP = {remaining: {field: 'timeestimate', unit: 'seconds'}, spent: {field: 'timespent', unit: 'seconds'},
-  estimate: {field: 'timeoriginalestimate', unit: 'seconds'}};
+var JIRA_DEFAULT_FIELD_MAP = {remaining: {field: 'timeestimate', unit: 'seconds', structure: null}, spent: {field: 'timespent', unit: 'seconds', structure: null},
+  estimate: {field: 'timeoriginalestimate', unit: 'seconds', structure: null}};
+var JIRA_FIELD_UNITS = [['seconds', 'секунды'], ['hours', 'часы'], ['minutes', 'минуты'], ['days', 'дни (8 ч)'], ['ms', 'миллисекунды']];
+
+/* ── Колонки Structure как источник показателей (значение колонки у строки эпика — как в структуре) ── */
+var STRUCTURE_UNITS = [['ms', 'миллисекунды'], ['seconds', 'секунды'], ['minutes', 'минуты'], ['hours', 'часы'], ['days', 'дни (8 ч)']];
+var FORMULA_ALIASES = {remaining: 'timeestimate', remaining_estimate: 'timeestimate', timeestimate: 'timeestimate',
+  original_estimate: 'timeoriginalestimate', originalestimate: 'timeoriginalestimate', estimate: 'timeoriginalestimate',
+  timeoriginalestimate: 'timeoriginalestimate', time_spent: 'timespent', timespent: 'timespent', spent: 'timespent'};
+var FORMULA_WORDS = ['if', 'then', 'else', 'with', 'and', 'or', 'not', 'case', 'true', 'false', 'null', 'undefined', 'end', 'in',
+  'sum', 'min', 'max', 'avg', 'count', 'distinct', 'none', 'all', 'any'];
+function unitOptions(units, current){
+  return units.map(function(u){ return '<option value="'+u[0]+'"'+(u[0] === current ? ' selected' : '')+'>'+u[1]+'</option>'; }).join('');
+}
+function describeAttribute(spec){
+  if(!spec) return '';
+  var p = spec.params || {};
+  if(spec.id === 'expr') return 'Формула: ' + String(p.formula || '').replace(/\s+/g, ' ').slice(0, 90);
+  if(spec.id === 'sum') return 'Σ по вложенным: ' + describeAttribute(p.attribute || p.value);
+  return 'Атрибут «' + spec.id + '»' + (p.fieldId ? ' (' + p.fieldId + ')' : '');
+}
+/* Спецификации колонок из вставленного текста: запрос или ответ /value из инструментов разработчика, массив или одна спецификация */
+function extractAttributeSpecs(text){
+  var data = JSON.parse(text), out = [], seen = {};
+  var add = function(spec){
+    if(spec && typeof spec === 'object' && typeof spec.id === 'string'){
+      var key = JSON.stringify(spec);
+      if(!seen[key]){ seen[key] = true; out.push(spec); }
+    }
+  };
+  var walk = function(node){
+    if(Array.isArray(node)){ node.forEach(walk); return; }
+    if(!node || typeof node !== 'object') return;
+    if(node.requests) walk(node.requests);
+    if(node.responses) walk(node.responses);
+    if(node.attributes) (node.attributes || []).forEach(add);
+    if(node.data && Array.isArray(node.data)) node.data.forEach(function(d){ add(d && d.attribute); });
+    if(typeof node.id === 'string' && !node.requests && !node.responses) add(node);
+  };
+  walk(data);
+  return out;
+}
+function formulaVariables(formula){
+  var text = String(formula || '').replace(/"[^"]*"|'[^']*'/g, ' ');
+  var locals = {};
+  text.replace(/\bWITH\s+([A-Za-z_][A-Za-z0-9_]*)\s*=/gi, function(_m, n){ locals[n.toLowerCase()] = true; return ''; });
+  var names = [], re = /[A-Za-z_][A-Za-z0-9_]*/g, m;
+  while((m = re.exec(text))){
+    var name = m[0], rest = text.slice(re.lastIndex).replace(/^\s+/, '');
+    if(rest[0] === '(' || rest[0] === '{' || FORMULA_WORDS.indexOf(name.toLowerCase()) !== -1 || locals[name.toLowerCase()]) continue;
+    if(names.indexOf(name) === -1) names.push(name);
+  }
+  return names;
+}
 
 function fieldMapSummary(fm){
   fm = fm || JIRA_DEFAULT_FIELD_MAP;
   return JIRA_METRICS.map(function(m){
     var f = fm[m[0]] || {};
+    if(f.structure) return '<div class="jira-map-line"><span>'+m[1]+'</span> ← <span class="badge badge-info">Structure</span> '+escapeHtml(f.structure.label || describeAttribute(f.structure.attribute))+'</div>';
     var known = JIRA_TIME_FIELDS.find(function(t){ return t.id === f.field; });
-    return '<div class="jira-map-line"><span>'+m[1]+'</span> ← '+(f.field ? '<span class="mono">'+escapeHtml(known ? known.name : f.field)+'</span>'+(f.unit === 'hours' ? ' <span class="muted-cell">ч</span>' : '') : '<span class="muted-cell">не заполняется</span>')+'</div>';
+    return '<div class="jira-map-line"><span>'+m[1]+'</span> ← '+(f.field ? '<span class="mono">'+escapeHtml(known ? known.name : f.field)+'</span>'+(f.unit !== 'seconds' ? ' <span class="muted-cell">'+escapeHtml(({ms: 'мс', minutes: 'мин', hours: 'ч', days: 'дн'})[f.unit] || '')+'</span>' : '') : '<span class="muted-cell">не заполняется</span>')+'</div>';
   }).join('');
 }
 
@@ -2757,16 +2810,24 @@ function openJiraButtonEditor(button){
           '<button type="button" class="btn btn-ghost btn-sm" id="jbLoadStructures">Загрузить из Jira</button></div>'+
           '<input type="number" id="jbStructureId" min="1" placeholder="ID структуры" hidden></div>'+
       '</div>'+
-      '<div class="jira-fields"><div class="jira-fields-head"><span class="field-label">Поля Jira для показателей замера</span>'+
+      '<div class="jira-fields"><div class="jira-fields-head"><span class="field-label">Откуда брать показатели замера</span>'+
         '<button type="button" class="btn btn-ghost btn-sm" id="jbLoadFields">Загрузить поля из Jira</button></div>'+
-        '<div class="jira-fields-grid" id="jbFields">'+JIRA_METRICS.map(function(m){
+        '<div class="jb-metrics" id="jbFields">'+JIRA_METRICS.map(function(m){
           var f = fieldMap[m[0]] || {field: '', unit: 'seconds'};
-          return '<label class="small" for="jbField_'+m[0]+'">'+m[1]+'</label>'+
-            '<select id="jbField_'+m[0]+'" data-metric="'+m[0]+'">'+fieldOptions(JIRA_TIME_FIELDS, f.field)+'</select>'+
-            '<select id="jbUnit_'+m[0]+'" aria-label="Единица: '+m[1]+'"><option value="seconds"'+(f.unit !== 'hours' ? ' selected' : '')+'>секунды</option>'+
-              '<option value="hours"'+(f.unit === 'hours' ? ' selected' : '')+'>часы</option></select>';
+          var st = f.structure;
+          return '<div class="jb-metric" data-metric="'+m[0]+'"><div class="jb-metric-head"><b>'+m[1]+'</b>'+
+            '<select id="jbSrc_'+m[0]+'" aria-label="Источник: '+m[1]+'"><option value="jira"'+(st ? '' : ' selected')+'>Поле Jira — сумма по задачам эпика</option>'+
+              '<option value="structure"'+(st ? ' selected' : '')+'>Колонка Structure — значение как в структуре</option></select></div>'+
+            '<div class="jb-structure" id="jbStr_'+m[0]+'"'+(st ? '' : ' hidden')+'><span class="jb-str-label" id="jbStrLabel_'+m[0]+'">'+
+              escapeHtml(st ? (st.label || describeAttribute(st.attribute)) : 'Колонка не выбрана')+'</span>'+
+              '<button type="button" class="btn btn-ghost btn-sm" data-str-edit="'+m[0]+'">Выбрать колонку…</button>'+
+              '<label class="small" for="jbStrUnit_'+m[0]+'">Значение колонки в</label><select id="jbStrUnit_'+m[0]+'">'+unitOptions(STRUCTURE_UNITS, st ? st.unit : 'hours')+'</select></div>'+
+            '<div class="jb-jira-row"><label class="small" for="jbField_'+m[0]+'" id="jbFieldLabel_'+m[0]+'">'+(st ? 'Поле Jira для состава задач и истории' : 'Поле Jira')+'</label>'+
+              '<select id="jbField_'+m[0]+'" data-metric="'+m[0]+'">'+fieldOptions(JIRA_TIME_FIELDS, f.field)+'</select>'+
+              '<select id="jbUnit_'+m[0]+'" aria-label="Единица: '+m[1]+'">'+unitOptions(JIRA_FIELD_UNITS, f.unit || 'seconds')+'</select></div></div>';
         }).join('')+'</div>'+
-        '<p class="bulk-note">Значения суммируются по всем задачам эпика. Стандартные поля учёта времени Jira хранятся в секундах; для своих числовых полей выберите единицу, в которой они заполняются.</p></div>'+
+        '<div class="jb-str-panel" id="jbStrPanel" hidden></div>'+
+        '<p class="bulk-note">Поле Jira — значения суммируются по задачам эпика (поля учёта времени Jira хранятся в секундах). Колонка Structure — берётся значение колонки у строки задачи эпика: поле, сумма по вложенным или формула, ровно как в структуре.</p></div>'+
       '<p class="bulk-note">Укажите для эпиков задачи Jira (ключи через запятую). «С вложенными»: со структурой — все задачи под указанными в дереве структуры, без структуры — задача вместе с подзадачами. Эпики без задач в срез не попадают.</p>'+
       '<div class="table-scroll"><table class="data-table compact-table jira-map-table" id="jbTable"><thead><tr><th>Эпик</th><th>Задачи Jira</th><th class="center">С вложенными</th></tr></thead><tbody>'+
       STATE.services.map(function(s){
@@ -2791,14 +2852,21 @@ function openJiraButtonEditor(button){
         if(keys) mappings.push({serviceId: parseInt(tr.dataset.sid, 10), issueKeys: keys,
                                 includeSubtree: tr.querySelector('[data-field="subtree"]').checked});
       });
-      var fm = {};
+      var fm = {}, missing = null;
       JIRA_METRICS.forEach(function(m){
-        fm[m[0]] = {field: document.getElementById('jbField_'+m[0]).value, unit: document.getElementById('jbUnit_'+m[0]).value};
+        var structure = null;
+        if(document.getElementById('jbSrc_'+m[0]).value === 'structure'){
+          if(!strSpecs[m[0]]) missing = missing || m[1];
+          else structure = {attribute: strSpecs[m[0]].attribute, label: strSpecs[m[0]].label, unit: document.getElementById('jbStrUnit_'+m[0]).value};
+        }
+        fm[m[0]] = {field: document.getElementById('jbField_'+m[0]).value, unit: document.getElementById('jbUnit_'+m[0]).value, structure: structure};
       });
       var body = {name: document.getElementById('jbName').value.trim(), structureId: structureId,
                   structureName: structureName, mappings: mappings, fieldMap: fm};
       if(!body.name){ toast('Укажите название кнопки'); return false; }
-      if(!JIRA_METRICS.some(function(m){ return fm[m[0]].field; })){ toast('Сопоставьте с полями Jira хотя бы один показатель'); return false; }
+      if(missing){ toast('Выберите колонку Structure для показателя «' + missing + '»'); return false; }
+      if(!structureId && JIRA_METRICS.some(function(m){ return fm[m[0]].structure; })){ toast('Колонки Structure можно выбрать только у кнопки со структурой'); return false; }
+      if(!JIRA_METRICS.some(function(m){ return fm[m[0]].field || fm[m[0]].structure; })){ toast('Сопоставьте с полями Jira или колонками Structure хотя бы один показатель'); return false; }
       if(!mappings.length){ toast('Укажите задачи Jira хотя бы для одного эпика'); return false; }
       confirmOk.disabled = true;
       (button ? apiPut('/api/jira/buttons/'+button.id, body) : apiPost('/api/projects/'+currentProjectId+'/jira/buttons', body)).then(function(saved){
@@ -2818,12 +2886,138 @@ function openJiraButtonEditor(button){
       var opt = e.target.selectedOptions[0];
       if(opt && opt.value) document.getElementById('jbUnit_'+m[0]).value = opt.dataset.time === '1' ? 'seconds' : 'hours';
     });
+    document.getElementById('jbSrc_'+m[0]).addEventListener('change', function(e){
+      var structure = e.target.value === 'structure';
+      document.getElementById('jbStr_'+m[0]).hidden = !structure;
+      document.getElementById('jbFieldLabel_'+m[0]).textContent = structure ? 'Поле Jira для состава задач и истории' : 'Поле Jira';
+      if(structure && !strSpecs[m[0]]) openStructureColumnPanel(m[0], m[1]);
+    });
   });
+  var strSpecs = {};
+  JIRA_METRICS.forEach(function(m){ var st = (fieldMap[m[0]] || {}).structure; if(st) strSpecs[m[0]] = {attribute: st.attribute, label: st.label || describeAttribute(st.attribute)}; });
+  var jiraFieldList = JIRA_TIME_FIELDS.slice();
+  confirmBody.querySelectorAll('[data-str-edit]').forEach(function(btn){
+    btn.addEventListener('click', function(){ var m = JIRA_METRICS.find(function(x){ return x[0] === btn.dataset.strEdit; }); openStructureColumnPanel(m[0], m[1]); });
+  });
+  function editorStructureId(){
+    var v = document.getElementById('jbStructure').value;
+    return v === '__manual' ? document.getElementById('jbStructureId').value.trim() : v;
+  }
+  function editorKeys(){
+    var keys = [];
+    document.querySelectorAll('#jbTable [data-field="keys"]').forEach(function(inp){ if(inp.value.trim() && keys.length < 5) keys.push(inp.value.trim()); });
+    return keys.join(', ');
+  }
+  function openStructureColumnPanel(metric, title){
+    var panel = document.getElementById('jbStrPanel');
+    var cur = strSpecs[metric];
+    var curExpr = cur && cur.attribute.id === 'expr' ? cur.attribute : (cur && cur.attribute.id === 'sum' && (cur.attribute.params || {}).attribute && cur.attribute.params.attribute.id === 'expr' ? cur.attribute.params.attribute : null);
+    var curSum = !!(cur && cur.attribute.id === 'sum');
+    panel.hidden = false;
+    panel.innerHTML = '<div class="jb-str-panel-head"><b>Колонка Structure для показателя «'+escapeHtml(title)+'»</b></div>'+
+      '<div class="seg-filter" role="radiogroup"><label class="checkbox-row"><input type="radio" name="jbStrMode" value="copy"'+(curExpr ? '' : ' checked')+'> Скопировать колонку из Structure</label>'+
+      '<label class="checkbox-row"><input type="radio" name="jbStrMode" value="formula"'+(curExpr ? ' checked' : '')+'> Задать формулу</label></div>'+
+      '<div id="jbStrCopy"><ol class="plan-list"><li>Откройте структуру в Jira с нужной колонкой.</li><li>Нажмите F12 → вкладка «Сеть» (Network) и обновите страницу.</li>'+
+        '<li>Найдите запрос <span class="mono">value</span>, на вкладке «Полезные данные» (Payload) скопируйте его содержимое и вставьте ниже.</li></ol>'+
+        '<textarea id="jbStrPaste" rows="4" placeholder="{&quot;requests&quot;:[{&quot;forestSpec&quot;:…,&quot;attributes&quot;:[…]}]}">'+(cur && !curExpr ? escapeHtml(JSON.stringify(cur.attribute)) : '')+'</textarea>'+
+        '<select id="jbStrPick" hidden aria-label="Колонка"></select></div>'+
+      '<div id="jbStrFormula" hidden><label class="small" for="jbStrFormulaText">Формула (как в колонке Structure)</label>'+
+        '<textarea id="jbStrFormulaText" rows="3" placeholder="remaining + time_spent">'+escapeHtml(curExpr ? (curExpr.params || {}).formula || '' : '')+'</textarea>'+
+        '<div id="jbStrVars" class="jb-str-vars"></div>'+
+        '<label class="checkbox-row"><input type="checkbox" id="jbStrSum"'+(curSum ? ' checked' : '')+'> Суммировать по вложенным (как «Σ» в колонке Structure)</label></div>'+
+      '<div class="form-actions"><button type="button" class="btn btn-ghost btn-sm" id="jbStrCheck">Проверить на эпиках</button>'+
+        '<button type="button" class="btn btn-ghost btn-sm" id="jbStrCancel">Отмена</button><button type="button" class="btn btn-primary btn-sm" id="jbStrApply">Применить</button></div>'+
+      '<div id="jbStrPreview"></div>';
+    var mode = function(){ return (panel.querySelector('input[name="jbStrMode"]:checked') || {}).value; };
+    var showMode = function(){ document.getElementById('jbStrCopy').hidden = mode() !== 'copy'; document.getElementById('jbStrFormula').hidden = mode() !== 'formula'; };
+    panel.querySelectorAll('input[name="jbStrMode"]').forEach(function(r){ r.addEventListener('change', showMode); });
+    showMode();
+    var picked = [];
+    var parsePaste = function(){
+      var sel = document.getElementById('jbStrPick');
+      var text = document.getElementById('jbStrPaste').value.trim();
+      picked = [];
+      try { picked = text ? extractAttributeSpecs(text) : []; } catch(e){ picked = []; }
+      sel.hidden = picked.length < 2;
+      sel.innerHTML = picked.map(function(spec, i){ return '<option value="'+i+'">'+escapeHtml(describeAttribute(spec))+'</option>'; }).join('');
+    };
+    document.getElementById('jbStrPaste').addEventListener('input', parsePaste);
+    parsePaste();
+    var varState = {};
+    if(curExpr) Object.keys((curExpr.params || {}).variables || {}).forEach(function(n){ varState[n] = curExpr.params.variables[n]; });
+    var renderVars = function(){
+      var names = formulaVariables(document.getElementById('jbStrFormulaText').value);
+      document.getElementById('jbStrVars').innerHTML = names.length ? '<div class="field-label">Переменные формулы</div>' + names.map(function(n){
+        var v = varState[n] || {id: FORMULA_ALIASES[n.toLowerCase()] || '', format: FORMULA_ALIASES[n.toLowerCase()] ? 'duration' : 'number'};
+        varState[n] = v;
+        return '<div class="jb-str-var"><span class="mono">'+escapeHtml(n)+'</span><select data-var="'+escapeAttr(n)+'">'+fieldOptions(jiraFieldList, v.id).replace('— не заполнять —', '— выберите поле —')+'</select>'+
+          '<select data-var-format="'+escapeAttr(n)+'"><option value="duration"'+(v.format === 'duration' ? ' selected' : '')+'>длительность</option><option value="number"'+(v.format !== 'duration' ? ' selected' : '')+'>число</option></select></div>';
+      }).join('') : '';
+      document.querySelectorAll('#jbStrVars [data-var]').forEach(function(el){ el.addEventListener('change', function(){ varState[el.dataset.var].id = el.value; }); });
+      document.querySelectorAll('#jbStrVars [data-var-format]').forEach(function(el){ el.addEventListener('change', function(){ varState[el.dataset.varFormat].format = el.value; }); });
+    };
+    document.getElementById('jbStrFormulaText').addEventListener('input', renderVars);
+    renderVars();
+    var buildSpec = function(){
+      if(mode() === 'copy'){
+        if(!picked.length){ toast('Вставьте запрос value из Structure или спецификацию колонки (JSON)'); return null; }
+        var spec = picked[picked.length < 2 ? 0 : parseInt(document.getElementById('jbStrPick').value, 10)];
+        return {attribute: spec, label: describeAttribute(spec)};
+      }
+      var formula = document.getElementById('jbStrFormulaText').value.trim();
+      if(!formula){ toast('Введите формулу'); return null; }
+      var vars = {}, bad = null;
+      formulaVariables(formula).forEach(function(n){ var v = varState[n]; if(!v || !v.id) bad = bad || n; else vars[n] = {id: v.id, format: v.format}; });
+      if(bad){ toast('Выберите поле Jira для переменной «' + bad + '»'); return null; }
+      var expr = {id: 'expr', format: 'number', params: {formula: formula, variables: vars}};
+      var attr = document.getElementById('jbStrSum').checked ? {id: 'sum', format: 'number', params: {attribute: expr}} : expr;
+      return {attribute: attr, label: describeAttribute(attr)};
+    };
+    document.getElementById('jbStrCheck').addEventListener('click', function(){
+      var spec = buildSpec();
+      if(!spec) return;
+      var box = document.getElementById('jbStrPreview');
+      var unit = document.getElementById('jbStrUnit_'+metric).value;
+      box.innerHTML = '<p class="insight-empty">Запрашиваем значения у Structure…</p>';
+      apiPost('/api/projects/'+currentProjectId+'/jira/structure-preview', {structureId: editorStructureId(), attribute: spec.attribute, unit: unit, keys: editorKeys()}).then(function(r){
+        var render = function(){
+          var u = document.getElementById('jbStrUnit_'+metric).value;
+          box.innerHTML = (r.values.length ? '<div class="table-scroll"><table class="data-table compact-table"><thead><tr><th>Задача</th><th class="num">Значение в Structure</th><th class="num">Часов при выбранной единице</th></tr></thead><tbody>'+
+            r.values.map(function(v){
+              var h = v.asUnits[u];
+              return '<tr><td class="mono nowrap">'+escapeHtml(v.key)+'</td><td class="num">'+escapeHtml(v.raw === null || v.raw === undefined ? '—' : String(v.raw))+'</td>'+
+                '<td class="num jb-unit-current">'+(h === null ? '—' : fmtNum(h) + ' ч')+'</td></tr>';
+            }).join('')+'</tbody></table></div>'+
+            '<div class="jb-unit-switch"><span class="bulk-note">Не совпадает с колонкой в структуре? Значение в:</span>'+STRUCTURE_UNITS.map(function(x){
+              return '<button type="button" class="btn btn-ghost btn-sm'+(x[0] === u ? ' active' : '')+'" data-unit="'+x[0]+'">'+x[1]+'</button>';
+            }).join('')+'</div>' : '')+
+            (r.warnings.length ? '<ul class="plan-list">'+r.warnings.map(function(w){ return '<li>'+escapeHtml(w)+'</li>'; }).join('')+'</ul>' : '');
+          box.querySelectorAll('[data-unit]').forEach(function(b){
+            b.addEventListener('click', function(){ document.getElementById('jbStrUnit_'+metric).value = b.dataset.unit; render(); });
+          });
+        };
+        render();
+      }).catch(function(){ box.innerHTML = ''; });
+    });
+    document.getElementById('jbStrCancel').addEventListener('click', function(){
+      panel.hidden = true;
+      if(!strSpecs[metric]){ document.getElementById('jbSrc_'+metric).value = 'jira'; document.getElementById('jbSrc_'+metric).dispatchEvent(new Event('change')); }
+    });
+    document.getElementById('jbStrApply').addEventListener('click', function(){
+      var spec = buildSpec();
+      if(!spec) return;
+      strSpecs[metric] = spec;
+      document.getElementById('jbStrLabel_'+metric).textContent = spec.label;
+      panel.hidden = true;
+      toast('Колонка выбрана — сохраните кнопку');
+    });
+  }
   document.getElementById('jbLoadFields').addEventListener('click', function(){
     var btn = this;
     btn.disabled = true;
     btn.textContent = 'Загрузка…';
     api('/api/projects/'+currentProjectId+'/jira/fields').then(function(list){
+      jiraFieldList = list;
       JIRA_METRICS.forEach(function(m){
         var sel = document.getElementById('jbField_'+m[0]);
         sel.innerHTML = fieldOptions(list, sel.value);

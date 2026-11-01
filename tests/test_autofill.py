@@ -46,7 +46,7 @@ def entry(flask_app, sid, date):
 # ─── Сопоставление полей ─────────────────────────────────────────
 
 def test_default_field_map_and_fields_list(admin, button):
-    assert button['fieldMap']['remaining'] == {'field': 'timeestimate', 'unit': 'seconds'}
+    assert button['fieldMap']['remaining'] == {'field': 'timeestimate', 'unit': 'seconds', 'structure': None}
     assert button['lastSuccessAt'] is None and button['schedule']['enabled'] is False
     fields = admin.get('/api/projects/1/jira/fields').get_json()
     ids = [f['id'] for f in fields]
@@ -61,14 +61,14 @@ def test_custom_field_map_in_hours(admin, fake, button):
     r = admin.put(f"/api/jira/buttons/{button['id']}", json={
         'name': 'Срез', 'structureId': None, 'fieldMap': field_map,
         'mappings': [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]})
-    assert r.status_code == 200 and r.get_json()['fieldMap'] == field_map
+    assert r.status_code == 200 and r.get_json()['fieldMap'] == {m: dict(v, structure=None) for m, v in field_map.items()}
     item = snapshot(admin, button['id'])[1]
     assert (item['remaining'], item['spent'], item['estimate']) == (25.5, None, 18)
 
 
 @pytest.mark.parametrize('field_map, message', [
     ({'remaining': {'field': 'bad id!'}}, 'идентификатор'),
-    ({'remaining': {'field': 'timeestimate', 'unit': 'days'}}, 'Единица'),
+    ({'remaining': {'field': 'timeestimate', 'unit': 'weeks'}}, 'Единица'),
     ({m: {'field': ''} for m in ('remaining', 'spent', 'estimate')}, 'хотя бы одну'),
 ], ids=['bad-id', 'bad-unit', 'all-empty'])
 def test_field_map_validation(admin, button, field_map, message):

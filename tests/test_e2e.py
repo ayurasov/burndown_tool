@@ -979,7 +979,7 @@ def test_jira_field_mapping_in_editor(admin_ui, fake_jira, admin):
     row = admin_ui.text('#jiraButtonsTable tbody tr')
     assert 'customfield_10050' in row and 'не заполняется' in row
     fm = admin.get('/api/projects/1/jira').get_json()['buttons'][0]['fieldMap']
-    assert fm['remaining'] == {'field': 'customfield_10050', 'unit': 'hours'} and fm['spent']['field'] == ''
+    assert fm['remaining'] == {'field': 'customfield_10050', 'unit': 'hours', 'structure': None} and fm['spent']['field'] == ''
     admin_ui.go('data')
     page.click('#jiraSnapshotButtons button:has-text("Свои поля")')
     page.wait_for_selector('#confirmModal.show #bulkTable')
@@ -1531,3 +1531,43 @@ def test_health_view_and_alert_settings(admin_ui):
     admin_ui.expect_toast('Некому отправить: укажите email администратора или привяжите Telegram и подключите почту или Telegram-бота в «Интеграциях»')
     page.click('#healthCheckJira')
     admin_ui.expect_toast('Jira проверена')
+
+
+def test_structure_column_in_button_editor(admin_ui, admin, fake_jira):
+    import json as _json
+    _connect_api(admin, fake_jira)
+    assert admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'structureId': 7, 'structureName': 'Релиз 2026',
+                      'mappings': [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]}).status_code == 200
+    payload = _json.dumps({'requests': [{'forestSpec': {'structureId': 7}, 'rows': [1], 'attributes': [
+        {'id': 'summary', 'format': 'text'},
+        {'id': 'sum', 'format': 'html', 'params': {'attribute': {'id': 'timeestimate', 'format': 'duration'}}}]}]})
+    page = admin_ui.page
+    page.reload()  # кнопка создана через API — загрузить её в интерфейс
+    page.wait_for_selector('#summaryTable tbody tr')
+    admin_ui.go('jira')
+    page.click('#jiraButtonsTable [data-action="edit"]')
+    page.wait_for_selector('#jbSrc_remaining')
+    page.select_option('#jbSrc_remaining', 'structure')
+    page.wait_for_selector('#jbStrPaste')
+    assert admin_ui.text('#jbFieldLabel_remaining') == 'Поле Jira для состава задач и истории'
+    page.fill('#jbStrPaste', payload)
+    page.select_option('#jbStrPick', '1')
+    page.select_option('#jbStrUnit_remaining', 'ms')
+    page.click('#jbStrCheck')
+    page.wait_for_selector('#jbStrPreview table')
+    assert admin_ui.cells('#jbStrPreview tbody td.jb-unit-current') == ['12,5 ч']
+    page.click('#jbStrPreview [data-unit="seconds"]')  # другая единица — пересчёт без нового запроса
+    assert admin_ui.cells('#jbStrPreview tbody td.jb-unit-current') == ['12 500 ч'] and page.input_value('#jbStrUnit_remaining') == 'seconds'
+    page.click('#jbStrPreview [data-unit="ms"]')
+    page.click('#jbStrApply')
+    assert admin_ui.text('#jbStrLabel_remaining') == 'Σ по вложенным: Атрибут «timeestimate»'
+    page.select_option('#jbSrc_spent', 'structure')  # формула
+    page.check('input[name="jbStrMode"][value="formula"]')
+    page.fill('#jbStrFormulaText', 'SUM{time_spent} / 3600000')
+    assert page.input_value('#jbStrVars [data-var="time_spent"]') == 'timespent'
+    page.click('#jbStrApply')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Кнопка обновлена')
+    assert admin_ui.text('#jiraButtonsTable').count('Structure') == 2
+    fm = admin.get('/api/projects/1/jira').get_json()['buttons'][0]['fieldMap']
+    assert fm['spent']['structure']['attribute']['params']['variables'] == {'time_spent': {'id': 'timespent', 'format': 'duration'}}
