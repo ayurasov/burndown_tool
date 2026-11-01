@@ -780,3 +780,9 @@ textarea:disabled{opacity:0.55;cursor:not-allowed;}
 .jb-board-filter > summary{cursor:pointer;font-weight:600;font-size:var(--text-sm);}
 .jb-board-filter textarea{width:100%;font-family:var(--font-mono);font-size:var(--text-xs);}
 #jbStrFilterOpt{margin-top:var(--space-1);}
+.jb-scope-list{display:flex;flex-direction:column;gap:2px;max-height:260px;overflow:auto;margin:var(--space-2) 0;}
+.jb-scope-item{font-size:var(--text-sm);}
+.jb-places{margin-top:var(--space-3);font-size:var(--text-sm);}
+.jb-places ul{margin:var(--space-1) 0 var(--space-2);padding-left:1.25rem;}
+.jb-place-chosen{color:var(--color-primary);}
+.jb-diag{align-items:center;justify-content:flex-start;gap:var(--space-2);}

@@ -1326,6 +1326,18 @@ def _button_field_map(row):
         return jira.DEFAULT_FIELD_MAP
 
 
+def _json_or_none(value):
+    return json.dumps(value, ensure_ascii=False) if value else None
+
+
+def _button_scope(row):
+    """Сохранённые разделы структуры кнопки (повреждённая запись — без разделов)."""
+    try:
+        return jira.normalize_scope(json.loads(row['structure_scope'])) if row['structure_scope'] else None
+    except (ValueError, TypeError, IndexError, KeyError):
+        return None
+
+
 def _button_board_filter(row):
     """Сохранённый фильтр доски кнопки (повреждённая запись — без фильтра)."""
     try:
@@ -1342,6 +1354,7 @@ def _jira_button_json(db, row):
             'structureName': row['structure_name'] or '',
             'fieldMap': _button_field_map(row),
             'boardFilter': _button_board_filter(row),
+            'structureScope': _button_scope(row),
             'lastSuccessAt': row['last_success_at'],
             'epicSync': dict(epic_sync_config(row), lastAt=row['epic_sync_at'], lastMessage=row['epic_sync_message']),
             'schedule': _schedule_json(sched),
@@ -1442,7 +1455,14 @@ def _parse_jira_button(db, pid, data):
         raise ValidationError(str(e))
     if board_filter and not structure_id:
         raise ValidationError('Фильтр доски задаётся только у кнопки со структурой')
-    return name, structure_id, text_value(data.get('structureName')) or None, mappings, field_map, board_filter
+    try:
+        scope = jira.normalize_scope(data.get('structureScope'))
+    except ValueError as e:
+        raise ValidationError(str(e))
+    if scope and not structure_id:
+        raise ValidationError('Разделы структуры задаются только у кнопки со структурой')
+    board = {'filter': board_filter, 'scope': scope}
+    return name, structure_id, text_value(data.get('structureName')) or None, mappings, field_map, board
 
 
 def _save_jira_mappings(db, button_id, mappings):
@@ -1566,13 +1586,13 @@ def api_create_jira_button(pid):
     if not can_edit_project(session['user_id'], pid):
         return jsonify({'error': 'Нет прав на редактирование'}), 403
     db = get_db()
-    name, structure_id, structure_name, mappings, field_map, board_filter = _parse_jira_button(db, pid, json_body())
+    name, structure_id, structure_name, mappings, field_map, board = _parse_jira_button(db, pid, json_body())
     order = db.execute('SELECT COALESCE(MAX(sort_order), 0) FROM jira_snapshot_buttons WHERE project_id = ?',
                        (pid,)).fetchone()[0]
     bid = db.execute('INSERT INTO jira_snapshot_buttons (project_id, name, structure_id, structure_name, sort_order, '
-                     'field_map, board_filter) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                     'field_map, board_filter, structure_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                      (pid, name, structure_id, structure_name, order + 1, json.dumps(field_map),
-                      json.dumps(board_filter, ensure_ascii=False) if board_filter else None)).lastrowid
+                      _json_or_none(board['filter']), _json_or_none(board['scope']))).lastrowid
     _save_jira_mappings(db, bid, mappings)
     db.commit()
     audit_log('jira', 'create', 'jira_button', bid, pid, [{'field': 'name', 'old': None, 'new': name}], entity_name=name)
@@ -1586,11 +1606,12 @@ def api_update_jira_button(bid):
     row, err = _jira_button_or_404(db, bid)
     if err:
         return err
-    name, structure_id, structure_name, mappings, field_map, board_filter = _parse_jira_button(
+    name, structure_id, structure_name, mappings, field_map, board = _parse_jira_button(
         db, row['project_id'], json_body())
     db.execute('UPDATE jira_snapshot_buttons SET name = ?, structure_id = ?, structure_name = ?, field_map = ?, '
-               'board_filter = ? WHERE id = ?', (name, structure_id, structure_name, json.dumps(field_map),
-                                                 json.dumps(board_filter, ensure_ascii=False) if board_filter else None, bid))
+               'board_filter = ?, structure_scope = ? WHERE id = ?',
+               (name, structure_id, structure_name, json.dumps(field_map), _json_or_none(board['filter']),
+                _json_or_none(board['scope']), bid))
     _save_jira_mappings(db, bid, mappings)
     db.commit()
     audit_log('jira', 'update', 'jira_button', bid, row['project_id'],
@@ -1628,7 +1649,7 @@ def api_jira_snapshot(bid):
     try:
         client = _jira_client(db)
         items = jira.compute_snapshot(client, row['structure_id'], button['mappings'], button['fieldMap'],
-                                      jira.board_transformations(button['boardFilter']))
+                                      jira.board_transformations(button['boardFilter']), button['structureScope'])
     except jira.JiraError as e:
         return _jira_error(e)
     finally:
@@ -1839,15 +1860,17 @@ def api_jira_structure_preview(pid):
     structure_id = _structure_id(data.get('structureId'))
     if not structure_id:
         raise ValidationError('Выберите структуру — колонки Structure работают только у кнопки со структурой')
-    variants = None
+    variants = variables = None
     try:
         if data.get('editor'):  # колонка задана как в Structure: поле или формула, Σ, дубликаты
             editor = jira.normalize_column_editor(data['editor'])
             attribute = jira.build_structure_attribute(editor)
             variants = jira.column_variants(editor)
+            variables = {n: jira.field_spec(v['field'], v['format']) for n, v in editor['variables'].items()}
         else:  # колонка скопирована из Structure (спецификация атрибута)
             attribute = jira.normalize_attribute(data.get('attribute'))
         transformations = jira.board_transformations(jira.normalize_board_filter(data.get('boardFilter')))
+        scope = jira.normalize_scope(data.get('structureScope'))
     except ValueError as e:
         raise ValidationError(str(e))
     unit = data.get('unit') or 'hours'
@@ -1860,10 +1883,25 @@ def api_jira_structure_preview(pid):
         raise ValidationError('Укажите задачи Jira у эпиков — значения колонки проверяются по ним')
     try:
         rows, warnings = jira.structure_preview(_jira_client(get_db()), structure_id, keys[:20], attribute, unit, variants,
-                                                transformations, bool(data.get('afterFiltering')))
+                                                transformations, bool(data.get('afterFiltering')), scope, variables)
     except jira.JiraError as e:
         return _jira_error(e)
     return jsonify({'values': rows, 'warnings': warnings, 'attribute': attribute})
+
+
+@app.route('/api/projects/<int:pid>/jira/structure-sections')
+@login_required
+def api_jira_structure_sections(pid):
+    """Разделы структуры (строки двух верхних уровней с вложенными) — для выбора у кнопки."""
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    structure_id = _structure_id(request.args.get('structureId'))
+    if not structure_id:
+        raise ValidationError('Выберите структуру')
+    try:
+        return jsonify(jira.structure_sections(_jira_client(get_db()), structure_id))
+    except jira.JiraError as e:
+        return _jira_error(e)
 
 
 @app.route('/api/projects/<int:pid>/jira/formula-fields')
@@ -2419,7 +2457,7 @@ def run_autofill(db, button_row, local_date, actor, overwrite=True):
         button = _jira_button_json(db, button_row)
         client = _jira_client(db)
         items = jira.compute_snapshot(client, button_row['structure_id'], button['mappings'], button['fieldMap'],
-                                      jira.board_transformations(button['boardFilter']))
+                                      jira.board_transformations(button['boardFilter']), button['structureScope'])
     except jira.JiraError as e:
         record_jira_health(db, False, str(e))
         return 'error', str(e)
@@ -2644,7 +2682,7 @@ def run_history_job(jid):
 
         client = _jira_client(db)
         results, warnings = jira.compute_history(client, button_row['structure_id'], button['mappings'],
-                                                 button['fieldMap'], moments, progress)
+                                                 button['fieldMap'], moments, progress, button['structureScope'])
         jira_log.info('восстановление истории по кнопке %s (%s дат): %s', button_row['id'], len(moments), client.stats())
         _history_update(db, jid, message='Сохранение замеров…')
         services = {s['id']: s for s in db.execute('SELECT * FROM services WHERE project_id = ?', (pid,)).fetchall()}

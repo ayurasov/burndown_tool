@@ -1326,6 +1326,8 @@ def test_notify_admin_settings_ui(admin_ui, fake_mail, fake_tg):
     page = admin_ui.page
     admin_ui.go('integrations')
     page.wait_for_selector('#notifyLogTable thead')
+    # настройки приходят отдельным запросом и перезаписывают поля — заполняем только после них
+    page.wait_for_function("document.getElementById('naBotStatus').textContent !== ''")
     page.fill('#naHost', 'smtp.example.ru')
     page.fill('#naPort', '465')
     page.select_option('#naSecurity', 'ssl')
@@ -1654,7 +1656,7 @@ def test_structure_column_in_button_editor(admin_ui, admin, fake_jira):
     page.click('#jbStrApply')
     assert admin_ui.text('#jbStrLabel_remaining') == 'Σ по вложенным: Атрибут «timeestimate»'
     # формула как в Structure: переменные orig, spent, status (статус — текстом), Σ по вложенным без дубликатов
-    page.click('.jb-board-filter > summary')  # фильтр доски — для колонок «После фильтрации»
+    page.click('#jbBoardFilterBox > summary')  # фильтр доски — для колонок «После фильтрации»
     page.check('input[name="jbBfMode"][value="jql"]')
     page.fill('#jbBfJqlText', 'status = "В работе"')
     page.select_option('#jbSrc_spent', 'structure')
@@ -1673,6 +1675,18 @@ def test_structure_column_in_button_editor(admin_ui, admin, fake_jira):
     assert admin_ui.cells('#jbStrPreview tbody tr td:nth-child(4)') == ['7 ч']  # только сама задача
     assert 'SUM{' in admin_ui.text('#jbStrPreview .jb-str-spec pre')
     assert 'С фильтром доски' in admin_ui.text('#jbStrPreview thead')
+    # значения переменных у строки эпика: видно, что отдаёт Structure по каждому полю
+    assert 'Статус' in admin_ui.text('#jbStrPreview') and 'В работе' in admin_ui.text('#jbStrPreview')
+    # другое поле для переменной — пользовательское поле из списка Jira — сразу участвует в расчёте
+    page.select_option('#jbStrVars [data-var="spent"]', 'customfield_10050')
+    assert page.input_value('#jbStrVars [data-var-format="spent"]') == 'number'
+    page.click('#jbStrCheck')
+    page.wait_for_function('document.querySelector("#jbStrPreview") && document.querySelector("#jbStrPreview").textContent.includes("Трудозатраты, ч")')
+    assert '"fieldId": 10050' in admin_ui.text('#jbStrPreview .jb-str-spec pre')
+    page.select_option('#jbStrVars [data-var="spent"]', 'timespent')
+    page.click('#jbStrCheck')
+    page.wait_for_function('document.querySelector("#jbStrPreview .jb-str-spec pre") && '
+                           '!document.querySelector("#jbStrPreview .jb-str-spec pre").textContent.includes("10050")')
     page.check('#jbStrAfter')  # «После фильтрации»: ABC-2 (готово) скрыта фильтром
     page.click('#jbStrCheck')
     page.wait_for_function('document.querySelector("#jbStrPreview td.jb-unit-current") && '
@@ -1697,3 +1711,46 @@ def test_structure_column_in_button_editor(admin_ui, admin, fake_jira):
     page.click('[data-str-edit="spent"]')
     assert page.is_checked('input[name="jbStrMode"][value="formula"]') and 'WITH rest' in page.input_value('#jbStrFormulaText')
     assert page.is_checked('#jbStrAfter') and page.input_value('#jbBfJqlText') == 'status = "В работе"'
+
+
+def test_structure_scope_and_places(admin_ui, admin, fake_jira, monkeypatch):
+    """Эпик стоит в структуре дважды: сверка показывает оба места, раздел выбирается у кнопки и сохраняется."""
+    import fake_jira as fj
+    from test_structure_columns import TWO_SECTIONS
+    monkeypatch.setattr(fj, 'FORMULA', TWO_SECTIONS)
+    _connect_api(admin, fake_jira)
+    assert admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'structureId': 7, 'structureName': 'Релиз 2026',
+                      'mappings': [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]}).status_code == 200
+    page = admin_ui.page
+    page.reload()
+    page.wait_for_selector('#summaryTable tbody tr')
+    admin_ui.go('jira')
+    page.click('#jiraButtonsTable [data-action="edit"]')
+    page.wait_for_selector('#jbSrc_spent')
+    page.select_option('#jbSrc_spent', 'structure')
+    page.select_option('#jbStrFieldSel', 'timeoriginalestimate')
+    page.click('#jbStrCheck')
+    page.wait_for_selector('#jbStrPreview .jb-places')
+    places = admin_ui.text('#jbStrPreview .jb-places')
+    assert 'Договор развития' in places and '4.1' in places and '(взята)' in places
+    assert admin_ui.cells('#jbStrPreview tbody td.jb-unit-current')[0] == '15 ч'
+    page.click('#jbScopeBox > summary')
+    page.click('#jbScopeLoad')
+    admin_ui.expect_toast('Разделов загружено: 4')
+    page.check('#jbScopeList [data-scope-item="5/8"]')
+    page.click('#jbStrCheck')
+    page.wait_for_function('document.querySelector("#jbStrPreview td.jb-unit-current") && '
+                           'document.querySelector("#jbStrPreview td.jb-unit-current").textContent.trim() === "16 ч"')
+    with page.expect_download() as dl:
+        page.click('#jbStrPreview [data-diag]')
+    import json as _json
+    diag = _json.loads(open(dl.value.path(), encoding='utf-8').read())
+    assert diag['request']['structureScope'] == [{'item': '5/8', 'title': '4.1'}] and diag['response']['values'][0]['places']
+    page.click('#jbStrApply')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Кнопка обновлена')
+    button = admin.get('/api/projects/1/jira').get_json()['buttons'][0]
+    assert button['structureScope'] == [{'item': '5/8', 'title': '4.1'}]
+    page.click('#jiraButtonsTable [data-action="edit"]')
+    page.wait_for_selector('#jbScopeList [data-scope-item="5/8"]')
+    assert page.is_checked('#jbScopeList [data-scope-item="5/8"]')

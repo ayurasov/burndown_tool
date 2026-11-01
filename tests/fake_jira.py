@@ -124,6 +124,16 @@ def _forest(transformations=None):
 
 
 FILTER_JQL = 'com.almworks.jira.structure:filter-jql'
+FOLDERS = {'5/7': 'Договор развития', '5/8': '4.1', '5/9': 'Интеграции'}  # названия папок структуры
+
+
+def _row_item(row_id):
+    """Элемент строки, как в формуле: «101» у задачи, «5/9» у папки."""
+    for part in FORMULA.split(','):
+        row, _depth, item = part.split(':')[:3]
+        if int(row) == row_id:
+            return item
+    return None
 
 
 def _jql_match(jql, issue):
@@ -200,6 +210,8 @@ def _attr_value(spec, row_id, forest=None):
         return _Expr(params.get('formula') or '', params.get('variables') or {}).value(row_id, forest)
     if attr == 'customfield':
         attr = f"customfield_{params['fieldId']}"
+    if attr == 'summary' and data is None:
+        return FOLDERS.get(_row_item(row_id))  # название папки
     if data is None or data.get('hidden'):
         return None
     if attr == 'status':
@@ -502,7 +514,7 @@ def create_app(state):
             rows = _forest(spec.get('transformations'))
         except ValueError:
             return jsonify({'errorMessages': ['Invalid transformation or JQL']}), 400
-        formula = ','.join(f"{r}:{d}:{it if it is not None else '5/9'}" for r, d, it in rows)
+        formula = ','.join(f"{r}:{d}:{it if it is not None else _row_item(r)}" for r, d, it in rows)
         return jsonify({'spec': spec, 'formula': formula,
                         'itemTypes': {'5': 'com.almworks.jira.structure:type-folder'},
                         'version': {'signature': 1, 'version': 3}})

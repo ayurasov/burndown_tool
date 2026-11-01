@@ -107,6 +107,9 @@ def create_jira_tables(conn):
     # 1.9.1: фильтр доски Structure — для колонок «После фильтрации»
     if 'board_filter' not in cols:
         conn.execute('ALTER TABLE jira_snapshot_buttons ADD COLUMN board_filter TEXT')
+    # 1.9.2: разделы структуры — если эпик стоит в структуре несколько раз, строка берётся из них
+    if 'structure_scope' not in cols:
+        conn.execute('ALTER TABLE jira_snapshot_buttons ADD COLUMN structure_scope TEXT')
     # 1.8.0: синхронизация эпиков с Jira (настройки и итог последнего запуска)
     for col in ('epic_sync', 'epic_sync_at', 'epic_sync_message'):
         if col not in cols:
