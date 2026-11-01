@@ -174,3 +174,144 @@ def test_stored_field_map_round_trip(flask_app):
     fm = app_module._button_field_map(row)
     assert fm['remaining']['structure']['unit'] == 'ms' and fm['estimate']['structure'] is None
     assert app_module._button_field_map({'field_map': '{"remaining": 5}'}) == jira.DEFAULT_FIELD_MAP
+
+
+# ─── Колонка, заданная как в Structure: поле или формула, Σ, дубликаты (1.9.1) ──
+
+USER_FORMULA = '''WITH rest = orig - spent :
+
+if (
+  rest < 0 OR (
+    status != "Backlog" AND
+    status != "В работе" AND
+    status != "Reopened"
+  ),
+  0,
+  rest
+)'''
+USER_VARS = {'orig': {'field': 'timeoriginalestimate', 'format': 'duration'},
+             'spent': {'field': 'timespent', 'format': 'duration'},
+             'status': {'field': 'status', 'format': 'text'}}
+WITH_DUPLICATE = '1:0:101,2:1:102,6:1:105,3:1:5/9,4:2:103,9:2:102,5:0:104'  # ABC-2 стоит под ABC-1 дважды
+
+
+def test_column_editor_builds_structure_specs():
+    field = jira.normalize_column_editor({'mode': 'field', 'field': 'timespent', 'format': 'duration', 'sum': True})
+    assert field['distinct'] is True  # «Исключать дубликаты» — по умолчанию, как в Structure
+    assert jira.build_structure_attribute(field) == {
+        'id': 'expr', 'format': 'number',
+        'params': {'formula': 'SUM{\nvalue\n}', 'variables': {'value': {'id': 'timespent', 'format': 'duration'}}}}
+    with_dups = jira.build_structure_attribute(dict(field, distinct=False))
+    assert with_dups['id'] == 'sum' and with_dups['params']['attribute']['params']['formula'] == 'value'
+    own = jira.build_structure_attribute(dict(field, sum=False))
+    assert own['params']['formula'] == 'value'
+    custom = jira.normalize_column_editor({'mode': 'field', 'field': 'customfield_10050', 'format': 'number'})
+    assert jira.build_structure_attribute(custom)['params']['variables']['value'] == {
+        'id': 'customfield', 'format': 'number', 'params': {'fieldId': 10050}}
+    formula = jira.normalize_column_editor({'mode': 'formula', 'formula': USER_FORMULA, 'variables': USER_VARS, 'sum': True})
+    spec = jira.build_structure_attribute(formula)
+    assert spec['params']['formula'].startswith('SUM{\nWITH rest') and spec['params']['variables']['status'] == {
+        'id': 'status', 'format': 'text'}
+    stored = jira.normalize_column_editor(field)  # сохранённые настройки читаются повторно
+    assert stored == field
+
+
+def test_column_editor_validation():
+    cases = [('x', 'Тип колонки'), ({'mode': 'formula', 'formula': ' '}, 'Введите формулу'),
+             ({'mode': 'formula', 'formula': 'a' * 20001}, 'большая'),
+             ({'mode': 'formula', 'formula': 'a', 'variables': []}, 'объект'),
+             ({'mode': 'formula', 'formula': 'a', 'variables': {'1a': {'field': 'x'}}}, 'имя переменной'),
+             ({'mode': 'formula', 'formula': 'a', 'variables': {'a': 'x'}}, 'выберите поле'),
+             ({'mode': 'formula', 'formula': 'a', 'variables': {'a': {'field': ''}}}, 'Выберите поле Jira для переменной «a»'),
+             ({'mode': 'formula', 'formula': 'a', 'variables': {'a': {'field': 'bad id'}}}, 'некорректное поле'),
+             ({'mode': 'formula', 'formula': 'a', 'variables': {'a': {'field': 'status', 'format': 'json'}}}, 'формат'),
+             ({'mode': 'field', 'field': ''}, 'Выберите поле')]
+    for raw, message in cases:
+        with pytest.raises(ValueError, match=message):
+            jira.normalize_column_editor(raw)
+
+
+def test_formula_fields_list():
+    fields = jira.formula_fields(fake_jira.FIELDS + [{'id': 'status', 'name': 'Status', 'custom': False, 'schema': {'type': 'status'}},
+                                                     {'id': 'duedate', 'name': 'Due', 'schema': {'type': 'date'}}, {'id': 'bad id'}, 'x'])
+    by_id = {f['id']: f['format'] for f in fields}
+    assert [f['id'] for f in fields[:4]] == ['timeoriginalestimate', 'timespent', 'timeestimate', 'status']
+    assert by_id['status'] == 'text' and by_id['duedate'] == 'time' and by_id['customfield_10050'] == 'number'
+    assert by_id['timespent'] == 'duration' and 'bad id' not in by_id
+
+
+def test_user_formula_with_status_and_duplicates(fake, monkeypatch):
+    """Формула пользователя (WITH, if, статусы) с «Σ по вложенным» и «Исключить дубликаты» — как в Structure."""
+    monkeypatch.setattr(fake_jira, 'FORMULA', WITH_DUPLICATE)
+    fm = jira.normalize_field_map({
+        'remaining': {'field': 'timeestimate', 'unit': 'seconds', 'structure': {
+            'editor': {'mode': 'formula', 'formula': USER_FORMULA, 'variables': USER_VARS, 'sum': True, 'distinct': True},
+            'unit': 'ms', 'label': 'Σ Остаток (с обнулением)'}},
+        'spent': {'field': 'timespent', 'unit': 'seconds', 'structure': {
+            'editor': {'mode': 'field', 'field': 'timespent', 'format': 'duration', 'sum': True, 'distinct': True}, 'unit': 'ms'}},
+        'estimate': {'field': 'timeoriginalestimate', 'unit': 'seconds', 'structure': {
+            'editor': {'mode': 'field', 'field': 'timeoriginalestimate', 'format': 'duration', 'sum': True, 'distinct': False},
+            'unit': 'ms'}}})
+    items = jira.compute_snapshot(client_for(fake), 7, [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}], fm)
+    item = items[0]
+    # ABC-1: 12 − 5 = 7 ч (в работе); ABC-2 готово → 0; ABC-3: 1 − 0 = 1 ч; повтор ABC-2 не считается
+    assert item['remaining'] == 8.0
+    assert item['spent'] == 6.0  # 5 + 1, дубликат ABC-2 исключён
+    assert item['estimate'] == 19.0  # 12 + 3 + 1 + 3: без «Исключить дубликаты» ABC-2 посчитана дважды
+
+
+def test_preview_with_editor_shows_variants(admin, fake, monkeypatch):
+    connect(admin, fake)
+    monkeypatch.setattr(fake_jira, 'FORMULA', WITH_DUPLICATE)
+    body = {'structureId': 7, 'unit': 'ms', 'keys': 'ABC-1, ABC-4',
+            'editor': {'mode': 'field', 'field': 'timespent', 'format': 'duration', 'sum': True, 'distinct': True}}
+    data = admin.post('/api/projects/1/jira/structure-preview', json=body).get_json()
+    first = data['values'][0]
+    assert first['key'] == 'ABC-1' and first['hours'] == 6.0
+    assert first['variants'] == {'own': 5 * 3600000, 'distinct': 6 * 3600000, 'all': 7 * 3600000}
+    assert data['attribute']['params']['formula'] == 'SUM{\nvalue\n}'
+    formula = dict(body, editor={'mode': 'formula', 'formula': USER_FORMULA, 'variables': USER_VARS, 'sum': True})
+    assert admin.post('/api/projects/1/jira/structure-preview', json=formula).get_json()['values'][0]['hours'] == 8.0
+    unbound = admin.post('/api/projects/1/jira/structure-preview', json=dict(body, editor={'mode': 'formula', 'formula': 'x'}))
+    assert unbound.status_code == 502  # переменная без поля — ошибку формулы сообщает Structure
+    bad = admin.post('/api/projects/1/jira/structure-preview', json=dict(body, editor={'mode': 'chart'}))
+    assert bad.status_code == 400 and 'Тип колонки' in bad.get_json()['error']
+
+
+def test_preview_variant_errors_do_not_hide_value(admin, fake, monkeypatch):
+    connect(admin, fake)
+    original = jira.JiraClient.structure_values
+
+    def values(self, structure_id, rows, attributes):
+        if attributes[0]['id'] == 'sum':
+            raise jira.JiraError('Unknown attribute: sum')  # вариант, которого нет в этой версии Structure
+        return original(self, structure_id, rows, attributes)
+    monkeypatch.setattr(jira.JiraClient, 'structure_values', values)
+    body = {'structureId': 7, 'unit': 'ms', 'keys': 'ABC-1',
+            'editor': {'mode': 'field', 'field': 'timespent', 'format': 'duration', 'sum': True}}
+    data = admin.post('/api/projects/1/jira/structure-preview', json=body).get_json()
+    assert data['values'][0]['hours'] == 6.0 and data['values'][0]['variants']['all'] is None
+    assert 'Σ с дубликатами' in data['warnings'][0]
+
+
+def test_button_saves_editor_and_rebuilds_spec(admin, fake, flask_app):
+    connect(admin, fake)
+    fm = field_map(spent={'field': 'timespent', 'unit': 'seconds', 'structure': {
+        'editor': {'mode': 'formula', 'formula': USER_FORMULA, 'variables': USER_VARS, 'sum': True, 'distinct': True},
+        'attribute': {'id': 'ignored'}, 'unit': 'ms', 'label': 'Остаток'}})
+    r = create_button(admin, fieldMap=fm)
+    assert r.status_code == 200, r.get_json()
+    saved = r.get_json()['fieldMap']['spent']['structure']
+    assert saved['editor']['variables']['status'] == {'field': 'status', 'format': 'text'}
+    assert saved['attribute']['params']['formula'].startswith('SUM{')  # спецификацию строит сервер, а не браузер
+    snap = admin.post(f"/api/jira/buttons/{r.get_json()['id']}/snapshot", json={}).get_json()
+    assert snap['items'][0]['spent'] == 8.0
+
+
+def test_formula_fields_endpoint(admin, fake, make_user):
+    connect(admin, fake)
+    fields = admin.get('/api/projects/1/jira/formula-fields').get_json()
+    assert fields[0]['id'] == 'timeoriginalestimate' and {'id': 'customfield_10060', 'name': 'Комментарий', 'format': 'text'} in fields
+    assert make_user('viewer', project_id=1).get('/api/projects/1/jira/formula-fields').status_code == 403
+    fake.configure(token='другой')
+    assert admin.get('/api/projects/1/jira/formula-fields').status_code == 502

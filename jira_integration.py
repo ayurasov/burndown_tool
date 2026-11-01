@@ -230,6 +230,106 @@ def normalize_attribute(spec, depth=0):
     return out
 
 
+# ─── Колонка Structure по настройкам, как в редакторе колонки Structure ──
+# «Поле» или «Формула», «Σ по вложенным» (Sum over sub-items), «Исключить дубликаты» (Exclude duplicates).
+# Σ с исключением дубликатов — агрегатная функция языка Structure SUM{…} (дубликаты она по умолчанию не считает);
+# Σ с дубликатами — атрибут суммы sum (он, как колонка без «Exclude duplicates», считает строку столько раз, сколько
+# раз задача стоит в поддереве). Значения считаются по всей структуре — без временных фильтров представления.
+
+STRUCTURE_FORMATS = ('duration', 'number', 'text', 'time')
+EDITOR_MODES = ('field', 'formula')
+VARIABLE_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,63}$')
+FORMULA_MAX = 20000
+DURATION_FIELDS = {'timeestimate', 'timespent', 'timeoriginalestimate', 'aggregatetimeestimate', 'aggregatetimespent',
+                   'aggregatetimeoriginalestimate'}
+
+
+def field_spec(field_id, fmt):
+    """Поле Jira как атрибут Structure: пользовательское поле — {"id": "customfield", "params": {"fieldId": N}}."""
+    m = re.fullmatch(r'customfield_(\d+)', field_id)
+    if m:
+        return {'id': 'customfield', 'format': fmt, 'params': {'fieldId': int(m.group(1))}}
+    return {'id': field_id, 'format': fmt}
+
+
+def normalize_column_editor(raw):
+    """Настройки колонки из редактора Burndown → проверенный словарь (ValueError с понятным текстом)."""
+    if not isinstance(raw, dict) or raw.get('mode') not in EDITOR_MODES:
+        raise ValueError('Тип колонки Structure — «Поле» или «Формула»')
+
+    def variable(v, name):
+        if not isinstance(v, dict):
+            raise ValueError(f'Переменная «{name}»: выберите поле Jira')
+        field = (v.get('field') or '').strip()
+        if not field:
+            raise ValueError(f'Выберите поле Jira для переменной «{name}»')
+        if not FIELD_ID_RE.match(field):
+            raise ValueError(f'Переменная «{name}»: некорректное поле Jira {field}')
+        fmt = v.get('format') or 'number'
+        if fmt not in STRUCTURE_FORMATS:
+            raise ValueError(f'Переменная «{name}»: формат — длительность, число, текст или дата')
+        return {'field': field, 'format': fmt}
+    out = {'mode': raw['mode'], 'sum': bool(raw.get('sum')), 'distinct': bool(raw.get('distinct', True))}
+    if raw['mode'] == 'field':  # из редактора — field и format; сохранённые настройки — переменная value
+        saved = (raw.get('variables') or {}).get('value') if isinstance(raw.get('variables'), dict) else None
+        saved = saved if isinstance(saved, dict) else {}
+        out['variables'] = {'value': variable({'field': raw.get('field') or saved.get('field'),
+                                               'format': raw.get('format') or saved.get('format')}, 'поле')}
+        out['formula'] = 'value'
+        return out
+    formula = raw.get('formula')
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError('Введите формулу')
+    if len(formula) > FORMULA_MAX:
+        raise ValueError('Формула слишком большая')
+    variables = raw.get('variables')
+    variables = {} if variables is None else variables
+    if not isinstance(variables, dict) or len(variables) > 50:
+        raise ValueError('Переменные формулы — объект {имя: поле}')
+    out['formula'] = formula.strip()
+    out['variables'] = {}
+    for name, v in variables.items():
+        if not isinstance(name, str) or not VARIABLE_RE.match(name):
+            raise ValueError(f'Некорректное имя переменной: {name}')
+        out['variables'][name] = variable(v, name)
+    return out
+
+
+def _expr(formula, variables):
+    return {'id': 'expr', 'format': 'number',
+            'params': {'formula': formula, 'variables': {n: field_spec(v['field'], v['format']) for n, v in variables.items()}}}
+
+
+def column_variants(editor):
+    """Три варианта колонки для сверки: только сама задача, Σ без дубликатов, Σ с дубликатами."""
+    own = _expr(editor['formula'], editor['variables'])
+    return {'own': own,
+            'distinct': _expr('SUM{\n' + editor['formula'] + '\n}', editor['variables']),
+            'all': {'id': 'sum', 'format': 'number', 'params': {'attribute': own}}}
+
+
+def build_structure_attribute(editor):
+    """Спецификация атрибута для Value API по настройкам колонки (как их задают в Structure)."""
+    variants = column_variants(editor)
+    if not editor['sum']:
+        return variants['own']
+    return variants['distinct'] if editor['distinct'] else variants['all']
+
+
+def formula_fields(raw):
+    """Поля Jira для переменных формулы: [{id, name, format}] — учёт времени, статус, затем остальные по имени."""
+    out = []
+    for f in raw or []:
+        if not isinstance(f, dict) or not isinstance(f.get('id'), str) or not FIELD_ID_RE.match(f['id']):
+            continue
+        kind = (f.get('schema') or {}).get('type')
+        fmt = ('duration' if f['id'] in DURATION_FIELDS else 'number' if kind == 'number'
+               else 'time' if kind in ('date', 'datetime') else 'text')
+        out.append({'id': f['id'], 'name': TIME_FIELD_NAMES.get(f['id']) or str(f.get('name') or f['id']), 'format': fmt})
+    rank = {'timeoriginalestimate': 0, 'timespent': 1, 'timeestimate': 2, 'status': 3}
+    return sorted(out, key=lambda x: (rank.get(x['id'], 9), x['format'] != 'duration', x['name'].lower()))
+
+
 def normalize_field_map(raw):
     """Проверенное сопоставление метрик: {metric: {'field': id|'', 'unit', 'structure': None | {'attribute',
     'unit', 'label'}}}. field — поле Jira (сумма по задачам; для показателя из колонки Structure — для состава задач
@@ -257,8 +357,11 @@ def normalize_field_map(raw):
             if s_unit not in UNITS:
                 raise ValueError('Единица колонки Structure — миллисекунды, секунды, минуты, часы или дни')
             label = structure.get('label') if isinstance(structure.get('label'), str) else ''
-            structure = {'attribute': normalize_attribute(structure.get('attribute')), 'unit': s_unit,
-                         'label': label.strip()[:200]}
+            editor = normalize_column_editor(structure['editor']) if structure.get('editor') else None
+            attribute = build_structure_attribute(editor) if editor else normalize_attribute(structure.get('attribute'))
+            structure = {'attribute': attribute, 'unit': s_unit, 'label': label.strip()[:200]}
+            if editor:
+                structure['editor'] = editor
         out[metric] = {'field': field, 'unit': unit, 'structure': structure or None}
     if not any(v['field'] or v['structure'] for v in out.values()):
         raise ValueError('Сопоставьте с полями Jira или колонками Structure хотя бы одну метрику')
@@ -768,9 +871,10 @@ def apply_structure_columns(client, structure_id, groups, items, columns):
                                         'проверьте её формат')
 
 
-def structure_preview(client, structure_id, keys, attribute, unit):
+def structure_preview(client, structure_id, keys, attribute, unit, variants=None):
     """Значения колонки Structure у строк задач (проверка в редакторе кнопки) →
-    [{'key', 'rowId', 'raw', 'hours'}] и предупреждения."""
+    [{'key', 'rowId', 'raw', 'hours', 'asUnits', 'variants'}] и предупреждения. variants — {имя: атрибут}: для сверки
+    со структурой те же значения считаются и в других вариантах (без суммы, Σ без и с дубликатами)."""
     found = client.issues_by_keys(keys, ['summary'])
     first, _count = root_rows(client.forest(structure_id))
     rows, warnings = [], []
@@ -783,15 +887,29 @@ def structure_preview(client, structure_id, keys, attribute, unit):
             warnings.append(f'{key}: задачи нет в структуре')
         else:
             rows.append((key, row))
-    values = client.structure_values(structure_id, [r for _k, r in rows], [attribute])[0] if rows else {}
+    row_ids = [r for _k, r in rows]
+    values = client.structure_values(structure_id, row_ids, [attribute])[0] if rows else {}
+    extra = {}
+    for name, spec in (variants or {}).items():
+        try:  # вариант, который Structure не поддерживает (старая версия), не мешает основному значению
+            extra[name] = client.structure_values(structure_id, row_ids, [spec])[0] if rows else {}
+        except JiraError as e:
+            extra[name] = {}
+            warnings.append(f'Вариант для сверки «{VARIANT_TITLES.get(name, name)}» не посчитан: {e}')
     out = []
     for key, row in rows:
         raw = values.get(row)
         num = _number(raw)
-        out.append({'key': key, 'rowId': row, 'raw': raw,
-                    'hours': None if num is None else round(num * UNITS[unit], 2),
-                    'asUnits': {u: (None if num is None else round(num * k, 2)) for u, k in UNITS.items()}})
+        item = {'key': key, 'rowId': row, 'raw': raw,
+                'hours': None if num is None else round(num * UNITS[unit], 2),
+                'asUnits': {u: (None if num is None else round(num * k, 2)) for u, k in UNITS.items()}}
+        if variants:
+            item['variants'] = {name: _number(extra[name].get(row)) for name in variants}
+        out.append(item)
     return out, warnings
+
+
+VARIANT_TITLES = {'own': 'только сама задача', 'distinct': 'Σ без дубликатов', 'all': 'Σ с дубликатами'}
 
 
 # ─── Состав эпика по задачам и качество данных ───────────────────

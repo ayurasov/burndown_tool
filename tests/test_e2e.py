@@ -1638,8 +1638,10 @@ def test_structure_column_in_button_editor(admin_ui, admin, fake_jira):
     page.click('#jiraButtonsTable [data-action="edit"]')
     page.wait_for_selector('#jbSrc_remaining')
     page.select_option('#jbSrc_remaining', 'structure')
-    page.wait_for_selector('#jbStrPaste')
+    page.wait_for_selector('#jbStrPaste', state='attached')
     assert admin_ui.text('#jbFieldLabel_remaining') == 'Поле Jira для состава задач и истории'
+    assert page.is_checked('input[name="jbStrMode"][value="field"]') and page.is_checked('#jbStrSum') and page.is_checked('#jbStrDistinct')
+    page.check('input[name="jbStrMode"][value="copy"]')
     page.fill('#jbStrPaste', payload)
     page.select_option('#jbStrPick', '1')
     page.select_option('#jbStrUnit_remaining', 'ms')
@@ -1651,13 +1653,34 @@ def test_structure_column_in_button_editor(admin_ui, admin, fake_jira):
     page.click('#jbStrPreview [data-unit="ms"]')
     page.click('#jbStrApply')
     assert admin_ui.text('#jbStrLabel_remaining') == 'Σ по вложенным: Атрибут «timeestimate»'
-    page.select_option('#jbSrc_spent', 'structure')  # формула
+    # формула как в Structure: переменные orig, spent, status (статус — текстом), Σ по вложенным без дубликатов
+    page.select_option('#jbSrc_spent', 'structure')
     page.check('input[name="jbStrMode"][value="formula"]')
-    page.fill('#jbStrFormulaText', 'SUM{time_spent} / 3600000')
-    assert page.input_value('#jbStrVars [data-var="time_spent"]') == 'timespent'
+    page.fill('#jbStrFormulaText', 'WITH rest = orig - spent :\nif(rest < 0 OR status != "В работе", 0, rest)')
+    page.wait_for_selector('#jbStrVars [data-var="status"]')
+    assert page.input_value('#jbStrVars [data-var="orig"]') == 'timeoriginalestimate'
+    assert page.input_value('#jbStrVars [data-var="spent"]') == 'timespent'
+    assert page.input_value('#jbStrVars [data-var="status"]') == 'status'
+    assert page.input_value('#jbStrVars [data-var-format="status"]') == 'text'
+    assert page.locator('#jbStrVars [data-var="rest"]').count() == 0  # WITH — локальная переменная, не поле
+    page.select_option('#jbStrUnit_spent', 'ms')
+    page.click('#jbStrCheck')
+    page.wait_for_selector('#jbStrPreview table')
+    assert admin_ui.cells('#jbStrPreview tbody td.jb-unit-current') == ['8 ч']  # ABC-1: 7 ч + ABC-3: 1 ч
+    assert admin_ui.cells('#jbStrPreview tbody tr td:nth-child(4)') == ['7 ч']  # только сама задача
+    assert 'SUM{' in admin_ui.text('#jbStrPreview .jb-str-spec pre')
+    page.click('#jbStrApply')
+    assert admin_ui.text('#jbStrLabel_spent').startswith('Формула: WITH rest') and 'Σ без дубликатов' in admin_ui.text('#jbStrLabel_spent')
+    page.select_option('#jbSrc_estimate', 'structure')  # поле: Σ по вложенным
+    page.select_option('#jbStrFieldSel', 'timeoriginalestimate')
     page.click('#jbStrApply')
     page.click('#confirmOk')
     admin_ui.expect_toast('Кнопка обновлена')
-    assert admin_ui.text('#jiraButtonsTable').count('Structure') == 2
+    assert admin_ui.text('#jiraButtonsTable').count('Structure') == 3
     fm = admin.get('/api/projects/1/jira').get_json()['buttons'][0]['fieldMap']
-    assert fm['spent']['structure']['attribute']['params']['variables'] == {'time_spent': {'id': 'timespent', 'format': 'duration'}}
+    assert fm['spent']['structure']['editor']['variables']['status'] == {'field': 'status', 'format': 'text'}
+    assert fm['estimate']['structure']['attribute']['params']['formula'] == 'SUM{\nvalue\n}'
+    page.click('#jiraButtonsTable [data-action="edit"]')  # повторное открытие — настройки на месте
+    page.wait_for_selector('#jbSrc_spent')
+    page.click('[data-str-edit="spent"]')
+    assert page.is_checked('input[name="jbStrMode"][value="formula"]') and 'WITH rest' in page.input_value('#jbStrFormulaText')

@@ -1821,8 +1821,14 @@ def api_jira_structure_preview(pid):
     structure_id = _structure_id(data.get('structureId'))
     if not structure_id:
         raise ValidationError('Выберите структуру — колонки Structure работают только у кнопки со структурой')
+    variants = None
     try:
-        attribute = jira.normalize_attribute(data.get('attribute'))
+        if data.get('editor'):  # колонка задана как в Structure: поле или формула, Σ, дубликаты
+            editor = jira.normalize_column_editor(data['editor'])
+            attribute = jira.build_structure_attribute(editor)
+            variants = jira.column_variants(editor)
+        else:  # колонка скопирована из Structure (спецификация атрибута)
+            attribute = jira.normalize_attribute(data.get('attribute'))
     except ValueError as e:
         raise ValidationError(str(e))
     unit = data.get('unit') or 'hours'
@@ -1834,10 +1840,22 @@ def api_jira_structure_preview(pid):
     if not keys:
         raise ValidationError('Укажите задачи Jira у эпиков — значения колонки проверяются по ним')
     try:
-        rows, warnings = jira.structure_preview(_jira_client(get_db()), structure_id, keys[:20], attribute, unit)
+        rows, warnings = jira.structure_preview(_jira_client(get_db()), structure_id, keys[:20], attribute, unit, variants)
     except jira.JiraError as e:
         return _jira_error(e)
-    return jsonify({'values': rows, 'warnings': warnings})
+    return jsonify({'values': rows, 'warnings': warnings, 'attribute': attribute})
+
+
+@app.route('/api/projects/<int:pid>/jira/formula-fields')
+@login_required
+def api_jira_formula_fields(pid):
+    """Все поля Jira для переменных формулы колонки Structure (с форматом по умолчанию)."""
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    try:
+        return jsonify(jira.formula_fields(_jira_client(get_db()).fields()))
+    except jira.JiraError as e:
+        return _jira_error(e)
 
 
 @app.route('/api/projects/<int:pid>/jira/epics/preview', methods=['POST'])
