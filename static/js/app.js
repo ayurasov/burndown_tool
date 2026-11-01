@@ -3175,20 +3175,28 @@ function bindBoardFilter(){
 function scopeHtml(scope){
   var list = scope || [];
   return '<details class="jb-board-filter" id="jbScopeBox"'+(list.length ? ' open' : '')+'><summary>Раздел структуры <span class="muted-cell">— если эпик стоит в структуре несколько раз</span></summary>'+
-    '<div class="setting-hint">Одна и та же задача может стоять в структуре в нескольких местах, и под каждой строкой у неё своё поддерево и свои суммы. Отметьте разделы, где вы смотрите цифры на доске (например, «4.1», «4.2», «4.3»): строка эпика берётся из них. Без отметок берётся первая строка в структуре.</div>'+
-    '<div id="jbScopeList" class="jb-scope-list">'+list.map(function(x){ return scopeItemHtml(x.item, x.title, 0, true); }).join('')+'</div>'+
+    '<div class="setting-hint">Одна и та же задача может стоять в структуре в нескольких местах, и под каждой строкой у неё своё поддерево и свои суммы. Отметьте разделы, где вы смотрите цифры на доске (например, «4.1», «4.2», «4.3»), или сами эпики под ними: строка эпика берётся из отмеченного места. Без отметок берётся первая строка в структуре.</div>'+
+    '<div id="jbScopeList" class="jb-scope-list">'+list.map(function(x){ return scopeItemHtml(x, 0, true); }).join('')+'</div>'+
     '<div class="form-actions"><button type="button" class="btn btn-ghost btn-sm" id="jbScopeLoad">Загрузить разделы</button></div></details>';
 }
-function scopeItemHtml(item, title, depth, checked, note){
-  return '<label class="checkbox-row jb-scope-item" style="padding-left:'+(depth * 1.25)+'rem"><input type="checkbox" data-scope-item="'+escapeAttr(item)+'" data-scope-title="'+escapeAttr(title || '')+'"'+(checked ? ' checked' : '')+'> '+
-    escapeHtml(title || item)+(note ? ' <span class="muted-cell">'+escapeHtml(note)+'</span>' : '')+'</label>';
+/* Раздел — строка структуры: один и тот же эпик может стоять в нескольких разделах, поэтому сохраняется и строка (row),
+   а в сохраняемом названии эпика второго уровня — раздел над ним («4.1 → SRM-4687 …»); label — текст в списке */
+function scopeItemHtml(x, depth, checked, note){
+  var row = typeof x.row === 'number' ? x.row : (typeof x.rowId === 'number' ? x.rowId : null);
+  return '<label class="checkbox-row jb-scope-item" style="padding-left:'+(depth * 1.25)+'rem"><input type="checkbox" data-scope-item="'+escapeAttr(x.item)+'"'+
+    (row !== null ? ' data-scope-row="'+row+'"' : '')+' data-scope-title="'+escapeAttr(x.title || '')+'"'+(checked ? ' checked' : '')+'> '+
+    escapeHtml(x.label || x.title || x.item)+(note ? ' <span class="muted-cell">'+escapeHtml(note)+'</span>' : '')+'</label>';
 }
 function readScope(){
   var out = [], seen = {};
   document.querySelectorAll('#jbScopeList [data-scope-item]:checked').forEach(function(el){
-    if(seen[el.dataset.scopeItem]) return;
-    seen[el.dataset.scopeItem] = true;
-    out.push({item: el.dataset.scopeItem, title: el.dataset.scopeTitle});
+    var row = el.dataset.scopeRow ? parseInt(el.dataset.scopeRow, 10) : null;
+    var key = el.dataset.scopeItem + '|' + row;
+    if(seen[key]) return;
+    seen[key] = true;
+    var x = {item: el.dataset.scopeItem, title: el.dataset.scopeTitle};
+    if(row !== null) x.row = row;
+    out.push(x);
   });
   return out.length ? out : null;
 }
@@ -3197,12 +3205,18 @@ function bindScope(structureId){
   btn.addEventListener('click', function(){
     var sid = structureId();
     if(!sid){ toast('Сначала выберите структуру'); return; }
-    var chosen = {};
-    (readScope() || []).forEach(function(x){ chosen[x.item] = true; });
+    var saved = readScope() || [];
     btn.disabled = true;
     api('/api/projects/'+currentProjectId+'/jira/structure-sections?structureId='+encodeURIComponent(sid)).then(function(list){
+      // отмечено по строке; раздел без строки (сохранён до 1.9.3) или со строкой, которой больше нет, — по элементу
+      var rows = {}, items = {};
+      saved.forEach(function(x){
+        var here = typeof x.row === 'number' && list.some(function(s){ return s.rowId === x.row && s.item === x.item; });
+        if(here) rows[x.row] = true; else items[x.item] = true;
+      });
       document.getElementById('jbScopeList').innerHTML = list.length ? list.map(function(x){
-        return scopeItemHtml(x.item, x.title, x.depth, chosen[x.item], 'строк: ' + x.rows);
+        var title = x.parentTitle ? x.parentTitle + ' → ' + x.title : x.title;
+        return scopeItemHtml({item: x.item, row: x.rowId, title: title, label: x.title}, x.depth, rows[x.rowId] || items[x.item], 'строк: ' + x.rows);
       }).join('') : '<p class="insight-empty">В структуре нет разделов с вложенными строками.</p>';
       toast('Разделов загружено: ' + list.length);
     }).catch(function(){}).then(function(){ btn.disabled = false; });
