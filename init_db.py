@@ -104,6 +104,10 @@ def create_jira_tables(conn):
         conn.execute('ALTER TABLE jira_snapshot_buttons ADD COLUMN field_map TEXT')
     if 'last_success_at' not in cols:
         conn.execute('ALTER TABLE jira_snapshot_buttons ADD COLUMN last_success_at TEXT')
+    # 1.8.0: синхронизация эпиков с Jira (настройки и итог последнего запуска)
+    for col in ('epic_sync', 'epic_sync_at', 'epic_sync_message'):
+        if col not in cols:
+            conn.execute(f'ALTER TABLE jira_snapshot_buttons ADD COLUMN {col} TEXT')
     # срез восстановлен по журналу изменений (1), а не получен из Jira на этот день (0) — восстановленный можно заменить
     snap_cols = {r[1] for r in conn.execute('PRAGMA table_info(jira_issue_snapshots)')}
     if 'restored' not in snap_cols:
@@ -209,6 +213,18 @@ SETTINGS_COLUMNS_V17 = [
     ('units', 'TEXT'), ('hours_per_day', 'REAL'), ('stale_days', 'INTEGER'), ('scope_threshold', 'INTEGER'),
     ('slip_threshold', 'INTEGER'), ('chance_threshold', 'INTEGER'), ('insight_window_days', 'INTEGER'),
 ]
+
+
+def ensure_org_calendar(conn):
+    """Общий производственный календарь: при первом запуске — праздники РФ из встроенного набора (holidays_ru.py).
+    Администратор может изменить или очистить его в разделе «Календарь»; повторно набор не подставляется."""
+    if conn.execute("SELECT 1 FROM app_settings WHERE key = 'org_calendar'").fetchone():
+        return
+    import json
+    import holidays_ru
+    holidays, extra = holidays_ru.all_dates()
+    conn.execute("INSERT INTO app_settings (key, value) VALUES ('org_calendar', ?)",
+                 (json.dumps({'holidays': holidays, 'extraWorkdays': extra}),))
 
 
 def upgrade_settings(conn):
@@ -482,6 +498,7 @@ def init_db():
     create_notify_tables(conn)
     create_auth_tables(conn)
     upgrade_settings(conn)
+    ensure_org_calendar(conn)
     create_indexes(conn)
 
     conn.commit()

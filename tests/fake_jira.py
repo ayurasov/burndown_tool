@@ -12,7 +12,9 @@ ABC-5 (106) — вне структуры. customfield_10050 — числово�
 Статусы: ABC-1, ABC-3, ABC-6 — в работе; ABC-2 — готово (с ненулевым остатком); остальные — открыты.
 """
 
+import ast
 import base64
+import operator
 import re
 import threading
 
@@ -94,6 +96,79 @@ def _issue_json(issue_id, fields, changelog=False, truncate=False):
         out['changelog'] = {'histories': [] if truncate else histories, 'total': len(histories),
                             'maxResults': 0 if truncate else len(histories)}
     return out
+
+
+TIME_FIELD_IDS = ('timeestimate', 'timespent', 'timeoriginalestimate')
+_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv}
+
+
+def _forest():
+    """[(rowId, depth, issueId|None)] по формуле структуры."""
+    out = []
+    for part in FORMULA.split(','):
+        row, depth, item = part.split(':')[:3]
+        out.append((int(row), int(depth), int(item) if item.isdigit() else None))
+    return out
+
+
+def _subtree(row_id):
+    rows = _forest()
+    for i, (rid, depth, _item) in enumerate(rows):
+        if rid == row_id:
+            out = [rid]
+            for rid2, depth2, _ in rows[i + 1:]:
+                if depth2 <= depth:
+                    break
+                out.append(rid2)
+            return out
+    return []
+
+
+def _attr_value(spec, row_id):
+    """Значение колонки Structure у строки, как считает учебный Structure: поле (длительности — в миллисекундах,
+    как в Structure), сумма по поддереву (sum) и простая формула (expr: + − × ÷, переменные, SUM{переменная})."""
+    item = {rid: it for rid, _d, it in _forest()}.get(row_id)
+    data = ISSUES.get(item) if item else None
+    attr = spec.get('id')
+    params = spec.get('params') or {}
+    if attr == 'sum':
+        inner = params.get('attribute') or params.get('value')
+        vals = [_attr_value(inner, r) for r in _subtree(row_id)]
+        nums = [v for v in vals if isinstance(v, (int, float))]
+        return sum(nums) if nums else None
+    if attr == 'expr':
+        variables = params.get('variables') or {}
+        formula = params.get('formula') or ''
+
+        def sum_var(match):
+            vals = [_attr_value(variables[match.group(1)], r) for r in _subtree(row_id)]
+            return str(sum(v for v in vals if isinstance(v, (int, float))))
+        formula = re.sub(r'SUM\{\s*(\w+)\s*\}', sum_var, formula)
+
+        def ev(node):
+            if isinstance(node, ast.Expression):
+                return ev(node.body)
+            if isinstance(node, ast.Constant):
+                return node.value
+            if isinstance(node, ast.Name):
+                value = _attr_value(variables[node.id], row_id) if node.id in variables else None
+                return value or 0
+            if isinstance(node, ast.BinOp):
+                return _OPS[type(node.op)](ev(node.left), ev(node.right))
+            raise ValueError('formula')
+        return ev(ast.parse(formula, mode='eval'))
+    if data is None or data.get('hidden'):
+        return None
+    if attr not in FIELD_IDS:
+        raise KeyError(attr)
+    value = data.get(attr)
+    if attr in TIME_FIELD_IDS and value is not None:
+        return value * 1000
+    return value
+
+
+FIELD_IDS = {'summary', 'timeestimate', 'timespent', 'timeoriginalestimate', 'customfield_10050', 'customfield_10060',
+             'duedate', 'key'}
 
 
 def create_app(state):
@@ -204,13 +279,35 @@ def create_app(state):
                         'itemTypes': {'5': 'com.almworks.jira.structure:type-folder'},
                         'version': {'signature': 1, 'version': 3}})
 
+    @app.post('/rest/structure/2.0/value')
+    def values():
+        if not state.get('value_api', True):
+            return 'Not Found', 404
+        body = request.get_json()
+        state['value_bodies'].append(body)
+        out = []
+        for req in body.get('requests') or []:
+            if (req.get('forestSpec') or {}).get('structureId') != 7:
+                return jsonify({'message': 'structure not found'}), 404
+            rows = req.get('rows') or []
+            data = []
+            for spec in req.get('attributes') or []:
+                try:
+                    vals = [_attr_value(spec, r) for r in rows]
+                except (KeyError, ValueError, ZeroDivisionError):
+                    return jsonify({'errorMessages': [f"Unknown attribute: {spec.get('id')}"]}), 400
+                data.append({'attribute': spec, 'values': vals, 'trailMode': 'INDEPENDENT', 'trails': ['' for _ in rows]})
+            out.append({'forestSpec': req['forestSpec'], 'rows': rows, 'data': data,
+                        'forestVersion': {'signature': 1, 'version': 3}})
+        return jsonify({'responses': out, 'itemTypes': {}, 'itemsVersion': {'signature': 1, 'version': 1}})
+
     return app
 
 
 class FakeJira:
     def __init__(self, mode='server', login='', token='secret-pat', structure=True):
         self.state = {'mode': mode, 'login': login, 'token': token, 'structure': structure,
-                      'requests': [], 'search_bodies': []}
+                      'requests': [], 'search_bodies': [], 'value_bodies': []}
         self.server = make_server('127.0.0.1', 0, create_app(self.state), threaded=True)
         self.url = f'http://127.0.0.1:{self.server.server_port}'
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

@@ -95,7 +95,7 @@ def test_scheduler_survives_failing_steps(flask_app, monkeypatch):
     assert calls == ['alerts', 'digests', 'outbox']
 
 
-def test_scheduler_loop_and_start(monkeypatch):
+def test_scheduler_loop_and_start(db_path, monkeypatch):
     ticks = []
 
     def sleep(_seconds):

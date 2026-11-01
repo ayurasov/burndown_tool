@@ -51,7 +51,8 @@ SETTINGS = [
     {'forecastMethod': 'linear', 'riskBufferDays': 3, 'burnrateMethod': 'all', 'burnrateWindowDays': 14},
     {'forecastMethod': 'average', 'riskBufferDays': 0, 'burnrateMethod': 'rolling', 'burnrateWindowDays': 10},
     {'forecastMethod': 'linear', 'riskBufferDays': 2, 'burnrateMethod': 'all', 'burnrateWindowDays': 14,
-     'rangeConfidence': 90, 'workdays': True, 'holidays': HOLIDAYS, 'extraWorkdays': ['2026-07-11', '2026-11-07']},
+     'rangeConfidence': 90, 'workdays': True, 'holidays': HOLIDAYS[:4], 'extraWorkdays': ['2026-07-11'],
+     'orgHolidays': HOLIDAYS[3:], 'orgExtraWorkdays': ['2026-11-07']},  # общий календарь и даты проекта объединяются
     {'forecastMethod': 'average', 'riskBufferDays': 1, 'burnrateMethod': 'rolling', 'burnrateWindowDays': 21,
      'rangeConfidence': 50, 'workdays': True, 'holidays': [], 'extraWorkdays': []},
 ]
