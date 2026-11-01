@@ -1326,6 +1326,8 @@ def test_notify_admin_settings_ui(admin_ui, fake_mail, fake_tg):
     page = admin_ui.page
     admin_ui.go('integrations')
     page.wait_for_selector('#notifyLogTable thead')
+    # настройки приходят отдельным запросом и перезаписывают поля — заполняем только после них
+    page.wait_for_function("document.getElementById('naBotStatus').textContent !== ''")
     page.fill('#naHost', 'smtp.example.ru')
     page.fill('#naPort', '465')
     page.select_option('#naSecurity', 'ssl')
