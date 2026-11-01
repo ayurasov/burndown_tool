@@ -262,10 +262,10 @@ def series_findings(drv, settings, today, label=''):
 
 # ─── Эпик, этап, проект ──────────────────────────────────────────
 
-def epic_insight(epic, rows, settings, today, comp_history=None, comp_latest=None):
+def epic_insight(epic, rows, settings, today, comp_history=None, comp_latest=None, with_mc=True):
     """epic: {'id', 'name', 'etap', 'target'}; rows — замеры по датам; comp_* — состав задач Jira."""
     drv = series_drivers([r['date'] for r in rows], [r['remaining'] for r in rows], [r['estimate'] for r in rows],
-                         epic['target'], settings, today, [(p['date'], p['scope']) for p in comp_history or []])
+                         epic['target'], settings, today, [(p['date'], p['scope']) for p in comp_history or []], with_mc)
     found = series_findings(drv, settings, today)
     if comp_latest and comp_latest.get('problemIssues'):
         n, total = comp_latest['problemIssues'], comp_latest.get('total') or 0
@@ -292,9 +292,9 @@ def _slowest(epics):
     return max(dated, key=lambda e: e['forecast']) if dated else None
 
 
-def stage_insight(name, target, epics, dates, series, settings, today, scope_history=None):
+def stage_insight(name, target, epics, dates, series, settings, today, scope_history=None, with_mc=True):
     """Этап: сумма по эпикам (как в своде) плюс выводы по составу — кто определяет срок и кто под угрозой."""
-    drv = series_drivers(dates, series['remaining'], series['estimate'], target, settings, today, scope_history)
+    drv = series_drivers(dates, series['remaining'], series['estimate'], target, settings, today, scope_history, with_mc)
     found = series_findings(drv, settings, today)
     slowest = _slowest(epics)
     if slowest and len(epics) > 1:
@@ -452,3 +452,107 @@ def portfolio_summary(projects):
     else:
         headline = 'Для выводов по проектам не хватает данных.'
     return {'headline': headline, 'counts': counts, 'projects': items}
+
+
+# ─── Лента изменений: что поменялось в выводах за неделю ─────────
+
+STATUS_WORDS = {'ok': 'успевает', 'risk': 'в зоне риска', 'danger': 'не успевает', 'unknown': 'без прогноза',
+                'notarget': 'без целевой даты'}
+CHANGE_SHIFT_DAYS = 3        # сдвиг прогноза меньше — не изменение (колебания от замера к замеру)
+CHANGE_CHANCE_POINTS = 0.15  # изменение шанса успеть на 15 п. п. и больше
+
+
+def insight_state(data):
+    """Компактный снимок выводов проекта: статусы, прогнозы, шансы и остаток эпиков и этапов — для сравнения
+    по неделям (хранится в базе ежедневно)."""
+    def item(x):
+        return {'name': x['name'], 'status': x['status'], 'forecast': x['forecast'], 'target': x['target'],
+                'probability': x['probability'], 'remaining': x['remaining'], 'noBurn': bool(x['noBurn']),
+                'tooFar': bool(x['tooFar']), 'finished': bool(x['finished'])}
+    remaining = [e['remaining'] for e in data['epics'] if e['remaining'] is not None]
+    return {'date': data['date'], 'status': data['summary']['status'],
+            'remaining': fc.js_sum(remaining) if remaining else None,
+            'epics': {str(e['id']): item(e) for e in data['epics']},
+            'stages': {s['name']: item(s) for s in data['stages']}}
+
+
+def _forecast_words(x):
+    if x['finished']:
+        return 'завершён'
+    if x['noBurn']:
+        return 'не сгорает'
+    if x['tooFar']:
+        return '> 3 лет'
+    return fmt_date(x['forecast']) if x['forecast'] else '—'
+
+
+def _item_changes(old, new, level, ref, settings):
+    """Изменения одного эпика или этапа между двумя снимками → выводы с важностью."""
+    out = []
+    what = 'Эпик' if level == 'epic' else 'Этап'
+    if new['finished'] and not old['finished']:
+        return [dict(finding('ok', 'finished', f'{what} завершён — остаток обнулился.', weight=300), subject=new['name'], ref=ref)]
+    if new['target'] != old['target']:
+        out.append(finding('info', 'target', f'Цель изменена: {fmt_date(old["target"])} → {fmt_date(new["target"])}.',
+                           weight=40))
+    rank_old, rank_new = STATUS_ORDER.get(old['status'], -1), STATUS_ORDER.get(new['status'], -1)
+    if old['status'] != new['status'] and min(rank_old, rank_new) >= 0:
+        worse = rank_new > rank_old
+        out.append(finding(new['status'] if worse else 'ok', 'status',
+                           f'Статус: {STATUS_WORDS[old["status"]]} → {STATUS_WORDS[new["status"]]}.',
+                           weight=200 + 50 * abs(rank_new - rank_old)))
+    blocked_old, blocked_new = old['noBurn'] or old['tooFar'], new['noBurn'] or new['tooFar']
+    if blocked_new and not blocked_old:
+        out.append(finding('risk', 'stalled', f'Прогноз потерян: {"остаток не сгорает" if new["noBurn"] else "срок больше 3 лет"} '
+                                               f'(был {_forecast_words(old)}).', weight=150))
+    elif blocked_old and not blocked_new and new['forecast']:
+        out.append(finding('ok', 'resumed', f'Работа возобновилась: прогноз {fmt_date(new["forecast"])}.', weight=120))
+    elif old['forecast'] and new['forecast']:
+        shift = fc.days_between(old['forecast'], new['forecast'])
+        if abs(shift) >= CHANGE_SHIFT_DAYS:
+            late = shift > 0
+            severity = ('risk' if new['target'] and new['forecast'] > new['target'] else 'info') if late else 'ok'
+            out.append(finding(severity, 'shift', f'Прогноз {"позже" if late else "раньше"} на {days_text(abs(shift))}: '
+                                                  f'{fmt_date(old["forecast"])} → {fmt_date(new["forecast"])}.',
+                               weight=min(abs(shift), 90)))
+    if old['probability'] is not None and new['probability'] is not None:
+        delta = new['probability'] - old['probability']
+        if abs(delta) >= CHANGE_CHANCE_POINTS:
+            out.append(finding('risk' if delta < 0 else 'ok', 'chance',
+                               f'Шанс успеть к цели: {fc.js_round(old["probability"] * 100)} % → '
+                               f'{fc.js_round(new["probability"] * 100)} %.', weight=fc.js_round(abs(delta) * 100)))
+    return [dict(x, subject=new['name'], ref=ref) for x in out]
+
+
+def state_changes(old, new, settings):
+    """Что изменилось в выводах между двумя снимками (insight_state): по проекту, этапам и эпикам —
+    от тревожного к хорошему. Новые и ушедшие из работы эпики — тоже изменения."""
+    if not old or not new:
+        return []
+    out = []
+    if old['status'] != new['status'] and min(STATUS_ORDER.get(old['status'], -1), STATUS_ORDER.get(new['status'], -1)) >= 0:
+        worse = STATUS_ORDER[new['status']] > STATUS_ORDER[old['status']]
+        out.append(dict(finding(new['status'] if worse else 'ok', 'status',
+                                f'Проект: {STATUS_WORDS[old["status"]]} → {STATUS_WORDS[new["status"]]}.', weight=1000),
+                        subject=None, ref=None))
+    if old.get('remaining') is not None and new.get('remaining') is not None:
+        delta = new['remaining'] - old['remaining']
+        if abs(delta) >= 0.05:
+            out.append(dict(finding('info', 'remaining', f'Остаток проекта {"вырос" if delta > 0 else "уменьшился"} на '
+                                                         f'{fmt_work(abs(delta), settings)}: {fmt_work(old["remaining"], settings)} → '
+                                                         f'{fmt_work(new["remaining"], settings)}.', weight=5),
+                            subject=None, ref=None))
+    for name, st in new['stages'].items():
+        if name in old['stages']:
+            out += _item_changes(old['stages'][name], st, 'stage', {'level': 'stage', 'name': name}, settings)
+    for eid, e in new['epics'].items():
+        ref = {'level': 'epic', 'id': int(eid)}
+        if eid in old['epics']:
+            out += _item_changes(old['epics'][eid], e, 'epic', ref, settings)
+        else:
+            out.append(dict(finding('info', 'added', 'Новый эпик в работе.', weight=10), subject=e['name'], ref=ref))
+    for eid, e in old['epics'].items():
+        if eid not in new['epics']:
+            out.append(dict(finding('ok', 'removed', 'Больше не в работе: отмечен сданным или удалён.', weight=100),
+                            subject=e['name'], ref=None))
+    return sorted(out, key=lambda f: (-SEVERITY_RANK[f['severity']], -f['weight']))

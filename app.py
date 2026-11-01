@@ -3203,6 +3203,7 @@ def warm_projects(pids):
                 db = get_db()
                 if db.execute('SELECT 1 FROM projects WHERE id = ?', (pid,)).fetchone():
                     project_insights(db, pid)
+                    insight_changes(db, pid)
                     done += 1
         except Exception:  # noqa: BLE001
             logger.exception('warm-up of project %s failed', pid)
@@ -3269,6 +3270,8 @@ def digest_overview(db, pid, today=None):
     """Сводка для дайджеста: статусы эпиков (project_overview) и «Выводы» проекта (project_insights)."""
     ov = project_overview(db, pid, today)
     ov['insights'] = project_insights(db, pid, ov['date'])['summary']
+    weeks = insight_changes(db, pid, 1, ov['date'])['weeks']
+    ov['changes'] = weeks[0]['items'][:6] if weeks else []
     return ov
 
 
@@ -3295,12 +3298,22 @@ def _autofill_state(db, pid):
 def project_insights(db, pid, today=None):
     """«Выводы» по проекту (insights.py): эпики и этапы с драйверами прогноза и сводка для руководителя.
     Учитываются несданные эпики; today — дата, относительно которой оценивается свежесть данных и прошедшие цели.
-    Результат кэшируется до изменения данных проекта или наступления нового дня."""
-    today = today or datetime.now().date().isoformat()
-    return cached_result('insights', (pid, today), project_version(db, pid), lambda: _project_insights(db, pid, today))
+    Результат кэшируется до изменения данных проекта или наступления нового дня; выводы на сегодня сохраняются
+    снимком для ленты изменений."""
+    real_today = datetime.now().date().isoformat()
+    today = today or real_today
+
+    def compute():
+        data = _project_insights(db, pid, today)
+        if today == real_today:
+            store_insight_snapshot(pid, today, ins.insight_state(data), 'live')
+        return data
+    return cached_result('insights', (pid, today), project_version(db, pid), compute)
 
 
-def _project_insights(db, pid, today=None):
+def _project_insights(db, pid, today=None, as_of=None):
+    """as_of — выводы «как на дату»: только замеры и срезы Jira до этой даты (для прошлых недель ленты изменений);
+    без Монте-Карло — статусы и прогнозы те же, шанс успеть есть только в сохранённых снимках."""
     project = db.execute('SELECT * FROM projects WHERE id = ?', (pid,)).fetchone()
     settings = project_settings(db, pid)
     today = today or datetime.now().date().isoformat()
@@ -3308,11 +3321,16 @@ def _project_insights(db, pid, today=None):
                           'ORDER BY sort_order, id', (pid,)).fetchall()
     rows = project_rows(db, pid, services)
     history, latest = jira_composition(db, pid)
+    if as_of:
+        rows = {sid: [r for r in items if r['date'] <= as_of] for sid, items in rows.items()}
+        history = {sid: [p for p in pts if p['date'] <= as_of] for sid, pts in history.items()}
+        history = {sid: pts for sid, pts in history.items() if pts}
+        latest = {sid: dict(pts[-1], problems={}, problemIssues=0) for sid, pts in history.items()}
     epics, by_id, groups = [], {}, {}
     for s in services:
         e = ins.epic_insight({'id': s['id'], 'name': s['name'], 'etap': s['etap'], 'stage': stage_key(s),
                               'target': s['target_date'] or None}, rows[s['id']], settings, today,
-                             history.get(s['id']), latest.get(s['id']))
+                             history.get(s['id']), latest.get(s['id']), with_mc=not as_of)
         epics.append(e)
         by_id[s['id']] = e
         groups.setdefault(stage_key(s), []).append(s['id'])
@@ -3326,14 +3344,105 @@ def _project_insights(db, pid, today=None):
     for name, ids in groups.items():
         dates, series = fc.aggregate_series([rows[i] for i in ids])
         stages.append(ins.stage_insight(name, stage_targets.get(name) or None, [by_id[i] for i in ids], dates, series,
-                                        settings, today, scope_of(ids)))
+                                        settings, today, scope_of(ids), with_mc=not as_of))
     dates, series = fc.aggregate_series([rows[s['id']] for s in services])
     project_drv = ins.series_drivers(dates, series['remaining'], series['estimate'], None, settings, today,
                                      scope_of([s['id'] for s in services]), with_mc=False)
-    summary = ins.project_summary(project_drv, epics, stages, settings, _autofill_state(db, pid))
+    summary = ins.project_summary(project_drv, epics, stages, settings, () if as_of else _autofill_state(db, pid))
     return {'project': {'id': project['id'], 'name': project['name']}, 'date': today,
             'settings': {k: settings[k] for k in ('units', 'hoursPerDay', 'workdays', 'rangeConfidence', 'insightWindowDays')},
             'summary': summary, 'epics': epics, 'stages': stages}
+
+
+# ─── Лента изменений выводов ─────────────────────────────────────
+# Выводы на сегодня сохраняются снимком (insight_snapshots) при каждом пересчёте и раз в день планировщиком.
+# Неделя ленты — сравнение снимков на её начало и конец; для дат, когда снимков ещё не было (до обновления
+# до 1.9.0), выводы восстанавливаются по замерам на дату и тоже сохраняются.
+
+CHANGES_WEEKS = 8
+SNAPSHOT_TOLERANCE_DAYS = 3  # снимок за 1–3 дня до границы недели годится вместо снимка на саму дату
+
+
+def store_insight_snapshot(pid, day, state, source):
+    try:
+        conn = _mc_connection()
+        conn.execute('INSERT OR REPLACE INTO insight_snapshots (project_id, snap_date, state, source, created_at) '
+                     'VALUES (?, ?, ?, ?, ?)', (pid, day, json.dumps(state, ensure_ascii=False), source, _utc_now_iso()))
+        conn.commit()
+    except sqlite3.Error:  # база занята — снимок сохранится при следующем пересчёте
+        pass
+
+
+def insight_state_on(db, pid, day):
+    """Снимок выводов на дату: сохранённый (не раньше чем за SNAPSHOT_TOLERANCE_DAYS) или восстановленный по замерам."""
+    since = (datetime.strptime(day, '%Y-%m-%d').date() - timedelta(days=SNAPSHOT_TOLERANCE_DAYS)).isoformat()
+    row = db.execute('SELECT state FROM insight_snapshots WHERE project_id = ? AND snap_date <= ? AND snap_date >= ? '
+                     'ORDER BY snap_date DESC LIMIT 1', (pid, day, since)).fetchone()
+    if row:
+        try:
+            return json.loads(row['state'])
+        except ValueError:
+            pass
+    state = ins.insight_state(_project_insights(db, pid, today=day, as_of=day))
+    store_insight_snapshot(pid, day, state, 'backfill')
+    return state
+
+
+def _has_measurements(state):
+    return any(e.get('remaining') is not None for e in state['epics'].values())
+
+
+def insight_changes(db, pid, weeks=CHANGES_WEEKS, today=None):
+    """Лента изменений выводов по неделям (от последней): {'weeks': [{'from', 'to', 'items'}]}. Недели до
+    первых замеров проекта не показываются."""
+    today = today or datetime.now().date().isoformat()
+
+    def compute():
+        settings = project_settings(db, pid)
+        states = [ins.insight_state(project_insights(db, pid, today))]
+        out = []
+        day = datetime.strptime(today, '%Y-%m-%d').date()
+        for k in range(1, weeks + 1):
+            old = insight_state_on(db, pid, (day - timedelta(days=7 * k)).isoformat())
+            if not _has_measurements(old) and k > 1:
+                break
+            out.append({'from': old['date'], 'to': states[-1]['date'],
+                        'items': ins.state_changes(old, states[-1], settings)})
+            states.append(old)
+            if not _has_measurements(old):
+                break
+        return {'weeks': out, 'date': today}
+    return cached_result('changes', (pid, today, weeks), project_version(db, pid), compute)
+
+
+def record_daily_insights():
+    """Раз в день — снимок выводов каждого проекта, даже если его никто не открывал (для ленты изменений)."""
+    db = get_db()
+    today = datetime.now().date().isoformat()
+    done = 0
+    for row in db.execute("SELECT id FROM projects WHERE id NOT IN (SELECT project_id FROM insight_snapshots "
+                          "WHERE snap_date = ? AND source = 'live')", (today,)).fetchall():
+        try:
+            project_insights(db, row['id'])
+            done += 1
+        except Exception:  # noqa: BLE001 — один проект не мешает остальным
+            logger.exception('daily insights of project %s failed', row['id'])
+    return done
+
+
+@app.route('/api/projects/<int:pid>/insights/changes')
+@login_required
+def api_insight_changes(pid):
+    if not can_view_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет доступа к проекту'}), 403
+    db = get_db()
+    if not db.execute('SELECT 1 FROM projects WHERE id = ?', (pid,)).fetchone():
+        return jsonify({'error': 'Проект не найден'}), 404
+    try:
+        weeks = min(max(int(request.args.get('weeks', CHANGES_WEEKS)), 1), 26)
+    except ValueError:
+        weeks = CHANGES_WEEKS
+    return versioned_json(f'changes{weeks}', pid, lambda: insight_changes(db, pid, weeks))
 
 
 @app.route('/api/projects/<int:pid>/insights')
@@ -3421,10 +3530,12 @@ def render_digest(ov, prev, public_url):
         return f"{f['subject']}: " if f.get('subject') else ''
     top = (summary or {}).get('top', [])[:5]
     health = (summary or {}).get('health', [])[:3]
+    week = ov.get('changes') or []  # что изменилось в выводах за неделю (лента изменений)
     lines = [subject, head, '']
     if summary:
         lines += ['Главное: ' + summary['headline']]
         lines += [f"• {subject_of(f)}{f['text']}" for f in top]
+        lines += (['За неделю:'] + [f"• {subject_of(f)}{f['text']}" for f in week]) if week else []
         lines += (['Данные:'] + [f"• {f['text']}" for f in health]) if health else []
         lines += ['']
     for e in ov['epics']:
@@ -3469,6 +3580,8 @@ def render_digest(ov, prev, public_url):
             "padding:10px 14px;margin:0 0 14px'>"
             f"<div style='font-weight:600;font-size:15px;margin-bottom:6px'>{esc(summary['headline'])}</div>"
             + (f"<ul style='margin:0;padding-left:0;list-style:none;font-size:13px'>{''.join(li(f) for f in top)}</ul>" if top else '')
+            + (f"<div style='font-size:12px;color:#5c6470;margin-top:6px'>За неделю:</div><ul style='margin:0;padding-left:0;"
+               f"list-style:none;font-size:13px'>{''.join(li(f) for f in week)}</ul>" if week else '')
             + (f"<div style='font-size:12px;color:#5c6470;margin-top:6px'>Данные:</div><ul style='margin:0;padding-left:0;"
                f"list-style:none;font-size:12px'>{''.join(li(f) for f in health)}</ul>" if health else '')
             + '</div>')
@@ -3491,7 +3604,10 @@ def render_digest(ov, prev, public_url):
     sev_icons = {'danger': '⛔', 'risk': '⚠️', 'info': 'ℹ️', 'ok': '✅'}
     if summary:
         tg += [f"<b>{esc(summary['headline'])}</b>"] + [
-            f"{sev_icons[f['severity']]} {esc(subject_of(f))}{esc(f['text'])}" for f in top[:3]] + ['']
+            f"{sev_icons[f['severity']]} {esc(subject_of(f))}{esc(f['text'])}" for f in top[:3]]
+        if week:
+            tg += ['<i>За неделю:</i>'] + [f"{sev_icons[f['severity']]} {esc(subject_of(f))}{esc(f['text'])}" for f in week[:3]]
+        tg += ['']
     icons = {'ok': '✅', 'risk': '⚠️', 'danger': '⛔', 'notarget': '◽', 'unknown': '◽'}
     for e in ov['epics']:
         ch = change(e)
@@ -4068,6 +4184,7 @@ def _scheduler_loop():
                 mark_scheduler_tick()
                 run_due_schedules()
                 run_notifications()
+                record_daily_insights()
         except Exception:  # noqa: BLE001
             logger.exception('scheduler tick failed')
 

@@ -291,6 +291,10 @@ def create_indexes(conn):
     conn.execute('CREATE TABLE IF NOT EXISTS mc_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at TEXT)')
     conn.execute('CREATE TABLE IF NOT EXISTS result_cache (kind TEXT NOT NULL, key TEXT NOT NULL, version TEXT NOT NULL, '
                  'value TEXT NOT NULL, created_at TEXT, PRIMARY KEY (kind, key))')
+    # 1.9.0: ежедневные снимки выводов — лента «что изменилось за неделю»
+    conn.execute('CREATE TABLE IF NOT EXISTS insight_snapshots (project_id INTEGER NOT NULL, snap_date TEXT NOT NULL, '
+                 "state TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'live', created_at TEXT, "
+                 'PRIMARY KEY (project_id, snap_date), FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE)')
 
 
 def init_db():

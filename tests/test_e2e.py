@@ -1355,6 +1355,23 @@ def test_insights_panel_links_to_epic(admin_ui):
     assert page.locator('#insightsBody .insight-epic[open] .insight').count() >= 1
 
 
+def test_weekly_changes_block_and_feed(ui, flask_app):
+    """«Что изменилось за неделю» в «Выводах»: изменения последней недели со ссылкой на эпик и лента по неделям."""
+    from test_changes import recent_measurements
+    recent_measurements(flask_app, [500, 450, 400, 350, 300, 300, 300])
+    admin_ui = ui.login(*ADMIN)
+    page = admin_ui.page
+    page.wait_for_selector('#insightChanges .insight-list')
+    assert 'Что изменилось за неделю' in admin_ui.text('#insightChanges')
+    assert page.locator('#insightChanges .insight-changes-period').count() == 1
+    assert page.locator('#insightChanges > .insight-list .insight').count() >= 1
+    page.click('#insightChanges .insight-feed > summary')
+    assert page.locator('#insightChanges .insight-feed-week').count() >= 1
+    link = page.locator('#insightChanges .insight-subject[data-level="epic"]').first
+    link.click()
+    page.wait_for_function('document.getElementById("chartServiceSelect").value === "1"')
+
+
 def test_stage_insights_open_epic(admin_ui):
     page = admin_ui.page
     admin_ui.go('stages')

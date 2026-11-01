@@ -2101,7 +2101,10 @@ function renderDashboard(){
    Выводы: проект → этапы → эпики (расчёт на сервере, insights.py) и портфель проектов
 ════════════════════════════════════════════════════════════════ */
 var insightsCache = {pid: null, data: null, promise: null, stamp: 0};
-function invalidateInsights(){ insightsCache.pid = null; insightsCache.data = null; insightsCache.promise = null; insightsCache.stamp++; }
+function invalidateInsights(){
+  insightsCache.pid = null; insightsCache.data = null; insightsCache.promise = null; insightsCache.stamp++;
+  if(typeof changesCache !== 'undefined') changesCache = {pid: null, data: null};
+}
 function loadInsights(){
   var pid = currentProjectId;
   if(!pid) return Promise.resolve(null);
@@ -2121,6 +2124,8 @@ function findingHtml(f, withSubject){
   if(withSubject && f.subject && f.ref){
     subject = '<button type="button" class="insight-subject" data-level="' + f.ref.level + '" data-ref="' +
       escapeAttr(f.ref.level === 'epic' ? f.ref.id : f.ref.name) + '">' + escapeHtml(f.subject) + '</button> ';
+  } else if(withSubject && f.subject){
+    subject = '<b class="insight-subject-plain">' + escapeHtml(f.subject) + '</b> ';  /* эпик уже не в работе — без ссылки */
   }
   return '<li class="insight insight-' + f.severity + '"><span class="insight-dot" aria-hidden="true"></span>' +
     '<span class="sr-only">' + SEVERITY_LABELS[f.severity] + ': </span><span class="insight-text">' + subject + escapeHtml(f.text) + '</span></li>';
@@ -2161,11 +2166,68 @@ function insightsHtml(d){
     findingsList(s.top, true, 'Рисков по срокам не видно.') + '</div><div>';
   if(s.wins.length) html += '<div class="insight-col-title">Хорошие новости</div>' + findingsList(s.wins, true);
   html += '<div class="insight-col-title">Данные</div>' + findingsList(s.health, false, 'Замеры свежие, цели заданы, ошибок автозаполнения нет.') + '</div></div>';
+  html += '<div class="insight-changes" id="insightChanges"><div class="insight-col-title">Что изменилось за неделю</div>' +
+    '<p class="insight-empty">Сравниваем с прошлой неделей…</p></div>';
   if(d.stages.length){
     html += '<details class="insight-details"><summary>Подробно по этапам и эпикам</summary>' +
       d.stages.map(function(st, i){ return stageDetailHtml(st, stageEpics(d, st), i); }).join('') + '</details>';
   }
   return html;
+}
+/* «Что изменилось за неделю» и лента по неделям: сравнение ежедневных снимков выводов (insight_changes на сервере) */
+var changesCache = {pid: null, data: null};
+var CHANGES_SHOWN = 6;
+function loadInsightChanges(){
+  var pid = currentProjectId;
+  if(changesCache.pid === pid && changesCache.data) return Promise.resolve(changesCache.data);
+  return api('/api/projects/' + pid + '/insights/changes').then(function(d){
+    if(pid === currentProjectId) changesCache = {pid: pid, data: d};
+    return d;
+  });
+}
+function plural(n, one, few, many){
+  n = Math.abs(Math.trunc(n));
+  if(n % 10 === 1 && n % 100 !== 11) return one;
+  return (n % 10 >= 2 && n % 10 <= 4 && !(n % 100 >= 12 && n % 100 <= 14)) ? few : many;
+}
+/* первые CHANGES_SHOWN изменений сразу, остальные — под «Ещё N» */
+function changesListHtml(items, empty){
+  var html = findingsList(items.slice(0, CHANGES_SHOWN), true, empty);
+  if(items.length > CHANGES_SHOWN){
+    html += '<details class="insight-more"><summary>Ещё ' + (items.length - CHANGES_SHOWN) + '</summary>' +
+      findingsList(items.slice(CHANGES_SHOWN), true) + '</details>';
+  }
+  return html;
+}
+function changesWeekTitle(w){ return fmtDate(w.from) + ' — ' + fmtDate(w.to); }
+function insightChangesHtml(d){
+  var weeks = d.weeks || [];
+  var html = '<div class="insight-col-title">Что изменилось за неделю' + (weeks.length ? ' <span class="insight-changes-period">' +
+    changesWeekTitle(weeks[0]) + '</span>' : '') + '</div>';
+  if(!weeks.length) return html + '<p class="insight-empty">Сравнивать пока не с чем: замеры появились меньше недели назад.</p>';
+  html += changesListHtml(weeks[0].items, 'Существенных изменений в статусах и прогнозах нет.');
+  if(weeks.length > 1){
+    html += '<details class="insight-feed"><summary>Лента изменений по неделям</summary>' + weeks.slice(1).map(function(w){
+      return '<div class="insight-feed-week"><div class="insight-feed-title">' + changesWeekTitle(w) + '<span class="insight-feed-count">' +
+        (w.items.length ? w.items.length + ' ' + plural(w.items.length, 'изменение', 'изменения', 'изменений') : 'без изменений') +
+        '</span></div>' + changesListHtml(w.items) + '</div>';
+    }).join('') + '</details>';
+  }
+  return html;
+}
+function renderInsightChanges(){
+  var box = document.getElementById('insightChanges');
+  if(!box) return;
+  var pid = currentProjectId;
+  loadInsightChanges().then(function(d){
+    var el = document.getElementById('insightChanges');
+    if(!el || pid !== currentProjectId) return;
+    el.innerHTML = insightChangesHtml(d);
+    bindInsightLinks(el);
+  }).catch(function(){
+    var el = document.getElementById('insightChanges');
+    if(el) el.innerHTML = '<div class="insight-col-title">Что изменилось за неделю</div><p class="insight-empty">Не удалось загрузить изменения.</p>';
+  });
 }
 function bindInsightLinks(root){
   root.querySelectorAll('.insight-subject').forEach(function(btn){
@@ -2219,6 +2281,7 @@ function renderInsightsPanel(){
     body.classList.remove('insight-loading');
     body.innerHTML = insightsHtml(d);
     bindInsightLinks(body);
+    renderInsightChanges();
     body.querySelectorAll('.insight-epic').forEach(function(det){
       det.querySelector('summary').addEventListener('dblclick', function(){ showEpicOnDashboard(parseInt(det.dataset.epic, 10)); });
     });

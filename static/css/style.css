@@ -662,6 +662,16 @@ table.jira-map-table{min-width:560px;}
 .insight-subject{font:inherit;font-weight:600;color:var(--color-primary);background:none;border:0;padding:0;cursor:pointer;text-align:left;}
 .insight-subject:hover{text-decoration:underline;}
 .insight-details{margin-top:var(--space-4);border-top:1px solid var(--color-divider);padding-top:var(--space-3);}
+/* «Что изменилось за неделю» и лента по неделям */
+.insight-changes{margin-top:var(--space-4);border-top:1px solid var(--color-divider);padding-top:var(--space-3);}
+.insight-changes-period{font-weight:400;text-transform:none;letter-spacing:0;margin-left:var(--space-2);}
+.insight-subject-plain{font-weight:600;}
+.insight-more{margin-top:var(--space-1);}
+.insight-more > summary, .insight-feed > summary{cursor:pointer;color:var(--color-primary);font-size:var(--text-sm);}
+.insight-feed{margin-top:var(--space-3);}
+.insight-feed-week{margin-top:var(--space-3);padding-left:var(--space-3);border-left:2px solid var(--color-divider);}
+.insight-feed-title{font-size:var(--text-sm);font-weight:600;margin-bottom:var(--space-1);display:flex;flex-wrap:wrap;gap:var(--space-2);align-items:baseline;}
+.insight-feed-count{font-weight:400;color:var(--color-text-muted);font-size:var(--text-xs);}
 .insight-details > summary{cursor:pointer;font-weight:600;color:var(--color-primary);}
 .insight-stage{padding:var(--space-3) 0;border-bottom:1px solid var(--color-divider);scroll-margin-top:var(--space-4);border-radius:var(--radius-sm);transition:background var(--transition-interactive);}
 .insight-stage:last-child{border-bottom:0;}
@@ -695,7 +705,7 @@ table.jira-map-table{min-width:560px;}
 .setting-wide{grid-column:1/-1;}
 .setting-item textarea{width:100%;font:inherit;font-size:var(--text-sm);resize:vertical;}
 .settings-grid > .settings-divider:first-child{border-top:0;padding-top:0;}
-@media print{ .view-blocks-btn{display:none;} .insight-details:not([open]) > :not(summary){display:block;} }
+@media print{ .view-blocks-btn{display:none;} .insight-details:not([open]) > :not(summary), .insight-more:not([open]) > :not(summary){display:block;} }
 textarea:disabled{opacity:0.55;cursor:not-allowed;}
 .setting-item .checkbox-row input,.blocks-list input{width:auto;flex:0 0 auto;}
 .insight-loading{opacity:.5;transition:opacity var(--transition-interactive);}
