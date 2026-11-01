@@ -3144,7 +3144,7 @@ function editorFromAttribute(spec){
 /* Фильтр доски Structure у кнопки — для колонок «После фильтрации» (After filtering) */
 function boardFilterHtml(bf){
   var mode = bf ? bf.mode : 'none';
-  return '<details class="jb-board-filter"'+(bf ? ' open' : '')+'><summary>Фильтр доски Structure <span class="muted-cell">— для колонок «После фильтрации»</span></summary>'+
+  return '<details class="jb-board-filter" id="jbBoardFilterBox"'+(bf ? ' open' : '')+'><summary>Фильтр доски Structure <span class="muted-cell">— для колонок «После фильтрации»</span></summary>'+
     '<div class="setting-hint">Если на доске Structure включён фильтр и у колонок отмечено «After filtering», укажите здесь тот же фильтр: такие колонки Burndown посчитает только по видимым с ним задачам.</div>'+
     '<div class="seg-filter" role="radiogroup">'+[['none', 'Без фильтра'], ['jql', 'JQL'], ['json', 'Трансформации из Structure (JSON)']].map(function(x){
       return '<label class="checkbox-row"><input type="radio" name="jbBfMode" value="'+x[0]+'"'+(mode === x[0] ? ' checked' : '')+'> '+x[1]+'</label>';
@@ -3170,6 +3170,86 @@ function bindBoardFilter(){
       document.getElementById('jbBfJson').hidden = mode !== 'json';
     });
   });
+}
+/* Раздел структуры у кнопки: если эпик стоит в структуре несколько раз, строка берётся из отмеченных разделов */
+function scopeHtml(scope){
+  var list = scope || [];
+  return '<details class="jb-board-filter" id="jbScopeBox"'+(list.length ? ' open' : '')+'><summary>Раздел структуры <span class="muted-cell">— если эпик стоит в структуре несколько раз</span></summary>'+
+    '<div class="setting-hint">Одна и та же задача может стоять в структуре в нескольких местах, и под каждой строкой у неё своё поддерево и свои суммы. Отметьте разделы, где вы смотрите цифры на доске (например, «4.1», «4.2», «4.3»): строка эпика берётся из них. Без отметок берётся первая строка в структуре.</div>'+
+    '<div id="jbScopeList" class="jb-scope-list">'+list.map(function(x){ return scopeItemHtml(x.item, x.title, 0, true); }).join('')+'</div>'+
+    '<div class="form-actions"><button type="button" class="btn btn-ghost btn-sm" id="jbScopeLoad">Загрузить разделы</button></div></details>';
+}
+function scopeItemHtml(item, title, depth, checked, note){
+  return '<label class="checkbox-row jb-scope-item" style="padding-left:'+(depth * 1.25)+'rem"><input type="checkbox" data-scope-item="'+escapeAttr(item)+'" data-scope-title="'+escapeAttr(title || '')+'"'+(checked ? ' checked' : '')+'> '+
+    escapeHtml(title || item)+(note ? ' <span class="muted-cell">'+escapeHtml(note)+'</span>' : '')+'</label>';
+}
+function readScope(){
+  var out = [], seen = {};
+  document.querySelectorAll('#jbScopeList [data-scope-item]:checked').forEach(function(el){
+    if(seen[el.dataset.scopeItem]) return;
+    seen[el.dataset.scopeItem] = true;
+    out.push({item: el.dataset.scopeItem, title: el.dataset.scopeTitle});
+  });
+  return out.length ? out : null;
+}
+function bindScope(structureId){
+  var btn = document.getElementById('jbScopeLoad');
+  btn.addEventListener('click', function(){
+    var sid = structureId();
+    if(!sid){ toast('Сначала выберите структуру'); return; }
+    var chosen = {};
+    (readScope() || []).forEach(function(x){ chosen[x.item] = true; });
+    btn.disabled = true;
+    api('/api/projects/'+currentProjectId+'/jira/structure-sections?structureId='+encodeURIComponent(sid)).then(function(list){
+      document.getElementById('jbScopeList').innerHTML = list.length ? list.map(function(x){
+        return scopeItemHtml(x.item, x.title, x.depth, chosen[x.item], 'строк: ' + x.rows);
+      }).join('') : '<p class="insight-empty">В структуре нет разделов с вложенными строками.</p>';
+      toast('Разделов загружено: ' + list.length);
+    }).catch(function(){}).then(function(){ btn.disabled = false; });
+  });
+}
+/* Сверка: все места эпика в структуре и значение колонки у каждой строки */
+function placesHtml(values, hours){
+  var multi = values.filter(function(v){ return v.places && v.places.length > 1; });
+  if(!multi.length) return '';
+  return '<div class="jb-places"><div class="field-label">Задача стоит в структуре несколько раз — у каждой строки своё поддерево</div>'+multi.map(function(v){
+    return '<div class="jb-places-item"><span class="mono">'+escapeHtml(v.key)+'</span><ul>'+v.places.map(function(p){
+      return '<li'+(p.chosen ? ' class="jb-place-chosen"' : '')+'>'+escapeHtml(p.path.filter(Boolean).join(' → ') || 'верхний уровень')+
+        ' — '+hours(typeof p.raw === 'number' ? p.raw : null)+(p.chosen ? ' <b>(взята)</b>' : '')+'</li>';
+    }).join('')+'</ul></div>';
+  }).join('')+'<div class="setting-hint">Если на доске другое число — отметьте у кнопки нужный «Раздел структуры».</div></div>';
+}
+/* Сверка: значения переменных формулы у выбранной строки — видно, какое поле Structure не отдаёт */
+function varsHtml(values, editor, k){
+  if(!editor || !values.some(function(v){ return v.vars; })) return '';
+  var names = Object.keys(values[0].vars || {});
+  if(!names.length) return '';
+  var vars = editor.mode === 'field' ? {value: {field: editor.field, format: editor.format}} : editor.variables;
+  var show = function(name, x){
+    if(x === null || x === undefined || x === '') return '<span class="muted-cell">пусто</span>';
+    var fmt = (vars[name] || {}).format;
+    if(fmt === 'duration' && typeof x === 'number') return fmtNum(Math.round(x * k * 100) / 100) + ' ч';
+    return escapeHtml(String(x));
+  };
+  return '<div class="table-scroll"><table class="data-table compact-table jb-str-check"><thead><tr><th>Переменная</th><th>Поле</th>'+
+    values.map(function(v){ return '<th class="num">'+escapeHtml(v.key)+'</th>'; }).join('')+'</tr></thead><tbody>'+names.map(function(n){
+      var f = formulaFieldById((vars[n] || {}).field);
+      return '<tr><td class="mono">'+escapeHtml(n)+'</td><td>'+escapeHtml(f ? f.name : (vars[n] || {}).field || '')+'</td>'+
+        values.map(function(v){ return '<td class="num">'+show(n, (v.vars || {})[n])+'</td>'; }).join('')+'</tr>';
+    }).join('')+'</tbody></table></div><div class="setting-hint">Значения переменных у строки эпика (без суммы по вложенным). Пусто — Structure не отдаёт это поле: выберите другое поле или формат.</div>';
+}
+function downloadJson(name, data){
+  var blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 0);
+}
+function APP_VERSION_TEXT(){
+  var el = document.getElementById('btnVersions');
+  return el ? el.textContent.trim() : '';
 }
 function describeAttribute(spec){
   if(!spec) return '';
@@ -3262,6 +3342,7 @@ function openJiraButtonEditor(button){
           '<button type="button" class="btn btn-ghost btn-sm" id="jbLoadStructures">Загрузить из Jira</button></div>'+
           '<input type="number" id="jbStructureId" min="1" placeholder="ID структуры" hidden></div>'+
       '</div>'+
+      scopeHtml(b.structureScope)+
       boardFilterHtml(b.boardFilter)+
       '<div class="jira-fields"><div class="jira-fields-head"><span class="field-label">Откуда брать показатели замера</span>'+
         '<button type="button" class="btn btn-ghost btn-sm" id="jbLoadFields">Загрузить поля из Jira</button></div>'+
@@ -3316,7 +3397,8 @@ function openJiraButtonEditor(button){
         fm[m[0]] = {field: document.getElementById('jbField_'+m[0]).value, unit: document.getElementById('jbUnit_'+m[0]).value, structure: structure};
       });
       var body = {name: document.getElementById('jbName').value.trim(), structureId: structureId,
-                  structureName: structureName, mappings: mappings, fieldMap: fm, boardFilter: readBoardFilter()};
+                  structureName: structureName, mappings: mappings, fieldMap: fm, boardFilter: readBoardFilter(),
+                  structureScope: readScope()};
       if(!body.name){ toast('Укажите название кнопки'); return false; }
       if(missing){ toast('Выберите колонку Structure для показателя «' + missing + '»'); return false; }
       if(!structureId && JIRA_METRICS.some(function(m){ return fm[m[0]].structure; })){ toast('Колонки Structure можно выбрать только у кнопки со структурой'); return false; }
@@ -3348,6 +3430,7 @@ function openJiraButtonEditor(button){
     });
   });
   bindBoardFilter();
+  bindScope(function(){ return editorStructureId(); });
   var strSpecs = {};
   JIRA_METRICS.forEach(function(m){
     var st = (fieldMap[m[0]] || {}).structure;
@@ -3491,7 +3574,8 @@ function openJiraButtonEditor(button){
       var box = document.getElementById('jbStrPreview');
       var unit = document.getElementById('jbStrUnit_'+metric).value;
       box.innerHTML = '<p class="insight-empty">Запрашиваем значения у Structure…</p>';
-      var body = {structureId: editorStructureId(), unit: unit, keys: editorKeys(), afterFiltering: spec.afterFiltering, boardFilter: readBoardFilter()};
+      var body = {structureId: editorStructureId(), unit: unit, keys: editorKeys(), afterFiltering: spec.afterFiltering, boardFilter: readBoardFilter(),
+                  structureScope: readScope()};
       if(spec.editor) body.editor = spec.editor; else body.attribute = spec.attribute;
       apiPost('/api/projects/'+currentProjectId+'/jira/structure-preview', body).then(function(r){
         var render = function(){
@@ -3515,7 +3599,13 @@ function openJiraButtonEditor(button){
             }).join('')+'</div>'+
             (hasVariants ? '<p class="setting-hint">Сверка: сравните с колонкой в Structure. Совпало с «Σ с дубликатами» — снимите «Исключать дубликаты» (или отметьте его в Structure); совпало с «С фильтром доски» — отметьте «После фильтрации»; на доске меньше всех вариантов — укажите у кнопки тот же фильтр, что включён на доске.</p>' : '') : '')+
             (r.warnings.length ? '<ul class="plan-list">'+r.warnings.map(function(w){ return '<li>'+escapeHtml(w)+'</li>'; }).join('')+'</ul>' : '')+
-            (r.attribute ? '<details class="jb-str-spec"><summary>Что отправляется в Structure</summary><pre class="mono">'+escapeHtml(JSON.stringify(r.attribute, null, 2))+'</pre></details>' : '');
+            placesHtml(r.values, hours)+varsHtml(r.values, spec.editor, k)+
+            (r.attribute ? '<details class="jb-str-spec"><summary>Что отправляется в Structure</summary><pre class="mono">'+escapeHtml(JSON.stringify(r.attribute, null, 2))+'</pre></details>' : '')+
+            '<div class="form-actions jb-diag"><button type="button" class="btn btn-ghost btn-sm" data-diag>Скачать диагностику</button>'+
+            '<span class="setting-hint">файл со всеми значениями и запросом к Structure — пришлите его, если цифры не сходятся</span></div>';
+          box.querySelector('[data-diag]').addEventListener('click', function(){
+            downloadJson('burndown-structure-diagnostics.json', {generatedAt: new Date().toISOString(), version: APP_VERSION_TEXT(), request: body, response: r});
+          });
           box.querySelectorAll('[data-unit]').forEach(function(b){
             b.addEventListener('click', function(){ document.getElementById('jbStrUnit_'+metric).value = b.dataset.unit; render(); });
           });

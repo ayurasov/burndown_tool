@@ -154,6 +154,99 @@ def parse_forest_rows(formula):
     return rows
 
 
+def parse_forest_items(formula):
+    """Формула Structure → [(rowId, depth, issueId|None, элемент)]; элемент — как в формуле: «12345» у задачи,
+    «тип/ID» у папки и прочих элементов. По элементам выбираются разделы структуры."""
+    rows = []
+    for part in (formula or '').split(','):
+        pieces = part.split(':')
+        if len(pieces) < 3:
+            continue
+        try:
+            row_id, depth = int(pieces[0]), int(pieces[1])
+        except ValueError:
+            continue
+        rows.append((row_id, depth, int(pieces[2]) if pieces[2].isdigit() else None, pieces[2]))
+    return rows
+
+
+def issue_occurrences(items):
+    """Все места задач в структуре → {issueId: [{'row', 'depth', 'path': [элементы предков], 'pathRows'}]}.
+    Одна и та же задача может стоять в структуре несколько раз, и под каждой строкой у неё своё поддерево."""
+    stack, out = [], {}
+    for row_id, depth, issue_id, item in items:
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        if issue_id is not None:
+            out.setdefault(issue_id, []).append({'row': row_id, 'depth': depth, 'path': [x[2] for x in stack],
+                                                 'pathRows': [x[1] for x in stack]})
+        stack.append((depth, row_id, item))
+    return out
+
+
+def pick_occurrence(occurrences, scope=None):
+    """Строка задачи для расчёта: первая в выбранных разделах структуры (scope — элементы разделов), без разделов —
+    первая в структуре. → (место | None, найдено ли в разделах)."""
+    if not occurrences:
+        return None, False
+    if scope:
+        for occ in occurrences:
+            if scope & set(occ['path']):
+                return occ, True
+        return occurrences[0], False
+    return occurrences[0], True
+
+
+def occurrence_warning(key, occurrences, picked, in_scope, scope):
+    """Предупреждение о задаче, которая стоит в структуре несколько раз (или не найдена в выбранных разделах)."""
+    if scope and not in_scope:
+        return f'{key}: в выбранных разделах структуры задачи нет — взята первая строка в структуре'
+    if len(occurrences) > 1 and not scope:
+        return (f'{key}: задача стоит в структуре {len(occurrences)} раз(а) — взята первая строка; чтобы взять строку из '
+                'нужного раздела, отметьте его у кнопки («Раздел структуры»)')
+    return None
+
+
+def subtree_issues_at(items, row_id):
+    """ID задач в поддереве строки row_id (включая её саму)."""
+    out, depth = set(), None
+    for rid, d, issue_id, _item in items:
+        if depth is None:
+            if rid == row_id:
+                depth = d
+                if issue_id is not None:
+                    out.add(issue_id)
+            continue
+        if d <= depth:
+            break
+        if issue_id is not None:
+            out.add(issue_id)
+    return out
+
+
+SCOPE_ITEM_RE = re.compile(r'^[^,:]{1,300}$')
+
+
+def normalize_scope(raw):
+    """Разделы структуры у кнопки: [{'item', 'title'}] (до 50) или None."""
+    if not raw:
+        return None
+    if not isinstance(raw, list) or len(raw) > 50:
+        raise ValueError('Разделы структуры — список (не больше 50)')
+    out = []
+    for x in raw:
+        item = x.get('item') if isinstance(x, dict) else x
+        if not isinstance(item, str) or not SCOPE_ITEM_RE.match(item):
+            raise ValueError('Некорректный раздел структуры')
+        title = x.get('title') if isinstance(x, dict) and isinstance(x.get('title'), str) else ''
+        out.append({'item': item, 'title': title.strip()[:300]})
+    return out or None
+
+
+def scope_items(scope):
+    return {x['item'] for x in scope} if scope else None
+
+
 def parse_forest_formula(formula):
     """Формула Structure «rowId:depth:item[:semantic],…» → [(depth, issueId|None)].
 
@@ -174,24 +267,6 @@ def parse_forest_formula(formula):
         item = pieces[2]
         rows.append((depth, int(item) if item.isdigit() else None))
     return rows
-
-
-def subtree_issue_ids(rows, root_issue_id):
-    """ID задач в поддеревьях всех вхождений root_issue_id (включая сам корень); None — корня нет в структуре."""
-    found, ids = False, set()
-    i = 0
-    while i < len(rows):
-        depth, issue_id = rows[i]
-        if issue_id == root_issue_id:
-            found = True
-            ids.add(issue_id)
-            j = i + 1
-            while j < len(rows) and rows[j][0] > depth:
-                if rows[j][1] is not None:
-                    ids.add(rows[j][1])
-                j += 1
-        i += 1
-    return ids if found else None
 
 
 def seconds_to_hours(values):
@@ -622,18 +697,24 @@ class JiraClient:
         if key not in cache:
             data = self.json('POST', self.structure_api('forest/latest'), json=forest_spec(structure_id, transformations),
                              not_found=f'Структура {structure_id} не найдена или плагин Structure недоступен')
-            cache[key] = parse_forest_rows(str(data.get('formula') or ''))
-        return cache[key]
+            cache[key] = str(data.get('formula') or '')
+        return parse_forest_rows(cache[key])
+
+    def forest_items(self, structure_id, transformations=None):
+        """Строки структуры с элементами [(rowId, depth, issueId|None, элемент)] — для разделов и мест задач."""
+        self.forest(structure_id, transformations)
+        key = (structure_id, json.dumps(transformations, sort_keys=True) if transformations else '')
+        return parse_forest_items(self.__dict__['_forests'][key])
 
     def forest_rows(self, structure_id):
         return [(depth, issue_id) for _row, depth, issue_id in self.forest(structure_id)]
 
-    def structure_values(self, structure_id, rows, attributes, transformations=None):
+    def structure_values(self, structure_id, rows, attributes, transformations=None, keep_format=False):
         """Значения колонок Structure для строк структуры (Value API) → [{rowId: значение}] по порядку attributes.
         Формат значений — число: так Structure отдаёт значение колонки без оформления."""
         out = [dict() for _ in attributes]
         rows = sorted(set(rows))
-        specs = [dict(a, format='number') for a in attributes]
+        specs = [dict(a) if keep_format else dict(a, format='number') for a in attributes]
         for start in range(0, len(rows), 500):
             batch = rows[start:start + 500]
             data = self.json('POST', self.structure_api('value'), json={'requests': [
@@ -795,7 +876,7 @@ def _issue_fields(issue, key=None):
     return dict(issue.get('fields') or {}, __key=issue.get('key') or key)
 
 
-def collect_issues(client, structure_id, mappings, fields, changelog=False, progress=None):
+def collect_issues(client, structure_id, mappings, fields, changelog=False, progress=None, scope=None):
     """Состав задач кнопки: запросы к Jira идут пакетами на всю кнопку, а не по эпикам —
     задачи-корни одним поиском, дерево структуры один раз, вложенные задачи всех эпиков одним поиском.
 
@@ -830,15 +911,22 @@ def collect_issues(client, structure_id, mappings, fields, changelog=False, prog
     nested = [g for g in groups if g['subtree'] and g['roots']]
     if nested and structure_id:
         rows = client.forest_rows(structure_id)
+        items = client.forest_items(structure_id)
+        places = issue_occurrences(items)
+        wanted = scope_items(scope)
         parents = parent_issue_ids(rows)  # задачи, у которых в структуре есть вложенные
         for g in nested:
             g['need'] = set()
             for key, issue_id, _f in g['roots']:
-                ids = subtree_issue_ids(rows, issue_id)
-                if ids is None:
+                occ, in_scope = pick_occurrence(places.get(issue_id), wanted)
+                if occ is None:
                     g['warnings'].append(f'{key}: задачи нет в структуре — учтена только она сама')
-                else:
-                    g['need'] |= ids
+                    continue
+                # поддерево одной строки задачи (как на доске), а не всех её мест в структуре
+                g['need'] |= subtree_issues_at(items, occ['row'])
+                note = occurrence_warning(key, places[issue_id], occ, in_scope, wanted)
+                if note:
+                    g['warnings'].append(note)
         missing = set().union(*(g['need'] - set(g['issues']) for g in nested))
         fetched = dict(take(issue) for issue in client.issues_by_ids(missing, fields, changelog, progress)) if missing else {}
         for g in nested:
@@ -883,7 +971,7 @@ def _snapshot_item(group, field_map):
     return dict(serviceId=group['serviceId'], issueCount=len(group['issues']), warnings=warnings, issues=issues, **values)
 
 
-def compute_snapshot(client, structure_id, mappings, field_map=None, transformations=None):
+def compute_snapshot(client, structure_id, mappings, field_map=None, transformations=None, scope=None):
     """Срез для кнопки.
 
     mappings: [{'serviceId', 'issueKeys': 'ABC-1, ABC-2', 'includeSubtree': bool}]
@@ -892,11 +980,11 @@ def compute_snapshot(client, structure_id, mappings, field_map=None, transformat
     """
     field_map = field_map or DEFAULT_FIELD_MAP
     fields = sorted({v['field'] for v in field_map.values() if v['field']} | set(ISSUE_FIELDS))
-    groups, _histories = collect_issues(client, structure_id, mappings, fields)
+    groups, _histories = collect_issues(client, structure_id, mappings, fields, scope=scope)
     items = [_snapshot_item(g, field_map) for g in groups]
     columns = {m: field_map[m]['structure'] for m in METRICS if field_map[m].get('structure')}
     if columns:
-        apply_structure_columns(client, structure_id, groups, items, columns, transformations)
+        apply_structure_columns(client, structure_id, groups, items, columns, transformations, scope)
     return items
 
 
@@ -914,18 +1002,7 @@ def _number(value):
     return None
 
 
-def root_rows(rows):
-    """Задача → первая строка структуры, где она стоит, и сколько раз она встречается."""
-    first, count = {}, {}
-    for row_id, _depth, issue_id in rows:
-        if issue_id is None:
-            continue
-        first.setdefault(issue_id, row_id)
-        count[issue_id] = count.get(issue_id, 0) + 1
-    return first, count
-
-
-def apply_structure_columns(client, structure_id, groups, items, columns, transformations=None):
+def apply_structure_columns(client, structure_id, groups, items, columns, transformations=None, scope=None):
     """Показатели из колонок Structure: значение колонки у строки задачи эпика (как в структуре); у эпика из
     нескольких задач — сумма их строк. Колонки «После фильтрации» считаются с фильтром доски (transformations),
     остальные — по всей структуре. Задача, которой нет в структуре, в показатель не входит (с предупреждением)."""
@@ -942,13 +1019,14 @@ def apply_structure_columns(client, structure_id, groups, items, columns, transf
             item['warnings'].append('Колонка отмечена «После фильтрации», но фильтр доски у кнопки не задан — '
                                     'посчитано по всей структуре')
     if plain:
-        _apply_columns(client, structure_id, groups, items, plain, None)
+        _apply_columns(client, structure_id, groups, items, plain, None, scope)
     if filtered:
-        _apply_columns(client, structure_id, groups, items, filtered, transformations)
+        _apply_columns(client, structure_id, groups, items, filtered, transformations, scope)
 
 
-def _apply_columns(client, structure_id, groups, items, columns, transformations):
-    first, count = root_rows(client.forest(structure_id, transformations))
+def _apply_columns(client, structure_id, groups, items, columns, transformations, scope=None):
+    places = issue_occurrences(client.forest_items(structure_id, transformations))
+    wanted = scope_items(scope)
     specs, index, slot = [], {}, {}
     for metric, col in columns.items():
         key = json.dumps(col['attribute'], sort_keys=True, ensure_ascii=False)
@@ -960,8 +1038,8 @@ def _apply_columns(client, structure_id, groups, items, columns, transformations
     for g, item in zip(groups, items):
         rows, gone = [], False
         for key, issue_id, _f in g['roots']:
-            row = first.get(issue_id)
-            if row is None:
+            occ, in_scope = pick_occurrence(places.get(issue_id), wanted)
+            if occ is None:
                 if transformations:
                     item['warnings'].append(f'{key}: задача скрыта фильтром доски — для колонок «После фильтрации» '
                                             'её значение 0')
@@ -969,9 +1047,10 @@ def _apply_columns(client, structure_id, groups, items, columns, transformations
                 else:
                     item['warnings'].append(f'{key}: задачи нет в структуре — колонки Structure для неё не посчитаны')
                 continue
-            if count.get(issue_id, 0) > 1:
-                item['warnings'].append(f'{key}: задача стоит в структуре несколько раз — взято значение первой строки')
-            rows.append(row)
+            note = occurrence_warning(key, places[issue_id], occ, in_scope, wanted)
+            if note and note not in item['warnings']:
+                item['warnings'].append(note)
+            rows.append(occ['row'])
         need.append(rows)
         hidden.append(gone)
     all_rows = sorted({r for rows in need for r in rows})
@@ -988,31 +1067,80 @@ def _apply_columns(client, structure_id, groups, items, columns, transformations
                                         'проверьте её формат')
 
 
+def row_titles(client, structure_id, rows, transformations=None):
+    """Названия строк структуры (ключ и тема задачи, название папки) → {rowId: текст}."""
+    if not rows:
+        return {}
+    try:
+        summary, key = client.structure_values(structure_id, rows, [{'id': 'summary', 'format': 'text'},
+                                                                    {'id': 'key', 'format': 'text'}],
+                                               transformations, keep_format=True)
+    except JiraError:
+        return {}
+    out = {}
+    for r in rows:
+        k, t = key.get(r), summary.get(r)
+        out[r] = ' '.join(str(x) for x in (k, t) if x not in (None, '')) or f'строка {r}'
+    return out
+
+
+def structure_sections(client, structure_id, limit=300):
+    """Разделы структуры для выбора у кнопки: строки верхних двух уровней, под которыми есть вложенные строки."""
+    items = client.forest_items(structure_id)
+    out = []
+    for i, (row_id, depth, issue_id, item) in enumerate(items):
+        if depth > 1:
+            continue
+        nxt = items[i + 1] if i + 1 < len(items) else None
+        if not nxt or nxt[1] <= depth:
+            continue
+        size = 0
+        for _r, d, _iid, _it in items[i + 1:]:
+            if d <= depth:
+                break
+            size += 1
+        out.append({'item': item, 'rowId': row_id, 'depth': depth, 'rows': size, 'issue': issue_id is not None})
+        if len(out) >= limit:
+            break
+    titles = row_titles(client, structure_id, [x['rowId'] for x in out])
+    for x in out:
+        x['title'] = titles.get(x['rowId']) or x['item']
+    return out
+
+
 def structure_preview(client, structure_id, keys, attribute, unit, variants=None, transformations=None,
-                      after_filtering=False):
-    """Значения колонки Structure у строк задач (проверка в редакторе кнопки) →
-    [{'key', 'rowId', 'raw', 'hours', 'asUnits', 'variants'}] и предупреждения. variants — {имя: атрибут}: для сверки
-    со структурой те же значения считаются и в других вариантах (без суммы, Σ без и с дубликатами — по всей структуре;
-    с фильтром доски — «как настроено» с фильтром). after_filtering — основное значение считается с фильтром доски."""
+                      after_filtering=False, scope=None, variables=None):
+    """Значения колонки Structure у строк задач (проверка в редакторе кнопки) и данные для сверки с доской:
+    [{'key', 'rowId', 'raw', 'hours', 'asUnits', 'variants', 'places', 'vars'}] и предупреждения.
+
+    variants — {имя: атрибут}: те же значения в других вариантах (без суммы, Σ без и с дубликатами — по всей
+    структуре; «filtered» — как настроено, с фильтром доски). places — все места задачи в структуре с путём и значением
+    колонки в каждом: если задача стоит в нескольких местах, у каждой строки своё поддерево. vars — значение каждой
+    переменной формулы у выбранной строки (видно, какое поле Structure не отдаёт)."""
     found = client.issues_by_keys(keys, ['summary'])
+    wanted = scope_items(scope)
+    items = client.forest_items(structure_id)
+    places = issue_occurrences(items)
     rows, warnings, ids = [], [], {}
-    first, _count = root_rows(client.forest(structure_id))
     for key in keys:
         issue = found.get(key)
-        row = first.get(int(issue['id'])) if issue else None
+        occ, in_scope = pick_occurrence(places.get(int(issue['id'])), wanted) if issue else (None, False)
         if issue is None:
             warnings.append(f'{key}: задача не найдена или нет прав на просмотр')
-        elif row is None:
+        elif occ is None:
             warnings.append(f'{key}: задачи нет в структуре')
         else:
-            rows.append((key, row))
+            rows.append((key, occ['row']))
             ids[key] = int(issue['id'])
+            note = occurrence_warning(key, places[ids[key]], occ, in_scope, wanted)
+            if note:
+                warnings.append(note)
 
     def values_for(spec, tf, name=None):
-        """{ключ: значение} по строкам задач в структуре с фильтром tf (или без него)."""
+        """{ключ: значение} по выбранным строкам задач — в структуре с фильтром tf (или без него)."""
         if tf:
-            frows, _c = root_rows(client.forest(structure_id, tf))
-            pairs = [(k, frows.get(ids[k])) for k, _r in rows]
+            fplaces = issue_occurrences(client.forest_items(structure_id, tf))
+            pairs = [(k, (pick_occurrence(fplaces.get(ids[k]), wanted)[0] or {}).get('row')) for k, _r in rows]
         else:
             pairs = rows
         present = [(k, r) for k, r in pairs if r is not None]
@@ -1036,15 +1164,38 @@ def structure_preview(client, structure_id, keys, attribute, unit, variants=None
         variant_specs['filtered'] = attribute
     extra = {name: (values_for(spec, transformations if name == 'filtered' else None, name) if rows else {})
              for name, spec in variant_specs.items()}
+    # все места задач в структуре: путь и значение колонки у каждой строки
+    all_places = {k: places.get(ids[k], []) for k, _r in rows}
+    place_rows = sorted({p['row'] for occ in all_places.values() for p in occ})
+    path_rows = sorted({r for occ in all_places.values() for p in occ for r in p['pathRows']})
+    titles = row_titles(client, structure_id, path_rows) if any(len(o) > 1 or wanted for o in all_places.values()) else {}
+    try:
+        at_place = client.structure_values(structure_id, place_rows, [attribute])[0] if place_rows else {}
+    except JiraError:
+        at_place = {}
+    # значения переменных формулы у выбранных строк — в их собственном формате
+    var_values = {}
+    for name, spec in (variables or {}).items():
+        try:
+            var_values[name] = client.structure_values(structure_id, [r for _k, r in rows], [spec],
+                                                       keep_format=True)[0] if rows else {}
+        except JiraError as e:
+            var_values[name] = {}
+            warnings.append(f'Переменная «{name}»: Structure не отдал значение поля ({e})')
     out = []
     for key, row in rows:
         raw = values.get(key)
         num = _number(raw)
         item = {'key': key, 'rowId': row, 'raw': raw,
                 'hours': None if num is None else round(num * UNITS[unit], 2),
-                'asUnits': {u: (None if num is None else round(num * k, 2)) for u, k in UNITS.items()}}
+                'asUnits': {u: (None if num is None else round(num * k, 2)) for u, k in UNITS.items()},
+                'places': [{'rowId': p['row'], 'depth': p['depth'], 'chosen': p['row'] == row,
+                            'path': [titles.get(r, '') for r in p['pathRows']], 'raw': at_place.get(p['row'])}
+                           for p in all_places[key]]}
         if variant_specs:
             item['variants'] = {name: _number(extra[name].get(key)) for name in variant_specs}
+        if variables:
+            item['vars'] = {name: var_values[name].get(row) for name in variables}
         out.append(item)
     return out, warnings
 
@@ -1210,7 +1361,7 @@ def issue_state_at(fields, histories, field_ids, moment):
     return values, status_id, seen
 
 
-def compute_history(client, structure_id, mappings, field_map, moments, progress=None):
+def compute_history(client, structure_id, mappings, field_map, moments, progress=None, scope=None):
     """Срезы на прошлые моменты по текущему составу задач кнопки.
 
     moments: {дата 'YYYY-MM-DD': datetime конца дня}. → ({дата: items как у compute_snapshot}, предупреждения).
@@ -1220,7 +1371,7 @@ def compute_history(client, structure_id, mappings, field_map, moments, progress
     field_ids = sorted({v['field'] for v in field_map.values() if v['field']})
     # текущий состав и журналы изменений — одними и теми же запросами (задачи не загружаются дважды)
     groups, histories = collect_issues(client, structure_id, mappings,
-                                       sorted(set(field_ids) | set(ISSUE_FIELDS) | {'created'}), True, progress)
+                                       sorted(set(field_ids) | set(ISSUE_FIELDS) | {'created'}), True, progress, scope)
     current = [_snapshot_item(g, field_map) for g in groups]
     keys = {i['key'] for it in current for i in it['issues']}
     data = {f['__key']: (f, histories.get(issue_id, [])) for g in groups for issue_id, f in g['issues'].items()}

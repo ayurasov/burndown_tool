@@ -93,7 +93,7 @@ def test_snapshot_structure_warnings(fake, monkeypatch):
     monkeypatch.setattr(fake_jira, 'FORMULA', '1:0:101,2:1:102,8:0:101,5:0:104')  # ABC-1 дважды; ABC-6 вне структуры
     items = jira.compute_snapshot(client_for(fake), 7, [{'serviceId': 1, 'issueKeys': 'ABC-1, ABC-6', 'includeSubtree': False}], fm)
     warnings = ' '.join(items[0]['warnings'])
-    assert 'ABC-6: задачи нет в структуре' in warnings and 'несколько раз' in warnings
+    assert 'ABC-6: задачи нет в структуре' in warnings and 'стоит в структуре 2 раз(а)' in warnings
     assert 'Колонка Structure «Тема» вернула не число' in warnings and items[0]['estimate'] is None
     no_structure = jira.compute_snapshot(client_for(fake), None, [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}], fm)
     assert no_structure[0]['remaining'] is None and 'только у кнопки со структурой' in ' '.join(no_structure[0]['warnings'])
@@ -146,7 +146,8 @@ def test_structure_preview_endpoint(admin, make_user, fake):
     body = {'structureId': 7, 'attribute': SUM_REMAINING, 'unit': 'ms', 'keys': 'ABC-1, ABC-5, ABC-404'}
     data = admin.post('/api/projects/1/jira/structure-preview', json=body).get_json()
     assert data['values'] == [{'key': 'ABC-1', 'rowId': 1, 'raw': 45000000, 'hours': 12.5, 'asUnits': {
-        'ms': 12.5, 'seconds': 12500.0, 'minutes': 750000.0, 'hours': 45000000.0, 'days': 360000000.0}}]
+        'ms': 12.5, 'seconds': 12500.0, 'minutes': 750000.0, 'hours': 45000000.0, 'days': 360000000.0},
+        'places': [{'rowId': 1, 'depth': 0, 'chosen': True, 'path': [], 'raw': 45000000}]}]
     assert data['warnings'] == ['ABC-5: задачи нет в структуре', 'ABC-404: задача не найдена или нет прав на просмотр']
     for over, message in [({'structureId': None}, 'структуру'), ({'attribute': {'id': ''}}, 'id'), ({'unit': 'годы'}, 'единица'),
                           ({'keys': ''}, 'задачи'), ({'keys': 'не ключ'}, 'Некорректные')]:
@@ -284,16 +285,21 @@ def test_preview_variant_errors_do_not_hide_value(admin, fake, monkeypatch):
     connect(admin, fake)
     original = jira.JiraClient.structure_values
 
-    def values(self, structure_id, rows, attributes, transformations=None):
+    def values(self, structure_id, rows, attributes, transformations=None, keep_format=False):
         if attributes[0]['id'] == 'sum':
             raise jira.JiraError('Unknown attribute: sum')  # вариант, которого нет в этой версии Structure
-        return original(self, structure_id, rows, attributes, transformations)
+        if attributes[0]['id'] == 'status':
+            raise jira.JiraError('Unknown attribute: status')
+        return original(self, structure_id, rows, attributes, transformations, keep_format)
     monkeypatch.setattr(jira.JiraClient, 'structure_values', values)
     body = {'structureId': 7, 'unit': 'ms', 'keys': 'ABC-1',
             'editor': {'mode': 'field', 'field': 'timespent', 'format': 'duration', 'sum': True}}
     data = admin.post('/api/projects/1/jira/structure-preview', json=body).get_json()
     assert data['values'][0]['hours'] == 6.0 and data['values'][0]['variants']['all'] is None
     assert 'Σ с дубликатами' in data['warnings'][0]
+    body['editor'] = {'mode': 'formula', 'formula': 'st', 'variables': {'st': {'field': 'status', 'format': 'text'}}}
+    data = admin.post('/api/projects/1/jira/structure-preview', json=body).get_json()
+    assert any('Переменная «st»: Structure не отдал значение поля' in w for w in data['warnings'])
 
 
 def test_button_saves_editor_and_rebuilds_spec(admin, fake, flask_app):
@@ -439,3 +445,85 @@ def test_button_keeps_board_filter(admin, fake, flask_app):
     assert create_button(admin, boardFilter={'mode': 'jql'}).status_code == 400
     with flask_app.app_context():
         assert app_module._button_board_filter({'board_filter': '{"mode": "jql"}'}) is None  # повреждённая запись
+
+
+# ─── Эпик стоит в структуре несколько раз: раздел структуры (1.9.2) ──
+
+# ABC-1 стоит в разделе «Договор развития» (под ним только ABC-2) и в разделе «4.1» (ABC-2, ABC-9, папка с ABC-3)
+TWO_SECTIONS = '20:0:5/7,21:1:101,22:2:102,30:0:5/8,1:1:101,2:2:102,6:2:105,3:2:5/9,4:3:103,5:1:104'
+IN_41 = [{'item': '5/8', 'title': '4.1'}]
+
+
+def estimate_map():
+    return jira.normalize_field_map({
+        'remaining': {'field': 'timeestimate', 'unit': 'seconds'},
+        'spent': {'field': '', 'structure': {'editor': {'mode': 'field', 'field': 'timeoriginalestimate', 'format': 'duration',
+                                                         'sum': True}, 'unit': 'ms'}},
+        'estimate': {'field': 'timeoriginalestimate', 'unit': 'seconds'}})
+
+
+def test_epic_in_two_sections_uses_chosen_section(fake, monkeypatch):
+    monkeypatch.setattr(fake_jira, 'FORMULA', TWO_SECTIONS)
+    mappings = [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]
+    first = jira.compute_snapshot(client_for(fake), 7, mappings, estimate_map())[0]
+    # без раздела — первая строка (раздел «Договор развития»): ABC-1 + ABC-2 = 12 + 3
+    assert first['spent'] == 15.0 and first['estimate'] == 15.0
+    assert any('стоит в структуре 2 раз(а)' in w for w in first['warnings'])
+    chosen = jira.compute_snapshot(client_for(fake), 7, mappings, estimate_map(), scope=IN_41)[0]
+    # раздел «4.1»: и колонка Structure, и сумма поля Jira — по поддереву этой строки: 12 + 3 + 1
+    assert chosen['spent'] == 16.0 and chosen['estimate'] == 16.0
+    assert not any('раз(а)' in w for w in chosen['warnings'])
+    missing = jira.compute_snapshot(client_for(fake), 7, mappings, estimate_map(), scope=[{'item': '5/404', 'title': ''}])[0]
+    assert any('в выбранных разделах структуры задачи нет' in w for w in missing['warnings'])
+
+
+def test_preview_lists_all_places_and_variables(admin, fake, monkeypatch):
+    connect(admin, fake)
+    monkeypatch.setattr(fake_jira, 'FORMULA', TWO_SECTIONS)
+    body = {'structureId': 7, 'unit': 'ms', 'keys': 'ABC-1',
+            'editor': {'mode': 'formula', 'formula': USER_FORMULA, 'variables': USER_VARS, 'sum': True}}
+    data = admin.post('/api/projects/1/jira/structure-preview', json=body).get_json()
+    first = data['values'][0]
+    assert [(p['path'], p['chosen']) for p in first['places']] == [(['Договор развития'], True), (['4.1'], False)]
+    assert [p['raw'] / 3600000 for p in first['places']] == [7.0, 8.0]  # у каждой строки своё поддерево
+    assert first['vars'] == {'orig': 12 * 3600000, 'spent': 5 * 3600000, 'status': 'В работе'}
+    assert any('стоит в структуре 2 раз(а)' in w for w in data['warnings'])
+    scoped = admin.post('/api/projects/1/jira/structure-preview', json=dict(body, structureScope=IN_41)).get_json()
+    assert scoped['values'][0]['hours'] == 8.0 and [p['chosen'] for p in scoped['values'][0]['places']] == [False, True]
+    bad = admin.post('/api/projects/1/jira/structure-preview', json=dict(body, structureScope='x'))
+    assert bad.status_code == 400
+
+
+def test_structure_sections_endpoint(admin, fake, monkeypatch, make_user):
+    connect(admin, fake)
+    monkeypatch.setattr(fake_jira, 'FORMULA', TWO_SECTIONS)
+    sections = admin.get('/api/projects/1/jira/structure-sections?structureId=7').get_json()
+    assert [(x['item'], x['depth'], x['title']) for x in sections] == [
+        ('5/7', 0, 'Договор развития'), ('101', 1, 'ABC-1'), ('5/8', 0, '4.1'), ('101', 1, 'ABC-1')]
+    assert sections[2]['rows'] == 6 and sections[0]['issue'] is False
+    assert admin.get('/api/projects/1/jira/structure-sections').status_code == 400
+    assert make_user('viewer', project_id=1).get('/api/projects/1/jira/structure-sections?structureId=7').status_code == 403
+    fake.configure(token='другой')
+    assert admin.get('/api/projects/1/jira/structure-sections?structureId=7').status_code == 502
+
+
+def test_button_keeps_structure_scope(admin, fake, flask_app, monkeypatch):
+    connect(admin, fake)
+    monkeypatch.setattr(fake_jira, 'FORMULA', TWO_SECTIONS)
+    r = create_button(admin, fieldMap=estimate_map(), structureScope=IN_41)
+    assert r.status_code == 200, r.get_json()
+    button = r.get_json()
+    assert button['structureScope'] == IN_41
+    snap = admin.post(f"/api/jira/buttons/{button['id']}/snapshot", json={}).get_json()
+    assert snap['items'][0]['spent'] == 16.0
+    assert create_button(admin, structureScope=[{'item': 'a:b'}]).status_code == 400
+    assert 'только у кнопки со структурой' in create_button(admin, structureId=None, structureScope=IN_41).get_json()['error']
+    with flask_app.app_context():
+        assert app_module._button_scope({'structure_scope': '"x"'}) is None  # повреждённая запись
+        assert app_module._button_scope({'structure_scope': None}) is None
+
+
+def test_row_titles_tolerate_errors(fake, monkeypatch):
+    client = client_for(fake)
+    monkeypatch.setattr(client, 'structure_values', lambda *a, **k: (_ for _ in ()).throw(jira.JiraError('нет')))
+    assert jira.row_titles(client, 7, [1]) == {} and jira.row_titles(client, 7, []) == {}

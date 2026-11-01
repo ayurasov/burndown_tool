@@ -46,12 +46,29 @@ def test_parse_issue_keys():
 def test_forest_formula_and_subtree():
     rows = jira.parse_forest_formula('1:0:101,2:1:102,3:1:5/9,4:2:103:x,5:0:104,bad,7:z:1')
     assert rows == [(0, 101), (1, 102), (1, None), (2, 103), (0, 104)]
-    assert jira.subtree_issue_ids(rows, 101) == {101, 102, 103}
-    assert jira.subtree_issue_ids(rows, 103) == {103}
-    assert jira.subtree_issue_ids(rows, 999) is None
-    # задача встречается в структуре дважды — поддеревья объединяются
-    rows = jira.parse_forest_formula('1:0:1,2:1:2,3:0:3,4:1:1,5:2:4')
-    assert jira.subtree_issue_ids(rows, 1) == {1, 2, 4}
+    items = jira.parse_forest_items('1:0:101,2:1:102,3:1:5/9,4:2:103:x,5:0:104,bad,7:z:1')
+    assert items[2] == (3, 1, None, '5/9')
+    assert jira.subtree_issues_at(items, 1) == {101, 102, 103}
+    assert jira.subtree_issues_at(items, 4) == {103} and jira.subtree_issues_at(items, 3) == {103}
+    assert jira.subtree_issues_at(items, 999) == set()
+    # задача стоит в структуре дважды — у каждой строки своё поддерево
+    items = jira.parse_forest_items('1:0:5/7,2:1:1,3:2:2,4:0:5/8,5:1:1,6:2:4')
+    places = jira.issue_occurrences(items)[1]
+    assert [(p['row'], p['path']) for p in places] == [(2, ['5/7']), (5, ['5/8'])]
+    assert jira.subtree_issues_at(items, 2) == {1, 2} and jira.subtree_issues_at(items, 5) == {1, 4}
+    assert jira.pick_occurrence(places)[0]['row'] == 2
+    assert jira.pick_occurrence(places, {'5/8'}) == (places[1], True)
+    assert jira.pick_occurrence(places, {'5/9'}) == (places[0], False)
+    assert jira.pick_occurrence(None) == (None, False)
+    assert 'стоит в структуре 2 раз(а)' in jira.occurrence_warning('A-1', places, places[0], True, None)
+    assert 'в выбранных разделах' in jira.occurrence_warning('A-1', places, places[0], False, {'5/9'})
+    assert jira.occurrence_warning('A-1', places[:1], places[0], True, None) is None
+    assert jira.normalize_scope([{'item': '5/8', 'title': ' 4.1 '}, '10001']) == [
+        {'item': '5/8', 'title': '4.1'}, {'item': '10001', 'title': ''}]
+    assert jira.normalize_scope([]) is None and jira.scope_items(None) is None
+    for bad in ('x', [{'item': 'a:b'}], [5], ['x'] * 51):
+        with pytest.raises(ValueError):
+            jira.normalize_scope(bad)
 
 
 def test_seconds_to_hours():
