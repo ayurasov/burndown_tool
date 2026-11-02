@@ -42,7 +42,7 @@ function api(url, opts){
     err.handled = true;
     throw err;
   }).then(function(r){
-    if(r.status === 401){ window.location.href = '/login'; throw new Error('Unauthorized'); }
+    if(r.status === 401){ window.location.href = '/login' + window.location.hash; throw new Error('Unauthorized'); }
     return r.json().catch(function(){ return {}; }).then(function(data){
       if(!r.ok){
         var msg = (data && data.error) || ('Ошибка сервера (' + r.status + ')');
@@ -218,6 +218,181 @@ function initTableSort(table, renderFn){
       renderFn();
     });
   });
+}
+/* ── Фильтр таблицы: поиск по всем колонкам и «Фильтр по полям» — условие под каждой колонкой
+   (text — содержит, num — «>0», «5–20», «пусто», list — выбор из значений). Состояние хранится по id таблицы
+   и переживает перерисовку; строки «Итого» не скрываются. ── */
+var tableFilterState = {};
+function tableFilter(table, cols){
+  if(!table || !table.tHead || !table.id) return;
+  var st = tableFilterState[table.id] || (tableFilterState[table.id] = {open: false, search: '', values: {}});
+  table._tfCols = cols;
+  var wrap = table.closest('.table-scroll') || table;
+  var bar = wrap.previousElementSibling;
+  if(!bar || !bar.classList.contains('tf-bar')){
+    bar = document.createElement('div');
+    bar.className = 'tf-bar';
+    bar.innerHTML = '<input type="search" class="filter-input tf-search" placeholder="Найти в таблице" aria-label="Найти в таблице">'+
+      '<button type="button" class="btn btn-ghost btn-sm tf-toggle" aria-expanded="false">Фильтр по полям</button>'+
+      '<span class="tf-count muted-cell" aria-live="polite"></span><button type="button" class="link-btn tf-reset" hidden>Сбросить фильтр</button>';
+    wrap.parentNode.insertBefore(bar, wrap);
+    bar.querySelector('.tf-search').addEventListener('input', function(e){ st.search = e.target.value; applyTableFilter(table); });
+    bar.querySelector('.tf-toggle').addEventListener('click', function(){ st.open = !st.open; tableFilter(table, table._tfCols); });
+    bar.querySelector('.tf-reset').addEventListener('click', function(){ st.search = ''; st.values = {}; tableFilter(table, table._tfCols); });
+  }
+  bar.querySelector('.tf-search').value = st.search;
+  var toggle = bar.querySelector('.tf-toggle');
+  toggle.setAttribute('aria-expanded', st.open ? 'true' : 'false');
+  toggle.classList.toggle('active', st.open);
+  var old = table.tHead.querySelector('tr.tf-row');
+  if(old) old.remove();
+  var rows = tableFilterRows(table);
+  var row = document.createElement('tr');
+  row.className = 'tf-row';
+  row.hidden = !st.open;
+  row.innerHTML = cols.map(function(kind, i){
+    var v = st.values[i] || '';
+    if(kind === 'text') return '<td><input type="search" class="tf-input" data-col="'+i+'" value="'+escapeAttr(v)+'" placeholder="содержит…" aria-label="Фильтр: '+escapeAttr(tableHeadText(table, i))+'"></td>';
+    if(kind === 'num') return '<td><input type="text" class="tf-input" data-col="'+i+'" value="'+escapeAttr(v)+'" placeholder="&gt;0, 5–20" inputmode="decimal" title="Число: «&gt;10», «&lt;=5», «=0», «5–20» или «пусто»" aria-label="Фильтр: '+escapeAttr(tableHeadText(table, i))+'"></td>';
+    if(kind === 'list'){
+      var seen = {};
+      rows.forEach(function(tr){ if(tr.cells[i]) cellValues(tr.cells[i]).forEach(function(x){ seen[x] = true; }); });
+      var opts = Object.keys(seen).sort(function(a, b){ return a.localeCompare(b, 'ru'); });
+      if(v && !seen[v]) opts.push(v);
+      return '<td><select class="tf-input" data-col="'+i+'" aria-label="Фильтр: '+escapeAttr(tableHeadText(table, i))+'"><option value="">все</option>'+
+        opts.map(function(x){ return '<option value="'+escapeAttr(x)+'"'+(x === v ? ' selected' : '')+'>'+escapeHtml(x || '(пусто)')+'</option>'; }).join('')+'</select></td>';
+    }
+    return '<td></td>';
+  }).join('');
+  table.tHead.appendChild(row);
+  row.querySelectorAll('.tf-input').forEach(function(el){
+    el.addEventListener(el.tagName === 'SELECT' ? 'change' : 'input', function(){ st.values[el.dataset.col] = el.value; applyTableFilter(table); });
+  });
+  bindDomSort(table, st);
+  applyTableSortDom(table);
+  applyTableFilter(table);
+}
+/* Сортировка по щелчку на заголовок у таблиц, которые не сортируются по данным (нет th[data-sort]): строки
+   переставляются на месте, «Итого» — внизу, пустые значения — в конце; повторный щелчок меняет направление */
+function bindDomSort(table, st){
+  var head = table.tHead.rows[0];
+  if(!head || head.querySelector('th[data-sort]')) return;
+  Array.prototype.forEach.call(head.cells, function(th, i){
+    if(!table._tfCols[i] || th.colSpan > 1) return;
+    var dir = st.sort && st.sort.col === i ? st.sort.dir : null;
+    th.classList.add('sortable');
+    th.classList.toggle('sorted-asc', dir === 'asc');
+    th.classList.toggle('sorted-desc', dir === 'desc');
+    th.setAttribute('aria-sort', dir === 'asc' ? 'ascending' : dir === 'desc' ? 'descending' : 'none');
+    if(th._tfSort) return;  /* шапка та же (сброс фильтра) — обработчик уже есть */
+    th._tfSort = true;
+    th.tabIndex = 0;
+    var toggle = function(){
+      st.sort = {col: i, dir: st.sort && st.sort.col === i && st.sort.dir === 'asc' ? 'desc' : 'asc'};
+      tableFilter(table, table._tfCols);
+    };
+    th.addEventListener('click', toggle);
+    th.addEventListener('keydown', function(e){ if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); toggle(); } });
+  });
+}
+function applyTableSortDom(table){
+  var st = tableFilterState[table.id], body = table.tBodies[0];
+  if(!st || !st.sort || !body) return;
+  var i = st.sort.col, kind = (table._tfCols || [])[i];
+  var rows = tableFilterRows(table);
+  var key = function(tr){
+    var td = tr.cells[i];
+    if(!td) return null;
+    if(kind === 'num') return cellNumber(td);
+    var t = kind === 'list' ? cellValues(td)[0] : cellText(td);
+    var d = t.match(/^(\d{2})\.(\d{2})\.(\d{4})/);  /* дата ДД.ММ.ГГГГ — по времени */
+    return d ? d[3] + '-' + d[2] + '-' + d[1] : (t === '—' ? '' : t);
+  };
+  var keyed = rows.map(function(tr, idx){ return {tr: tr, k: key(tr), idx: idx}; });
+  keyed.sort(function(a, b){ return compareValues(a.k, b.k, st.sort.dir) || a.idx - b.idx; });
+  var rest = Array.prototype.filter.call(body.rows, function(tr){ return rows.indexOf(tr) === -1; });
+  keyed.forEach(function(x){ body.appendChild(x.tr); });
+  rest.forEach(function(tr){ body.appendChild(tr); });
+}
+function tableHeadText(table, i){
+  var cell = table.tHead.rows[0] && table.tHead.rows[0].cells[i];
+  return cell ? cell.textContent.trim() : '';
+}
+function tableFilterRows(table){
+  return Array.prototype.filter.call(table.tBodies[0] ? table.tBodies[0].rows : [], function(tr){
+    return !tr.classList.contains('total-row') && !tr.querySelector('.empty-cell');
+  });
+}
+function cellText(td){
+  var control = td.querySelector('input, select, textarea');
+  if(control) return control.type === 'checkbox' ? (control.checked ? 'да' : 'нет') : control.value;
+  return td.dataset.v !== undefined ? td.dataset.v : td.textContent.replace(/\s+/g, ' ').trim();
+}
+/* значения для списка в фильтре: без значков в начале («✓ Успеваем» → «Успеваем») */
+function cellValues(td){
+  return td.dataset.values !== undefined ? td.dataset.values.split('|') : [cellText(td).replace(/^[^0-9A-Za-zА-Яа-яЁё(]+/, '')];
+}
+function cellNumber(td){
+  if(td.dataset.num !== undefined) return td.dataset.num === '' ? null : parseFloat(td.dataset.num);
+  var m = cellText(td).match(/[-−+]?\d[\d\s  ]*(?:[.,]\d+)?/);
+  return m ? parseFloat(m[0].replace(/[\s  ]/g, '').replace(',', '.').replace('−', '-')) : null;
+}
+/* «>10», «>=10», «<5», «=0», «10» — равно, «5–20» (или 5..20) — диапазон, «пусто»; иначе false — условие не разобрано */
+function parseNumFilter(expr){
+  var s = String(expr).trim().replace(/\s+/g, '').replace(/,/g, '.').replace(/−/g, '-').replace(/≥/g, '>=').replace(/≤/g, '<=');
+  if(!s) return null;
+  if(/^(пусто|нет|—|-)$/i.test(s)) return function(v){ return v === null; };
+  var m = s.match(/^(>=|<=|>|<|=)?(-?\d+(?:\.\d+)?)$/);
+  if(m){
+    var n = parseFloat(m[2]), op = m[1] || '=';
+    return function(v){
+      if(v === null) return false;
+      return op === '>' ? v > n : op === '<' ? v < n : op === '>=' ? v >= n : op === '<=' ? v <= n : Math.abs(v - n) < 1e-9;
+    };
+  }
+  m = s.match(/^(-?\d+(?:\.\d+)?)(?:\.\.|–|—|-)(-?\d+(?:\.\d+)?)$/);
+  if(m){
+    var a = Math.min(parseFloat(m[1]), parseFloat(m[2])), b = Math.max(parseFloat(m[1]), parseFloat(m[2]));
+    return function(v){ return v !== null && v >= a && v <= b; };
+  }
+  return false;
+}
+function applyTableFilter(table){
+  var st = tableFilterState[table.id];
+  if(!st) return;
+  var cols = table._tfCols || [], tests = [];
+  Object.keys(st.values).forEach(function(k){
+    var v = st.values[k], i = parseInt(k, 10);
+    var input = table.tHead.querySelector('.tf-input[data-col="'+i+'"]');
+    if(input) input.classList.remove('tf-invalid');
+    if(v === '' || v === undefined) return;
+    if(cols[i] === 'num'){
+      var f = parseNumFilter(v);
+      if(!f){ if(input && f === false) input.classList.add('tf-invalid'); return; }
+      tests.push(function(cells){ return !!cells[i] && f(cellNumber(cells[i])); });
+    } else if(cols[i] === 'list'){
+      tests.push(function(cells){ return !!cells[i] && cellValues(cells[i]).indexOf(v) >= 0; });
+    } else {
+      var needle = v.toLowerCase();
+      tests.push(function(cells){ return !!cells[i] && cellText(cells[i]).toLowerCase().indexOf(needle) >= 0; });
+    }
+  });
+  var search = st.search.trim().toLowerCase();
+  var rows = tableFilterRows(table), shown = 0, total = 0;
+  rows.forEach(function(tr){
+    var ok = tests.every(function(t){ return t(tr.cells); }) &&
+      (!search || Array.prototype.some.call(tr.cells, function(td){ return cellText(td).toLowerCase().indexOf(search) >= 0; }));
+    tr.classList.toggle('tf-hidden', !ok);
+    if(!tr.hidden) total++;
+    if(ok && !tr.hidden) shown++;
+  });
+  var active = !!search || tests.length > 0;
+  var wrap = table.closest('.table-scroll') || table;
+  var bar = wrap.previousElementSibling;
+  if(bar && bar.classList.contains('tf-bar')){
+    bar.querySelector('.tf-count').textContent = active ? 'Показано ' + shown + ' из ' + total : '';
+    bar.querySelector('.tf-reset').hidden = !active && !Object.keys(st.values).some(function(k){ return st.values[k]; });
+  }
 }
 function applyTableSort(key, rows){
   var sort = tableSortState[key];
@@ -1126,6 +1301,7 @@ function renderSummaryTable(){
   html += '</tbody>';
   table.innerHTML = html;
   initTableSort(table, renderSummaryTable);
+  tableFilter(table, ['list', 'text', 'num', 'num', 'num', 'text', 'text', 'num', 'list']);
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -1191,6 +1367,7 @@ function renderBurnRateTable(){
     return {label: s.etap+' — '+s.name, rates: serviceDailyRates(s.id, dates)};
   });
   table.innerHTML = burnRateTableHtml('Эпик', dates, rows);
+  tableFilter(table, ['text'].concat(dates.map(function(){ return 'num'; })));
 }
 
 /* ════════════════════════════════════════════════════════════════
@@ -1236,6 +1413,7 @@ function renderStageSummaryTable(){
   html += '</tbody>';
   table.innerHTML = html;
   initTableSort(table, renderStageSummaryTable);
+  tableFilter(table, ['text', 'num', 'num', 'num', 'num', 'text', 'text', 'num', 'list']);
 }
 
 function renderStageBurnRateTable(){
@@ -1250,6 +1428,7 @@ function renderStageBurnRateTable(){
     return {label: name, rates: sumRates(stageGroups[name].map(function(id){ return serviceDailyRates(id, dates); }), dates.length)};
   });
   table.innerHTML = burnRateTableHtml('Этап', dates, rows);
+  tableFilter(table, ['text'].concat(dates.map(function(){ return 'num'; })));
 }
 
 function buildStagePanelsSkeleton(){
@@ -1483,6 +1662,7 @@ function renderDataView(){
   html += '</tbody>';
   table.innerHTML = html;
   initTableSort(table, renderDataView);
+  tableFilter(table, ['text', 'num', 'num', 'num', null]);
 
   table.querySelectorAll('input').forEach(function(inp){
     inp.addEventListener('change', function(){
@@ -1541,7 +1721,7 @@ function renderServicesView(){
   var table = document.getElementById('servicesTable');
   var groupHint = 'Группа для «Свода по этапам»; пусто — группировка по этапу';
   var html = '<colgroup><col class="col-drag"><col class="col-etap"><col class="col-name"><col class="col-target"><col class="col-done"><col class="col-group"><col class="col-count"><col class="col-actions"></colgroup>'+
-    '<thead><tr><th class="drag-col"></th><th class="sortable" data-sort="etap">Этап</th><th class="sortable" data-sort="name">Название эпика</th><th class="sortable" data-sort="targetDate">Целевая дата</th><th class="center" title="Сданный функционал не учитывается в рамках этапа">Сдано</th><th class="sortable" data-sort="stageGroup" title="'+groupHint+'">Группа в своде</th><th class="sortable num" data-sort="count">Замеров</th><th class="actions-col"></th></tr></thead><tbody>';
+    '<thead><tr><th class="drag-col"></th><th class="sortable" data-sort="etap">Этап</th><th class="sortable" data-sort="name">Название эпика</th><th class="sortable" data-sort="targetDate">Целевая дата</th><th class="sortable center" data-sort="isDone" title="Сданный функционал не учитывается в рамках этапа">Сдано</th><th class="sortable" data-sort="stageGroup" title="'+groupHint+'">Группа в своде</th><th class="sortable num" data-sort="count">Замеров</th><th class="actions-col"></th></tr></thead><tbody>';
   var services = getSortedServices();
   if(!services.length){
     html += '<tr><td colspan="8" class="empty-cell">Эпиков пока нет — добавьте первый.</td></tr>';
@@ -1560,6 +1740,7 @@ function renderServicesView(){
   html += '</tbody>';
   table.innerHTML = html;
   initTableSort(table, renderServicesView);
+  tableFilter(table, [null, 'text', 'text', 'text', 'list', 'text', 'num', null]);
 
   if(canEdit()){
     enableRowDrag(table, function(rows){
@@ -2007,7 +2188,7 @@ var navItems = document.querySelectorAll('.nav-item');
 var pageTitle = document.getElementById('pageTitle');
 var pageSub = document.getElementById('pageSub');
 var ADMIN_VIEWS = ['users', 'projects', 'audit', 'integrations', 'calendar', 'health'];
-var GLOBAL_VIEWS = ADMIN_VIEWS.concat(['portfolio']);  /* не относятся к выбранному проекту */
+var GLOBAL_VIEWS = ADMIN_VIEWS.concat(['portfolio', 'guide']);  /* не относятся к выбранному проекту */
 var PDF_VIEWS = ['dashboard', 'stages', 'data'];
 var titles = {
   portfolio: ['Портфель проектов', 'Сводка по всем доступным проектам'],
@@ -2024,7 +2205,8 @@ var titles = {
   projects: ['Управление проектами', 'Создание, редактирование и удаление проектов'],
   audit: ['Реестр изменений', 'Журнал всех изменений с фильтрами'],
   calendar: ['Производственный календарь', 'Праздники и рабочие выходные для расчёта в рабочих днях'],
-  health: ['Состояние системы', 'Работа планировщика, Jira, автозаполнения и рассылок; оповещения администратору']
+  health: ['Состояние системы', 'Работа планировщика, Jira, автозаполнения и рассылок; оповещения администратору'],
+  guide: ['Руководство', 'Как работать с Burndown']
 };
 
 function projectTitleSuffix(){
@@ -2045,22 +2227,288 @@ function navigate(view){
     pageTitle.textContent = titles[view][0];
     pageSub.textContent = titles[view][1] + (GLOBAL_VIEWS.indexOf(view) === -1 ? projectTitleSuffix() : '');
   }
+  /* эпик «Данных по датам» из адреса (F5, «Назад» в другой проект) — до отрисовки раздела */
+  if(pendingRoute && pendingRoute.view === view && view === 'data' && pendingRoute.epic && serviceById(pendingRoute.epic)){
+    currentDataServiceId = pendingRoute.epic;
+  }
   var renderers = {dashboard:renderDashboard, stages:renderStagesView, data:renderDataView, services:renderServicesView,
     settings:renderSettingsView, jira:renderJiraView, autofill:renderAutofillView, notify:renderNotifyView,
     integrations:renderIntegrationsView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); },
-    portfolio:renderPortfolioView, calendar:renderCalendarView, health:renderHealthView};
+    portfolio:renderPortfolioView, calendar:renderCalendarView, health:renderHealthView, guide:renderGuideView};
   if(renderers[view] && (currentProjectId || GLOBAL_VIEWS.indexOf(view) !== -1)) renderers[view]();
   var reportView = PDF_VIEWS.indexOf(view) !== -1 && currentProjectId;
   document.getElementById('btnPdf').style.display = reportView ? '' : 'none';
   document.getElementById('btnPrint').style.display = (reportView && view !== 'data') ? '' : 'none';
   if(window.matchMedia('(max-width: 900px)').matches) setSidebarCollapsed(true);
+  applyPendingRoute();
+  syncRoute(true);
 }
+
+/* ── Адрес страницы: раздел, проект и эпик в «#/раздел?project=…&epic=…» — после F5 открывается та же страница
+   (и прокрутка), «Назад» и «Вперёд» браузера переключают разделы ── */
+var pendingRoute = null, routeReplaceNext = true;
+var ROUTE_SCROLL_KEY = 'burndown-scroll';
+function parseRoute(){
+  var m = (window.location.hash || '').match(/^#\/([a-z]+)(?:\?(.*))?$/);
+  if(!m || !(titles[m[1]] || m[1] === 'guide')) return null;
+  var q = new URLSearchParams(m[2] || '');
+  var num = function(k){ var n = parseInt(q.get(k), 10); return n > 0 ? n : null; };
+  return {view: m[1], project: num('project'), epic: num('epic'), doc: q.get('doc'), section: q.get('s')};
+}
+function routeEpic(){
+  if(currentView === 'dashboard') return parseInt(document.getElementById('chartServiceSelect').value, 10) || null;
+  if(currentView === 'data') return currentDataServiceId;
+  return null;
+}
+function routeHash(){
+  var q = [];
+  if(currentProjectId) q.push('project=' + currentProjectId);  /* и в общих разделах — выбранный проект остаётся тем же */
+  var epic = routeEpic();
+  if(epic) q.push('epic=' + epic);
+  if(currentView === 'guide') q = q.concat(guideRouteParams());
+  return '#/' + currentView + (q.length ? '?' + q.join('&') : '');
+}
+/* push — новая запись в истории браузера (переход пользователя); иначе адрес заменяется (выбор эпика, первый показ) */
+function syncRoute(push){
+  if(!currentUser) return;
+  var hash = routeHash();
+  var replace = routeReplaceNext || !push;
+  routeReplaceNext = false;
+  if(window.location.hash === hash) return;
+  try { window.history[replace ? 'replaceState' : 'pushState'](null, '', window.location.pathname + window.location.search + hash); } catch(e){}
+}
+/* после загрузки раздела из адреса: эпик и прокрутка, как были до обновления страницы */
+function applyPendingRoute(){
+  var r = pendingRoute;
+  if(!r) return;
+  pendingRoute = null;
+  if(r.view !== currentView){ restoreScroll(true); return; }
+  if(r.epic && currentView === 'dashboard'){
+    var sel = document.getElementById('chartServiceSelect');
+    if(Array.prototype.some.call(sel.options, function(o){ return o.value === String(r.epic); }) && sel.value !== String(r.epic)){
+      sel.value = String(r.epic);
+      sel.dispatchEvent(new Event('change'));
+    }
+  }
+  restoreScroll(currentView === 'guide' && r.section);  /* в руководстве — переход к разделу из адреса */
+}
+function restoreScroll(forgetOnly){
+  var saved = null;
+  try { saved = JSON.parse(sessionStorage.getItem(ROUTE_SCROLL_KEY) || 'null'); sessionStorage.removeItem(ROUTE_SCROLL_KEY); } catch(e){}
+  if(forgetOnly || !saved || saved.hash !== window.location.hash || !(saved.y > 0)) return;
+  /* графики и выводы догружаются — прокручиваем, пока страница не станет достаточно длинной, если читатель не начал сам */
+  var stop = false, tries = 0;
+  var cancel = function(){ stop = true; };
+  ['wheel', 'touchstart', 'keydown', 'mousedown'].forEach(function(ev){ window.addEventListener(ev, cancel, {once: true, passive: true}); });
+  (function attempt(){
+    if(stop) return;
+    window.scrollTo({top: saved.y, behavior: 'instant'});
+    if(Math.abs(window.scrollY - saved.y) > 2 && ++tries < 40) setTimeout(attempt, 150);  /* до 6 с */
+  })();
+}
+window.addEventListener('pagehide', function(){
+  try { sessionStorage.setItem(ROUTE_SCROLL_KEY, JSON.stringify({hash: window.location.hash, y: window.scrollY})); } catch(e){}
+});
+window.addEventListener('popstate', function(){
+  var r = parseRoute();
+  if(!r || !currentUser) return;
+  routeReplaceNext = true;
+  if(r.project && r.project !== currentProjectId && projects.some(function(p){ return p.id === r.project; })){
+    pendingRoute = r;
+    currentView = r.view;
+    switchProject(r.project);
+  } else {
+    pendingRoute = r;
+    if(r.view === 'data' && r.epic && serviceById(r.epic)) currentDataServiceId = r.epic;
+    navigate(r.view);
+  }
+});
 
 navItems.forEach(function(n){
   n.addEventListener('click', function(e){
     e.preventDefault();
     navigate(n.dataset.view);
   });
+});
+
+/* ════════════════════════════════════════════════════════════════
+   Онлайн-руководство: тот же документ, что в PDF и DOCX, — с оглавлением, поиском по тексту разделов,
+   переходом по разделам (раздел — в адресе страницы) и увеличением иллюстраций
+════════════════════════════════════════════════════════════════ */
+var guideState = {doc: 'user-guide', data: {}, loading: {}, section: null, pinned: null, sectionText: {}};
+var GUIDE_PIN_MS = 4000;
+function guideRouteParams(){
+  var q = [];
+  if(guideState.doc && guideState.doc !== 'user-guide') q.push('doc=' + encodeURIComponent(guideState.doc));
+  if(guideState.section) q.push('s=' + encodeURIComponent(guideState.section));
+  return q;
+}
+function renderGuideView(){
+  var r = pendingRoute && pendingRoute.view === 'guide' ? pendingRoute : null;
+  if(r){ guideState.doc = r.doc || 'user-guide'; guideState.section = r.section || null; }  /* адрес — сразу с разделом */
+  loadGuide(guideState.doc, r ? r.section : null);
+}
+function loadGuide(doc, section){
+  doc = doc || 'user-guide';
+  var got = guideState.data[doc] ? Promise.resolve(guideState.data[doc]) :
+    (guideState.loading[doc] || (guideState.loading[doc] = api('/api/guide/' + encodeURIComponent(doc)).then(function(d){
+      guideState.data[doc] = d;
+      return d;
+    }).then(function(d){ delete guideState.loading[doc]; return d; }, function(err){ delete guideState.loading[doc]; throw err; })));
+  return got.then(function(d){
+    if(currentView === 'guide') showGuide(d, section);
+  }).catch(function(){
+    if(doc !== 'user-guide') return loadGuide('user-guide');
+    document.getElementById('guideContent').innerHTML = '<p class="insight-empty">Онлайн-руководство недоступно — '+
+      '<a href="/manuals/user-guide.pdf" target="_blank" rel="noopener">откройте PDF</a>.</p>';
+  });
+}
+function guideHeadings(){
+  return Array.prototype.slice.call(document.querySelectorAll('#guideContent h1[id], #guideContent h2[id], #guideContent h3[id]'));
+}
+function guideHeadingText(h){
+  var num = h.querySelector('.header-section-number');
+  var text = h.textContent.trim();
+  return {num: num ? num.textContent.trim() : '', text: num ? text.slice(num.textContent.length).trim() : text};
+}
+function showGuide(d, section){
+  var content = document.getElementById('guideContent');
+  guideState.doc = d.id;
+  pageTitle.textContent = d.title;
+  pageSub.textContent = 'Burndown — версия ' + d.version + ' · тот же текст, что в PDF и Word';
+  document.getElementById('guideDocs').innerHTML = d.guides.length > 1 ? d.guides.map(function(g){
+    return '<button type="button" class="btn btn-ghost btn-sm'+(g.id === d.id ? ' active' : '')+'" data-guide="'+escapeAttr(g.id)+'">'+escapeHtml(g.title)+'</button>';
+  }).join('') : '';
+  var has = function(ext){ return d.formats.indexOf(ext) !== -1; };
+  document.getElementById('guideActions').innerHTML =
+    (has('pdf') ? '<a class="btn btn-ghost btn-sm" href="/manuals/'+d.id+'.pdf" target="_blank" rel="noopener">Открыть PDF</a>'+
+                  '<a class="btn btn-primary btn-sm" href="/manuals/'+d.id+'.pdf?download=1" download>Скачать PDF</a>' : '')+
+    (has('docx') ? '<a class="btn btn-ghost btn-sm" href="/manuals/'+d.id+'.docx" download>Скачать Word</a>' : '');
+  document.querySelectorAll('#guideDocs [data-guide]').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      guideState.section = null;
+      loadGuide(btn.dataset.guide).then(function(){ window.scrollTo({top: 0, behavior: 'instant'}); syncRoute(true); });
+    });
+  });
+  if(content.dataset.doc !== d.id){
+    content.dataset.doc = d.id;
+    /* документ приложения (собран pandoc из docs/manuals), иллюстрации подгружаются по мере прокрутки */
+    content.innerHTML = d.html.replace(/<img /g, '<img loading="lazy" ');
+    var heads = guideHeadings();
+    guideState.sectionText = {};
+    heads.forEach(function(h){
+      var text = '';
+      for(var n = h.nextElementSibling; n && !/^H[1-3]$/.test(n.tagName); n = n.nextElementSibling) text += ' ' + n.textContent;
+      guideState.sectionText[h.id] = text.toLowerCase();
+    });
+    document.getElementById('guideTocMobile').innerHTML = heads.filter(function(h){ return h.tagName !== 'H3'; }).map(function(h){
+      var t = guideHeadingText(h);
+      return '<option value="'+escapeAttr(h.id)+'">'+(h.tagName === 'H2' ? '— ' : '')+escapeHtml((t.num ? t.num + ' ' : '') + t.text)+'</option>';
+    }).join('');
+    renderGuideToc();
+  }
+  if(section) guideGo(section, true);
+}
+function renderGuideToc(){
+  var query = document.getElementById('guideSearch').value.trim().toLowerCase();
+  var heads = guideHeadings().filter(function(h){
+    if(!query) return h.tagName !== 'H3';
+    return guideHeadingText(h).text.toLowerCase().indexOf(query) !== -1 || (guideState.sectionText[h.id] || '').indexOf(query) !== -1;
+  });
+  document.getElementById('guideTocEmpty').hidden = !query || heads.length > 0;
+  document.getElementById('guideToc').innerHTML = heads.map(function(h){
+    var t = guideHeadingText(h);
+    return '<li class="toc-'+h.tagName.toLowerCase()+'"><a href="#" data-section="'+escapeAttr(h.id)+'">'+
+      (t.num ? '<span class="toc-num">'+escapeHtml(t.num)+'</span>' : '')+escapeHtml(t.text)+'</a></li>';
+  }).join('');
+  markGuideToc();
+}
+/* подсвечивается раздел оглавления, в который входит текущий подраздел */
+function markGuideToc(){
+  var heads = guideHeadings(), active = null;
+  var idx = heads.findIndex(function(h){ return h.id === guideState.section; });
+  for(var i = idx; i >= 0; i--){ if(heads[i].tagName !== 'H3'){ active = heads[i].id; break; } }
+  document.querySelectorAll('#guideToc a').forEach(function(a){ a.parentNode.classList.toggle('active', a.dataset.section === active); });
+  var sel = document.getElementById('guideTocMobile');
+  if(active && sel.value !== active) sel.value = active;
+}
+/* текущий раздел — последний заголовок, поднявшийся в верхнюю треть экрана; раздел запоминается в адресе
+   (F5 вернёт к нему). Сразу после перехода к разделу держится он, пока догружаются иллюстрации выше */
+var guideScrollQueued = false;
+function trackGuideSection(){
+  guideScrollQueued = false;
+  if(currentView !== 'guide') return;
+  var pin = guideState.pinned, current = null;
+  if(pin && Date.now() <= pin.until) current = pin.id;
+  else {
+    var limit = window.innerHeight * 0.3;
+    guideHeadings().some(function(h){
+      if(h.getBoundingClientRect().top > limit) return true;
+      current = h.id;
+      return false;
+    });
+  }
+  if(!current || current === guideState.section) return;
+  guideState.section = current;
+  markGuideToc();
+  syncRoute(false);
+}
+window.addEventListener('scroll', function(){
+  if(currentView !== 'guide' || guideScrollQueued) return;
+  guideScrollQueued = true;
+  window.requestAnimationFrame(trackGuideSection);
+}, {passive: true});
+function guideGo(id, initial){
+  var target = document.getElementById(id);
+  if(!target || !document.getElementById('guideContent').contains(target)) return;
+  target.scrollIntoView({block: 'start', behavior: 'instant'});
+  /* иллюстрации выше раздела догружаются и сдвигают текст — пока читатель не прокрутил сам, раздел держится на месте */
+  guideState.pinned = {id: id, until: Date.now() + GUIDE_PIN_MS};
+  guideState.section = id;
+  markGuideToc();
+  syncRoute(!initial);
+}
+function guideUnpin(){ guideState.pinned = null; }
+document.getElementById('guideSearch').addEventListener('input', renderGuideToc);
+document.getElementById('guideToc').addEventListener('click', function(e){
+  var a = e.target.closest('a[data-section]');
+  if(!a) return;
+  e.preventDefault();
+  guideGo(a.dataset.section);
+});
+document.getElementById('guideTocMobile').addEventListener('change', function(e){ guideGo(e.target.value); });
+document.getElementById('guideContent').addEventListener('click', function(e){
+  var link = e.target.closest('a[href^="#"]');
+  if(link){ e.preventDefault(); guideGo(decodeURIComponent(link.getAttribute('href').slice(1))); return; }
+  var img = e.target.closest('figure img');
+  if(img){
+    var zoom = document.getElementById('guideZoom');
+    zoom.querySelector('img').src = img.getAttribute('src');
+    zoom.querySelector('img').alt = img.alt;
+    zoom.querySelector('p').textContent = img.alt;
+    zoom.setAttribute('aria-label', img.alt);
+    zoom.hidden = false;
+  }
+});
+document.getElementById('guideContent').addEventListener('load', function(e){
+  var pin = guideState.pinned;
+  if(e.target.tagName !== 'IMG' || !pin) return;
+  if(Date.now() > pin.until){ guideState.pinned = null; return; }
+  var target = document.getElementById(pin.id);
+  if(target) target.scrollIntoView({block: 'start', behavior: 'instant'});
+}, true);
+['wheel', 'touchmove'].forEach(function(ev){ document.getElementById('view-guide').addEventListener(ev, guideUnpin, {passive: true}); });
+document.getElementById('guideZoom').addEventListener('click', function(){ this.hidden = true; });
+document.addEventListener('keydown', function(e){
+  if(currentView !== 'guide') return;
+  if(e.key === 'Escape') document.getElementById('guideZoom').hidden = true;
+  if(['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'Home', 'End', ' '].indexOf(e.key) !== -1) guideUnpin();
+});
+document.getElementById('lnkManual').addEventListener('click', function(e){
+  e.preventDefault();
+  guideState.section = null;
+  navigate('guide');
+  window.scrollTo({top: 0, behavior: 'instant'});
 });
 
 /* ════════════════════════════════════════════════════════════════
@@ -2449,6 +2897,7 @@ document.getElementById('chartServiceSelect').addEventListener('change', functio
   updateEpicTargetInput();
   renderEpicCharts();
   renderEpicInsights();
+  syncRoute(false);
 });
 document.getElementById('epicTargetDate').addEventListener('change', function(e){
   var sid = parseInt(document.getElementById('chartServiceSelect').value, 10);
@@ -2469,6 +2918,7 @@ document.getElementById('epicTargetDate').addEventListener('change', function(e)
 document.getElementById('dataServiceSelect').addEventListener('change', function(e){
   currentDataServiceId = parseInt(e.target.value, 10) || null;
   renderDataView();
+  syncRoute(false);
 });
 
 function updateEpicTargetInput(){
@@ -3068,6 +3518,8 @@ var JIRA_METRICS = [['remaining', 'Остаток'], ['spent', 'Затрачен
 var JIRA_TIME_FIELDS = [{id: 'timeestimate', name: 'Оставшаяся оценка', time: true},
   {id: 'timespent', name: 'Затраченное время', time: true},
   {id: 'timeoriginalestimate', name: 'Первоначальная оценка', time: true}];
+/* пустое поле Jira у показателя из колонки Structure: по задачам — та же колонка без суммы */
+var FIELD_EMPTY_LABEL = '— не заполнять —', FIELD_FROM_STRUCTURE_LABEL = '— как колонка Structure, по самой задаче —';
 var JIRA_DEFAULT_FIELD_MAP = {remaining: {field: 'timeestimate', unit: 'seconds', structure: null}, spent: {field: 'timespent', unit: 'seconds', structure: null},
   estimate: {field: 'timeoriginalestimate', unit: 'seconds', structure: null}};
 var JIRA_FIELD_UNITS = [['seconds', 'секунды'], ['hours', 'часы'], ['minutes', 'минуты'], ['days', 'дни (8 ч)'], ['ms', 'миллисекунды']];
@@ -3320,8 +3772,8 @@ function fieldMapSummary(fm){
   }).join('');
 }
 
-function fieldOptions(fields, selected){
-  var opts = '<option value="">— не заполнять —</option>';
+function fieldOptions(fields, selected, emptyLabel){
+  var opts = '<option value="">'+escapeHtml(emptyLabel || FIELD_EMPTY_LABEL)+'</option>';
   var seen = !selected;
   fields.forEach(function(f){
     if(f.id === selected) seen = true;
@@ -3371,11 +3823,11 @@ function openJiraButtonEditor(button){
               '<button type="button" class="btn btn-ghost btn-sm" data-str-edit="'+m[0]+'">Выбрать колонку…</button>'+
               '<label class="small" for="jbStrUnit_'+m[0]+'">Значение колонки в</label><select id="jbStrUnit_'+m[0]+'">'+unitOptions(STRUCTURE_UNITS, st ? st.unit : 'hours')+'</select></div>'+
             '<div class="jb-jira-row"><label class="small" for="jbField_'+m[0]+'" id="jbFieldLabel_'+m[0]+'">'+(st ? 'Поле Jira для состава задач и истории' : 'Поле Jira')+'</label>'+
-              '<select id="jbField_'+m[0]+'" data-metric="'+m[0]+'">'+fieldOptions(JIRA_TIME_FIELDS, f.field)+'</select>'+
+              '<select id="jbField_'+m[0]+'" data-metric="'+m[0]+'">'+fieldOptions(JIRA_TIME_FIELDS, f.field, st ? FIELD_FROM_STRUCTURE_LABEL : null)+'</select>'+
               '<select id="jbUnit_'+m[0]+'" aria-label="Единица: '+m[1]+'">'+unitOptions(JIRA_FIELD_UNITS, f.unit || 'seconds')+'</select></div></div>';
         }).join('')+'</div>'+
         '<div class="jb-str-panel" id="jbStrPanel" hidden></div>'+
-        '<p class="bulk-note">Поле Jira — значения суммируются по задачам эпика (поля учёта времени Jira хранятся в секундах). Колонка Structure — берётся значение колонки у строки задачи эпика: поле, сумма по вложенным или формула, ровно как в структуре.</p></div>'+
+        '<p class="bulk-note">Поле Jira — значения суммируются по задачам эпика (учёт времени Jira, в том числе Σ-поля, — всегда в секундах). Колонка Structure — берётся значение колонки у строки задачи эпика: поле, сумма по вложенным или формула, ровно как в структуре; часы отдельных задач в составе эпика — та же колонка по самой задаче, если не выбрано поле Jira.</p></div>'+
       '<p class="bulk-note">Укажите для эпиков задачи Jira (ключи через запятую). «С вложенными»: со структурой — все задачи под указанными в дереве структуры, без структуры — задача вместе с подзадачами. Эпики без задач в срез не попадают.</p>'+
       '<div class="table-scroll"><table class="data-table compact-table jira-map-table" id="jbTable"><thead><tr><th>Эпик</th><th>Задачи Jira</th><th class="center">С вложенными</th></tr></thead><tbody>'+
       STATE.services.map(function(s){
@@ -3440,6 +3892,7 @@ function openJiraButtonEditor(button){
       var structure = e.target.value === 'structure';
       document.getElementById('jbStr_'+m[0]).hidden = !structure;
       document.getElementById('jbFieldLabel_'+m[0]).textContent = structure ? 'Поле Jira для состава задач и истории' : 'Поле Jira';
+      document.getElementById('jbField_'+m[0]).options[0].textContent = structure ? FIELD_FROM_STRUCTURE_LABEL : FIELD_EMPTY_LABEL;
       if(structure && !strSpecs[m[0]]) openStructureColumnPanel(m[0], m[1]);
     });
   });
@@ -3648,7 +4101,7 @@ function openJiraButtonEditor(button){
       jiraFieldList = list;
       JIRA_METRICS.forEach(function(m){
         var sel = document.getElementById('jbField_'+m[0]);
-        sel.innerHTML = fieldOptions(list, sel.value);
+        sel.innerHTML = fieldOptions(list, sel.value, document.getElementById('jbSrc_'+m[0]).value === 'structure' ? FIELD_FROM_STRUCTURE_LABEL : null);
       });
       toast('Числовых полей загружено: ' + list.length);
     }).catch(function(){}).then(function(){ btn.disabled = false; btn.textContent = 'Загрузить поля из Jira'; });
@@ -3811,9 +4264,10 @@ function compositionRowHtml(o){
     '<td class="num">'+hoursToStr(l.scope)+'</td>'+
     '<td class="num nowrap">'+delta+'</td>'+
     burnupCell(burnupForecast(hist), o.target)+
-    '<td class="nowrap">'+(probs ? '<span class="badge badge-risk" title="'+escapeAttr(probTitle)+'">⚠ '+probs+'</span>' : '<span class="badge badge-ok">✓ в порядке</span>')+'</td>'+
+    '<td class="nowrap" data-v="'+(probs ? 'есть проблемы' : 'в порядке')+'">'+(probs ? '<span class="badge badge-risk" title="'+escapeAttr(probTitle)+'">⚠ '+probs+'</span>' : '<span class="badge badge-ok">✓ в порядке</span>')+'</td>'+
     '<td class="mono nowrap">'+fmtDate(l.date)+'</td></tr>';
 }
+var COMPOSITION_FILTER = ['text', null, 'num', 'num', 'num', 'num', 'text', 'list', 'text'];
 var COMPOSITION_HEAD = '<th class="comp-col">Состав задач</th><th class="num">Выполнено объёма</th><th class="num">Задач готово</th>'+
   '<th class="num">Объём, '+unitSuffix()+'</th><th class="num" title="Изменение объёма с прошлого среза">Δ объёма</th>'+
   '<th title="Дата, когда «Выполнено» догонит «Объём» при текущих темпах (burn-up). Зелёным — не позже цели">Прогноз по задачам</th>'+
@@ -3834,6 +4288,7 @@ function renderJiraComposition(){
     }).join('') +
     (total ? compositionRowHtml({label: 'Итого по проекту', latest: total.latest, history: total.history, cls: 'total-row'}) : '') +
     '</tbody>';
+  tableFilter(table, COMPOSITION_FILTER);
   table.querySelectorAll('[data-changes]').forEach(function(btn){
     btn.addEventListener('click', function(e){
       e.stopPropagation();
@@ -4007,6 +4462,7 @@ function renderStageJira(){
         cls: 'clickable', attrs: ' data-stage="'+escapeAttr(n)+'" tabindex="0"'});
     }).join('') +
     compositionRowHtml({label: 'Итого по проекту', latest: total.latest, history: total.history, cls: 'total-row'}) + '</tbody>';
+  tableFilter(table, COMPOSITION_FILTER);
   var sel = document.getElementById('stageBurnupSelect');
   var current = sel.value;
   sel.innerHTML = names.map(function(n){ return '<option value="'+escapeAttr(n)+'">'+escapeHtml(n)+'</option>'; }).join('') +
@@ -4154,20 +4610,24 @@ function openJiraIssues(sid){
           return '<button type="button" class="btn btn-ghost btn-sm'+(i === 0 ? ' active' : '')+'" data-filter="'+f[0]+'"'+(f[2] ? '' : ' disabled')+'>'+escapeHtml(f[1])+' <span class="muted-cell">'+f[2]+'</span></button>';
         }).join('')+'</div>'+
         '<div class="table-scroll jira-issues-scroll"><table class="data-table compact-table" id="jiTable"><thead><tr>'+
-          '<th>Задача</th><th>Тема</th><th>Статус</th><th class="num">Остаток</th><th class="num">Затрачено</th><th class="num">Оценка</th><th>Данные</th></tr></thead><tbody>'+
+          '<th>Задача</th><th>Тема</th><th>Статус</th><th class="num">Остаток, ч</th><th class="num">Затрачено, ч</th><th class="num">Оценка, ч</th><th>Данные</th></tr></thead><tbody>'+
         issues.map(function(i){
           return '<tr data-cat="'+i.category+'"'+(i.problems.length ? ' data-problem="1"' : '')+(i.container ? ' class="container-row"' : '')+'>'+
             '<td class="nowrap">'+link(i.key)+'</td>'+
             '<td>'+escapeHtml(i.summary)+(i.container ? ' <span class="muted-cell">· содержит задачи</span>' : '')+
               (data.prevDate && !i.prev ? ' <span class="badge badge-new">новая</span>' : '')+'</td>'+
             '<td class="nowrap"><span class="badge '+badgeClass[i.category]+'">'+escapeHtml(i.status || CATEGORY_LABELS[i.category])+'</span></td>'+
-            '<td class="num">'+(isNum(i.remaining) ? fmtNum(i.remaining) : '—')+deltaHtml(i, 'remaining')+'</td>'+
-            '<td class="num">'+(isNum(i.spent) ? fmtNum(i.spent) : '—')+deltaHtml(i, 'spent')+'</td>'+
-            '<td class="num">'+(isNum(i.estimate) ? fmtNum(i.estimate) : '—')+deltaHtml(i, 'estimate')+'</td>'+
-            '<td class="issue-problems">'+i.problems.map(function(p){ return '<div>⚠ '+escapeHtml(labels[p] || p)+'</div>'; }).join('')+'</td></tr>';
+            ['remaining', 'spent', 'estimate'].map(function(m){
+              return '<td class="num" data-num="'+(isNum(i[m]) ? i[m] : '')+'">'+(isNum(i[m]) ? fmtNum(i[m]) : '—')+deltaHtml(i, m)+'</td>';
+            }).join('')+
+            '<td class="issue-problems" data-values="'+escapeAttr(i.problems.length ? i.problems.map(function(p){ return labels[p] || p; }).join('|') : 'в порядке')+'">'+
+              i.problems.map(function(p){ return '<div>⚠ '+escapeHtml(labels[p] || p)+'</div>'; }).join('')+'</td></tr>';
         }).join('')+'</tbody></table></div>',
       onOk: function(){ closeModal(); return false; }
     });
+    var jiTable = document.getElementById('jiTable');
+    delete tableFilterState.jiTable;  // у каждого эпика — свой список задач
+    tableFilter(jiTable, ['text', 'text', 'list', 'num', 'num', 'num', 'list']);
     document.querySelectorAll('#jiFilter [data-filter]').forEach(function(btn){
       btn.addEventListener('click', function(){
         var f = btn.dataset.filter;
@@ -4175,6 +4635,7 @@ function openJiraIssues(sid){
         document.querySelectorAll('#jiTable tbody tr').forEach(function(tr){
           tr.hidden = !(f === 'all' || (f === 'problems' ? tr.dataset.problem : tr.dataset.cat === f));
         });
+        applyTableFilter(jiTable);
       });
     });
   }).catch(function(){});
@@ -4984,6 +5445,7 @@ function loadAbout(){
 function manualRowHtml(m){
   var has = function(ext){ return m.formats.indexOf(ext) !== -1; };
   return '<div class="about-manual"><span class="about-manual-title">'+escapeHtml(m.title)+'</span><span class="about-manual-links">'+
+    (m.online ? '<a href="#/guide'+(m.id !== 'user-guide' ? '?doc=' + m.id : '')+'" data-guide-open="'+m.id+'">Читать онлайн</a>' : '')+
     (has('pdf') ? '<a href="/manuals/'+m.id+'.pdf" target="_blank" rel="noopener">Открыть</a>'+
                   '<a href="/manuals/'+m.id+'.pdf?download=1" download>Скачать PDF</a>' : '')+
     (has('docx') ? '<a href="/manuals/'+m.id+'.docx" download>Скачать Word</a>' : '')+'</span></div>';
@@ -5004,6 +5466,16 @@ function openAbout(){
       '</div>'
     });
     document.getElementById('aboutVersions').addEventListener('click', openVersions);
+    document.querySelectorAll('[data-guide-open]').forEach(function(a){
+      a.addEventListener('click', function(e){
+        e.preventDefault();
+        closeModal();
+        guideState.doc = a.dataset.guideOpen;
+        guideState.section = null;
+        navigate('guide');
+        window.scrollTo({top: 0, behavior: 'instant'});
+      });
+    });
   }).catch(function(){});
 }
 function openVersions(){
@@ -5195,6 +5667,7 @@ function loadProjectData(pid, view, quiet){
     loadJiraConfig();
     loadJiraComposition();
     if(!serviceById(currentDataServiceId)) currentDataServiceId = STATE.services.length ? STATE.services[0].id : null;
+    document.getElementById('navServiceCount').textContent = STATE.services.length;
     if(!quiet) navigate(view || currentView);
   });
 }
@@ -5226,18 +5699,26 @@ function init(){
     currentUser = data.user;
     currentUser.defaultPassword = !!data.defaultPassword;
     updateRoleUI();
+    /* раздел из адреса (#/раздел?project=…): после F5 — та же страница */
+    var route = parseRoute();
+    if(route){
+      pendingRoute = route;
+      currentView = route.view;
+      if(route.project) currentProjectId = route.project;
+      if(route.view === 'data' && route.epic) currentDataServiceId = route.epic;
+    }
     /* ссылка на проект из письма или ответа бота: /?project=3 */
     try {
       var linked = parseInt(new URLSearchParams(window.location.search).get('project'), 10);
       if(linked > 0){
         currentProjectId = linked;
-        if(window.history && window.history.replaceState) window.history.replaceState(null, '', window.location.pathname);
+        if(window.history && window.history.replaceState) window.history.replaceState(null, '', window.location.pathname + window.location.hash);
       }
     } catch(e){}
     loadProjects();
     if(isGlobalAdmin()) api('/api/admin/health').then(function(h){ setHealthDot(h.status); }).catch(function(){});
   }).catch(function(){
-    window.location.href = '/login';
+    window.location.href = '/login' + window.location.hash;  /* после входа — тот же раздел */
   });
 }
 

@@ -29,7 +29,7 @@ from urllib.parse import quote
 
 from flask import (
     Flask, request, jsonify, session, render_template,
-    redirect, g, Response, send_file
+    redirect, g, Response, send_file, send_from_directory
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -626,7 +626,8 @@ def api_about():
     for key, (title, admin_only) in MANUALS.items():
         formats = [ext for ext in MANUAL_TYPES if os.path.isfile(os.path.join(MANUALS_DIR, f'{key}.{ext}'))]
         if formats and (is_admin or not admin_only):
-            manuals.append({'id': key, 'title': title, 'formats': formats})
+            manuals.append({'id': key, 'title': title, 'formats': formats,
+                            'online': os.path.isfile(os.path.join(MANUALS_DIR, f'{key}.html'))})
     return jsonify({'name': 'Burndown', 'version': APP_VERSION, 'date': RELEASES[0]['date'] if RELEASES else '',
                     'releases': RELEASES, 'manuals': manuals})
 
@@ -649,6 +650,44 @@ def manual_file(name, ext):
         return Response('Файл руководства не найден на сервере', status=404, mimetype='text/plain')
     return send_file(path, mimetype=MANUAL_TYPES[ext], as_attachment=ext != 'pdf' or request.args.get('download') == '1',
                      download_name=f'Burndown — {title.lower()} {APP_VERSION}.{ext}', max_age=0)
+
+
+def _guides_for(user):
+    return [{'id': key, 'title': title} for key, (title, admin_only) in MANUALS.items()
+            if (user['role'] == 'admin' or not admin_only) and os.path.isfile(os.path.join(MANUALS_DIR, f'{key}.html'))]
+
+
+@app.route('/api/guide/<name>')
+@login_required
+def api_guide(name):
+    """Онлайн-руководство: тот же документ, что в PDF и DOCX (docs/manuals/<name>.html собирает
+    tools/docs/build_manuals.py), с якорями разделов; картинки — по /manuals/images/."""
+    user = get_current_user()
+    if name not in MANUALS:
+        return jsonify({'error': 'Руководство не найдено'}), 404
+    title, admin_only = MANUALS[name]
+    if admin_only and user['role'] != 'admin':
+        return jsonify({'error': 'Руководство администратора доступно только администратору'}), 403
+    path = os.path.join(MANUALS_DIR, f'{name}.html')
+    if not os.path.isfile(path):
+        return jsonify({'error': 'Онлайн-версия руководства не собрана на сервере — откройте PDF'}), 404
+    with open(path, encoding='utf-8') as f:
+        body = f.read()
+    body = re.sub(r'(<img[^>]*\ssrc=")images/', r'\1/manuals/images/', body)
+    formats = [ext for ext in MANUAL_TYPES if os.path.isfile(os.path.join(MANUALS_DIR, f'{name}.{ext}'))]
+    return jsonify({'id': name, 'title': title, 'version': APP_VERSION, 'html': body, 'formats': formats,
+                    'guides': _guides_for(user)})
+
+
+@app.route('/manuals/images/<path:fname>')
+def manual_image(fname):
+    """Иллюстрации руководств (для онлайн-версии). Снимки руководства администратора — только администратору."""
+    user = get_current_user()
+    if not user:
+        return Response('Нужен вход', status=401, mimetype='text/plain')
+    if fname.startswith('admin/') and user['role'] != 'admin':
+        return Response('Нет доступа', status=403, mimetype='text/plain')
+    return send_from_directory(os.path.join(MANUALS_DIR, 'images'), fname, max_age=3600)
 
 
 # ─── API: Auth ───────────────────────────────────────────────────

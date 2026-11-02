@@ -68,7 +68,8 @@
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({username: username, password: password})
     }).then(function(r){ return r.json().catch(function(){ return {}; }); }).then(function(data){
-      if(data.success){ window.location.href = '/'; }
+      /* раздел, с которого отправили на вход (#/раздел?project=…), открывается после входа */
+      if(data.success){ window.location.href = '/' + (/^#\/[a-z]+/.test(window.location.hash) ? window.location.hash : ''); }
       else { errEl.textContent = data.error || 'Ошибка входа'; btn.disabled = false; btn.textContent = 'Войти'; }
     }).catch(function(){
       errEl.textContent = 'Ошибка соединения с сервером'; btn.disabled = false; btn.textContent = 'Войти';

@@ -75,7 +75,7 @@
         <div>© Alexander Yurasov</div>
         <button type="button" class="sidebar-version" id="btnVersions" title="История версий">Burndown — версия {{ app_version }}</button>
         <div class="sidebar-links">
-          <a href="/manuals/user-guide.pdf" target="_blank" rel="noopener" id="lnkManual" title="Руководство пользователя (PDF) — откроется в новой вкладке">Руководство</a>
+          <a href="#/guide" id="lnkManual" title="Руководство пользователя — оглавление, поиск, PDF">Руководство</a>
           <span aria-hidden="true">·</span>
           <button type="button" id="btnAbout">О программе</button>
         </div>
@@ -732,6 +732,25 @@
     </section>
 
     <!-- NO PROJECT -->
+    <section class="view" id="view-guide">
+      <div class="guide-head">
+        <div class="guide-docs" id="guideDocs" role="group" aria-label="Руководство"></div>
+        <div class="guide-actions" id="guideActions"></div>
+      </div>
+      <div class="guide-layout">
+        <nav class="guide-toc" aria-label="Содержание руководства">
+          <input type="search" class="filter-input guide-search" id="guideSearch" placeholder="Найти в руководстве" aria-label="Найти в руководстве">
+          <p class="guide-toc-empty" id="guideTocEmpty" hidden>Ничего не найдено</p>
+          <ul id="guideToc"></ul>
+        </nav>
+        <div class="guide-main">
+          <select class="guide-toc-mobile" id="guideTocMobile" aria-label="Перейти к разделу"></select>
+          <article class="guide-content" id="guideContent"><p class="muted-cell">Загрузка руководства…</p></article>
+        </div>
+      </div>
+      <div class="guide-zoom" id="guideZoom" role="dialog" aria-modal="true" hidden><img alt=""><p></p></div>
+    </section>
+
     <section class="view" id="view-empty">
       <div class="panel empty-state">
         <p>Нет доступных проектов. Обратитесь к администратору, чтобы получить доступ.</p>

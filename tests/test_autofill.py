@@ -29,7 +29,18 @@ def schedule(admin, bid, **over):
     body = {'enabled': True, 'days': [1, 2, 3, 4, 5], 'time': '09:00', 'timezone': 'Europe/Moscow',
             'overwrite': True}
     body.update(over)
-    return admin.put(f'/api/jira/buttons/{bid}/schedule', json=body)
+    r = admin.put(f'/api/jira/buttons/{bid}/schedule', json=body)
+    forget_today(bid)
+    return r
+
+
+def forget_today(bid):
+    """Расписание как будто сохранено заранее: если тест идёт в день из сценария (MONDAY) после времени запуска,
+    сохранение отметило бы этот день выполненным, и сценарный запуск не случился бы."""
+    db = app_module.sqlite3.connect(app_module.DB_PATH)
+    db.execute('UPDATE jira_schedules SET last_run_date = NULL WHERE button_id = ?', (bid,))
+    db.commit()
+    db.close()
 
 
 def run_due(flask_app, now):
