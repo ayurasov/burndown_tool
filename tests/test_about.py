@@ -55,7 +55,7 @@ def test_about_lists_manuals_by_role(admin, make_user):
     d = admin.get('/api/about').get_json()
     assert d['version'] == app_module.APP_VERSION and d['releases'][0]['version'] == d['version']
     assert [m['id'] for m in d['manuals']] == ['user-guide', 'admin-guide']
-    assert d['manuals'][0]['formats'] == ['pdf', 'docx']
+    assert d['manuals'][0]['formats'] == ['pdf', 'docx'] and d['manuals'][0]['online'] is True
     user = make_user('petrova', project_id=1)
     assert [m['id'] for m in user.get('/api/about').get_json()['manuals']] == ['user-guide']
 
@@ -83,3 +83,39 @@ def test_manual_open_and_download(admin, make_user, client):
 def test_sidebar_shows_version(admin):
     html = admin.get('/').get_data(as_text=True)
     assert f'Burndown — версия {app_module.APP_VERSION}' in html
+
+
+def test_online_guide(admin, make_user, client, monkeypatch, tmp_path):
+    """Онлайн-руководство: тот же документ, что в PDF (HTML собирает tools/docs/build_manuals.py), с якорями разделов."""
+    user = make_user('petrova', project_id=1)
+    d = user.get('/api/guide/user-guide').get_json()
+    assert d['title'] == 'Руководство пользователя' and d['version'] == app_module.APP_VERSION
+    assert d['formats'] == ['pdf', 'docx'] and d['guides'] == [{'id': 'user-guide', 'title': 'Руководство пользователя'}]
+    assert '<h1 data-number="1" id="о-документе">' in d['html'] and 'src="/manuals/images/user/' in d['html']
+    assert 'src="images/' not in d['html']
+    assert [g['id'] for g in admin.get('/api/guide/user-guide').get_json()['guides']] == ['user-guide', 'admin-guide']
+    # руководство администратора и его снимки — только администратору
+    assert user.get('/api/guide/admin-guide').status_code == 403 and admin.get('/api/guide/admin-guide').status_code == 200
+    assert user.get('/api/guide/other').status_code == 404
+    img = user.get('/manuals/images/user/01-login.png')
+    assert img.status_code == 200 and img.mimetype == 'image/png'
+    assert user.get('/manuals/images/admin/01-users.png').status_code == 403
+    assert admin.get('/manuals/images/admin/01-users.png').status_code == 200
+    assert user.get('/manuals/images/user/нет.png').status_code == 404
+    assert user.get('/manuals/images/..%2F..%2Fapp.py').status_code == 404
+    assert client.get('/manuals/images/user/01-login.png').status_code == 401
+    assert client.get('/api/guide/user-guide').status_code == 401
+    # онлайн-версия не собрана — понятная ошибка, в «О программе» нет ссылки «Читать онлайн»
+    monkeypatch.setattr(app_module, 'MANUALS_DIR', str(tmp_path))
+    (tmp_path / 'user-guide.pdf').write_bytes(b'%PDF')
+    assert 'не собрана' in user.get('/api/guide/user-guide').get_json()['error']
+    assert user.get('/api/about').get_json()['manuals'][0]['online'] is False
+
+
+def test_online_guide_is_built_with_manuals():
+    """HTML онлайн-руководства собирается вместе с PDF и DOCX и не отстаёт от текста руководства."""
+    for guide in ('user-guide', 'admin-guide'):
+        md = (ROOT / 'docs' / 'manuals' / f'{guide}.md').read_text(encoding='utf-8')
+        html = (ROOT / 'docs' / 'manuals' / f'{guide}.html').read_text(encoding='utf-8')
+        headings = re.findall(r'^#{1,2} (.+)$', md, re.M)
+        assert headings and all(h.strip() in html for h in headings), guide

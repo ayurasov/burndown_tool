@@ -7,6 +7,7 @@ import pytest
 import app as app_module
 import jira_integration as jira
 from fake_jira import FakeJira
+from test_autofill import forget_today
 from test_jira import connect, create_button
 
 
@@ -152,6 +153,7 @@ def test_autofill_stores_composition(admin, flask_app, button):
     snap(admin, button, '2026-11-01')
     admin.put(f'/api/jira/buttons/{button}/schedule', json={
         'enabled': True, 'days': [1], 'time': '09:00', 'timezone': 'Europe/Moscow', 'overwrite': True})
+    forget_today(button)  # иначе 2 ноября после 9:00 сохранение отметит сценарный день выполненным
     with flask_app.app_context():
         assert app_module.run_due_schedules(datetime(2026, 11, 2, 6, 30, tzinfo=timezone.utc)) == 1
     history = admin.get('/api/projects/1/jira/composition').get_json()['history']['1']

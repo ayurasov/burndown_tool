@@ -257,6 +257,14 @@ def main():
         pg.mouse.move(5, 5)
         shot(pg.locator('#allEpicsBlock'), 'user/08-all-epics.png')
         shot(pg.locator('#summaryTable').locator('xpath=ancestor::div[contains(@class,"panel")]'), 'user/09-summary.png')
+        # фильтр по полям: остаток больше 100 ч
+        summary_panel = pg.locator('#summaryTable').locator('xpath=ancestor::div[contains(@class,"panel")]')
+        summary_panel.locator('.tf-toggle').click()
+        pg.fill('#summaryTable .tf-row input[data-col="2"]', '>100')
+        pg.wait_for_timeout(300)
+        shot(summary_panel, 'user/63-table-filter.png')
+        summary_panel.locator('.tf-reset').click()
+        summary_panel.locator('.tf-toggle').click()
         shot(pg.locator('#burnRateTable').locator('xpath=ancestor::div[contains(@class,"panel")]'), 'user/10-burnrate.png')
         # задачи Jira: состав эпиков, burn-up, список задач эпика с проблемами данных
         pg.wait_for_selector('#jiraCompTable tbody tr')
@@ -384,6 +392,15 @@ def main():
         modal('user/49-versions.png')
         pg.keyboard.press('Escape')
 
+        # ── Руководство в приложении: оглавление, поиск, раздел
+        pg.click('#lnkManual')
+        pg.wait_for_selector('#guideToc li')
+        pg.fill('#guideSearch', 'фильтр')  # поиск — по заголовкам и тексту разделов
+        pg.wait_for_timeout(800)
+        shot(pg, 'user/64-online-guide.png')
+        pg.fill('#guideSearch', '')
+        go('dashboard', '#summaryTable tbody tr')
+
         # ── Интеграции (администратор): общее подключение к Jira — Server/DC, логин и пароль (Basic)
         go('integrations', '#notifyLogTable thead')
         pg.wait_for_function("document.getElementById('jiraStatus').textContent !== ''")
@@ -465,8 +482,8 @@ def main():
             app_module.get_db().execute('UPDATE jira_schedules SET last_run_date = NULL')
             app_module.get_db().commit()
             app_module.run_due_schedules()
-        pg.reload()
-        pg.wait_for_selector('#summaryTable tbody tr')
+        pg.reload()  # обновление страницы оставляет открытым тот же раздел
+        pg.wait_for_load_state('networkidle')
         go('autofill', '.autofill-card')
         shot(pg.locator('#view-autofill .panel'), 'user/31-autofill.png')
         shot(pg.locator(f'.autofill-card[data-bid="{bid1}"]'), 'user/32-autofill-card.png')

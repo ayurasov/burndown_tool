@@ -345,9 +345,10 @@ Telegram-бота (создаётся у @BotFather) и внешний адре�
 
 ## Руководства
 
-Готовые руководства пользователя и администратора (PDF и DOCX) — в [`docs/manuals`](docs/manuals).
-Приложение отдаёт их по ссылкам «Руководство» и «О программе» внизу бокового меню (`/manuals/user-guide.pdf`,
-`?download=1` — скачать; руководство администратора — только администратору).
+Готовые руководства пользователя и администратора (HTML, PDF и DOCX) — в [`docs/manuals`](docs/manuals).
+«Руководство» внизу бокового меню открывает их прямо в приложении (`#/guide`: оглавление, поиск, раздел в адресе —
+HTML из `docs/manuals/*.html`, иллюстрации по `/manuals/images/…`), «О программе» — ещё и PDF и DOCX
+(`/manuals/user-guide.pdf`, `?download=1` — скачать; руководство администратора — только администратору).
 
 **Версии.** История версий для пользователей — [`docs/versions.md`](docs/versions.md) («## Версия X.Y.Z (дата)»,
 описание, разделы «### …» со списками). Первая запись — текущая версия: её показывает приложение и подставляет
@@ -358,7 +359,7 @@ python-docx, pypdf и Playwright с Chromium):
 ```bash
 pip install -r requirements-dev.txt python-docx pillow
 python tools/docs/shots.py           # скриншоты на демо-стенде (временная БД и учебная Jira)
-python tools/docs/build_manuals.py   # PDF и DOCX
+python tools/docs/build_manuals.py   # HTML для чтения в приложении, PDF и DOCX
 ```
 
 ## Ролевая модель

@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover
 INSTANCE_TYPES = ('cloud', 'server', 'server_basic')
 ISSUE_KEY_RE = re.compile(r'^[A-Z][A-Z0-9_]*-\d+$')
 METRICS = ('remaining', 'spent', 'estimate')
-ISSUE_FIELDS = ('summary', 'status', 'parent')  # для состава эпика по задачам
+ISSUE_FIELDS = ('summary', 'status', 'parent', 'issuetype')  # для состава эпика по задачам
 STATUS_CATEGORIES = ('new', 'indeterminate', 'done')
 PROBLEMS = {
     'no_estimate': 'Не закрыта, нет оценки и остатка',
@@ -52,7 +52,10 @@ PROBLEMS = {
 }
 TIME_FIELDS = {'remaining': 'timeestimate', 'spent': 'timespent', 'estimate': 'timeoriginalestimate'}
 TIME_FIELD_NAMES = {'timeestimate': 'Оставшаяся оценка', 'timespent': 'Затраченное время',
-                    'timeoriginalestimate': 'Первоначальная оценка'}
+                    'timeoriginalestimate': 'Первоначальная оценка', 'aggregatetimeestimate': 'Σ Оставшаяся оценка',
+                    'aggregatetimespent': 'Σ Затраченное время', 'aggregatetimeoriginalestimate': 'Σ Первоначальная оценка'}
+# Σ-поля Jira: значение задачи вместе с её подзадачами
+AGGREGATE_FIELDS = {'aggregatetimeestimate', 'aggregatetimespent', 'aggregatetimeoriginalestimate'}
 # единица значения поля Jira или колонки Structure → множитель для перевода в часы (рабочий день — 8 ч)
 UNITS = {'ms': 1 / 3600000, 'seconds': 1 / 3600, 'minutes': 1 / 60, 'hours': 1.0, 'days': 8.0}
 ATTRIBUTE_ID_RE = re.compile(r'^[A-Za-z0-9_.:\-]{1,200}$')
@@ -208,21 +211,24 @@ def occurrence_warning(key, occurrences, picked, in_scope, scope_rows):
     return None
 
 
-def subtree_issues_at(items, row_id):
-    """ID задач в поддереве строки row_id (включая её саму)."""
-    out, depth = set(), None
+def subtree_rows(items, row_id):
+    """Строки поддерева строки row_id (включая её саму) → [(rowId, issueId|None)] в порядке структуры."""
+    out, depth = [], None
     for rid, d, issue_id, _item in items:
         if depth is None:
             if rid == row_id:
                 depth = d
-                if issue_id is not None:
-                    out.add(issue_id)
+                out.append((rid, issue_id))
             continue
         if d <= depth:
             break
-        if issue_id is not None:
-            out.add(issue_id)
+        out.append((rid, issue_id))
     return out
+
+
+def subtree_issues_at(items, row_id):
+    """ID задач в поддереве строки row_id (включая её саму)."""
+    return {issue_id for _rid, issue_id in subtree_rows(items, row_id) if issue_id is not None}
 
 
 SCOPE_ITEM_RE = re.compile(r'^[^,:]{1,300}$')
@@ -539,6 +545,8 @@ def normalize_field_map(raw):
             raise ValueError(f'Некорректный идентификатор поля Jira: {field}')
         if unit not in UNITS:
             raise ValueError('Единица измерения — миллисекунды, секунды, минуты, часы или дни')
+        if field in DURATION_FIELDS:
+            unit = 'seconds'  # учёт времени (и Σ-поля) Jira всегда отдаёт в секундах, что бы ни было выбрано раньше
         structure = item.get('structure')
         if structure:
             if not isinstance(structure, dict):
@@ -869,8 +877,8 @@ class JiraClient:
             ftype = (f.get('schema') or {}).get('type')
             if fid in TIME_FIELD_NAMES or ftype == 'number':
                 out.append({'id': fid, 'name': TIME_FIELD_NAMES.get(fid) or f.get('name') or fid,
-                            'custom': bool(f.get('custom')), 'time': fid in TIME_FIELD_NAMES})
-        out.sort(key=lambda f: (not f['time'], f['name'].lower()))
+                            'custom': bool(f.get('custom')), 'time': fid in DURATION_FIELDS})
+        out.sort(key=lambda f: (not f['time'], f['id'] in AGGREGATE_FIELDS, f['name'].lower()))
         return out
 
 
@@ -973,22 +981,50 @@ def collect_issues(client, structure_id, mappings, fields, changelog=False, prog
     return groups, histories
 
 
+def without_subtasks(issues, field_map):
+    """Σ-поле Jira у задачи включает её подзадачи: если подзадачи тоже в составе эпика, у родителя остаётся только своя
+    часть (Σ минус подзадачи из состава) — иначе в сумме по эпику и в составе задач они учитываются дважды.
+    issues — {issueId: поля задачи} → такой же словарь (изменённые задачи — копии)."""
+    fields = {spec['field'] for spec in field_map.values() if spec['field'] in AGGREGATE_FIELDS}
+    if not fields:
+        return issues
+    by_key = {f.get('__key'): i for i, f in issues.items()}
+    children = {}
+    for issue_id, f in issues.items():
+        kind = f.get('issuetype') if isinstance(f.get('issuetype'), dict) else {}
+        parent = (f.get('parent') if isinstance(f.get('parent'), dict) else {}).get('key')
+        if kind.get('subtask') and parent in by_key and by_key[parent] != issue_id:
+            children.setdefault(by_key[parent], []).append(f)
+    if not children:
+        return issues
+    out = dict(issues)
+    for parent_id, kids in children.items():
+        f = dict(out[parent_id])
+        for field in fields:
+            own, sub = _number(f.get(field)), [_number(k.get(field)) for k in kids]
+            if own is not None:
+                f[field] = max(own - sum(v for v in sub if v is not None), 0)
+        out[parent_id] = f
+    return out
+
+
 def _snapshot_item(group, field_map):
     """Группа задач ассоциации → строка среза: суммы показателей, задачи и предупреждения."""
     warnings = list(group['warnings'])
     values = {}
+    issues = without_subtasks(group['issues'], field_map)
     for metric in METRICS:
         spec = field_map[metric]
         if not spec['field']:
             values[metric] = None
             continue
-        raw = [f.get(spec['field']) for f in group['issues'].values()]
+        raw = [f.get(spec['field']) for f in issues.values()]
         values[metric] = sum_hours(raw, spec['unit'])
         if values[metric] is None and any(v not in (None, '') for v in raw):
             warnings.append(f"Поле {spec['field']} не числовое — метрика не заполнена")
     if not group['keys'] and not group['invalid']:
         warnings.append('Не указаны задачи')
-    issues = [issue_detail(f, field_map, issue_id in group['containers']) for issue_id, f in group['issues'].items()]
+    issues = [issue_detail(f, field_map, issue_id in group['containers']) for issue_id, f in issues.items()]
     issues.sort(key=lambda i: issue_sort_key(i['key']))
     return dict(serviceId=group['serviceId'], issueCount=len(group['issues']), warnings=warnings, issues=issues, **values)
 
@@ -1007,7 +1043,81 @@ def compute_snapshot(client, structure_id, mappings, field_map=None, transformat
     columns = {m: field_map[m]['structure'] for m in METRICS if field_map[m].get('structure')}
     if columns:
         apply_structure_columns(client, structure_id, groups, items, columns, transformations, scope)
+        apply_structure_issue_values(client, structure_id, groups, items, field_map, scope)
     return items
+
+
+def own_attribute(column):
+    """Та же колонка Structure по самой задаче, без суммы по вложенным → атрибут или None (если не понять, как
+    убрать сумму из готовой спецификации)."""
+    if column.get('editor'):
+        return column_variants(column['editor'])['own']
+    attr = column.get('attribute') or {}
+    params = attr.get('params') if isinstance(attr.get('params'), dict) else {}
+    if attr.get('id') == 'sum' and isinstance(params.get('attribute'), dict):
+        return params['attribute']
+    formula = params.get('formula')
+    if attr.get('id') == 'expr' and isinstance(formula, str):
+        text = formula.strip()
+        match = re.match(r'^SUM(?:#[A-Za-z]+)?\s*\{(.*)\}$', text, re.S)
+        if match:
+            return dict(attr, params=dict(params, formula=match.group(1).strip()))
+        return None if 'SUM' in text.upper() else attr
+    return attr if attr.get('id') and attr.get('id') not in ('sum', 'expr') else None  # колонка без суммы — уже «сама задача»
+
+
+def apply_structure_issue_values(client, structure_id, groups, items, field_map, scope=None):
+    """Показатели задач в составе эпика для метрик из колонок Structure, у которых не задано поле Jira: значение той же
+    колонки у строки задачи без суммы по вложенным (для формулы — формула по самой задаче). Строка задачи берётся
+    из поддерева выбранной строки эпика (раздел структуры), задача, стоящая в нём несколько раз, — один раз."""
+    derive = {}
+    for metric in METRICS:
+        spec = field_map[metric]
+        if spec.get('structure') and not spec['field']:
+            attr = own_attribute(spec['structure'])
+            if attr:
+                derive[metric] = (attr, spec['structure']['unit'])
+    if not derive or not structure_id:
+        return
+    forest = client.forest_items(structure_id)
+    places = issue_occurrences(forest)
+    wanted = scope_rows(forest, scope)
+    row_of = []
+    for g in groups:
+        rows = {}
+        for _key, issue_id, _f in g['roots']:
+            occ, _in_scope = pick_occurrence(places.get(issue_id), wanted)
+            if occ is None:
+                continue
+            for rid, iid in (subtree_rows(forest, occ['row']) if g['subtree'] else [(occ['row'], issue_id)]):
+                if iid in g['issues']:
+                    rows.setdefault(iid, rid)
+        row_of.append(rows)
+    specs, slot = [], {}
+    for metric, (attr, _unit) in derive.items():
+        key = json.dumps(attr, sort_keys=True, ensure_ascii=False)
+        if key not in slot:
+            slot[key] = len(specs)
+            specs.append(attr)
+        derive[metric] = (slot[key], derive[metric][1])
+    all_rows = sorted({r for rows in row_of for r in rows.values()})
+    if not all_rows:
+        return
+    try:
+        values = client.structure_values(structure_id, all_rows, specs)
+    except JiraError as e:
+        for item in items:
+            item['warnings'].append(f'Показатели задач из колонок Structure не получены: {e}')
+        return
+    derived = set(derive)
+    for g, item, rows in zip(groups, items, row_of):
+        id_of = {f.get('__key'): issue_id for issue_id, f in g['issues'].items()}
+        for detail in item.get('issues') or []:
+            row = rows.get(id_of.get(detail['key']))
+            for metric, (index, unit) in derive.items():
+                num = _number(values[index].get(row)) if row is not None else None
+                detail[metric] = None if num is None else round(num * UNITS[unit], 2)
+            detail['problems'] = issue_problems(detail, field_map, derived)
 
 
 def _number(value):
@@ -1266,9 +1376,10 @@ def issue_detail(f, field_map, container=False):
     return out
 
 
-def issue_problems(issue, field_map):
-    """Признаки, из-за которых сумма по эпику может вводить в заблуждение (только по сопоставленным полям)."""
-    mapped = {m: bool(field_map[m]['field']) for m in METRICS}
+def issue_problems(issue, field_map, derived=()):
+    """Признаки, из-за которых сумма по эпику может вводить в заблуждение (только по сопоставленным полям; derived —
+    метрики, значения которых взяты из колонок Structure)."""
+    mapped = {m: bool(field_map[m]['field']) or m in derived for m in METRICS}
     rem, spent, est = issue['remaining'], issue['spent'], issue['estimate']
     done = issue['category'] == 'done'
     out = []

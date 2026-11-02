@@ -39,6 +39,7 @@ FIELDS = [
     {'id': 'timeestimate', 'name': 'Remaining Estimate', 'custom': False, 'schema': {'type': 'number'}},
     {'id': 'timespent', 'name': 'Time Spent', 'custom': False, 'schema': {'type': 'number'}},
     {'id': 'timeoriginalestimate', 'name': 'Original Estimate', 'custom': False, 'schema': {'type': 'number'}},
+    {'id': 'aggregatetimeoriginalestimate', 'name': 'Σ Original Estimate', 'custom': False, 'schema': {'type': 'number'}},
     {'id': 'customfield_10050', 'name': 'Трудозатраты, ч', 'custom': True, 'schema': {'type': 'number'}},
     {'id': 'customfield_10060', 'name': 'Комментарий', 'custom': True, 'schema': {'type': 'string'}},
     # поля для записи прогноза Burndown
@@ -86,6 +87,8 @@ def _field(data, name):
         return _history(data)[0]
     if name == 'summary':
         return data.get('summary') or f"Задача {data['key']}"
+    if name == 'issuetype':
+        return {'name': 'Подзадача' if data.get('subtask') else 'Задача', 'subtask': bool(data.get('subtask'))}
     return data.get(name)
 
 

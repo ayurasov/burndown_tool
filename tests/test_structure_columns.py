@@ -568,3 +568,105 @@ def test_row_titles_tolerate_errors(fake, monkeypatch):
     client = client_for(fake)
     monkeypatch.setattr(client, 'structure_values', lambda *a, **k: (_ for _ in ()).throw(jira.JiraError('нет')))
     assert jira.row_titles(client, 7, [1]) == {} and jira.row_titles(client, 7, []) == {}
+
+
+# ─── Показатели задач в составе эпика (1.9.4) ────────────────────
+
+def structure_only_map():
+    """Как в АИСУЗ: показатели из колонок Structure, поле Jira для состава задач не задано."""
+    return jira.normalize_field_map({
+        'remaining': {'field': '', 'structure': {'editor': {'mode': 'formula', 'formula': USER_FORMULA, 'variables': USER_VARS,
+                                                            'sum': True}, 'unit': 'ms'}},
+        'spent': {'field': '', 'structure': {'editor': {'mode': 'field', 'field': 'timespent', 'format': 'duration',
+                                                        'sum': True}, 'unit': 'ms'}},
+        'estimate': {'field': '', 'structure': {'editor': {'mode': 'field', 'field': 'timeoriginalestimate',
+                                                           'format': 'duration', 'sum': True}, 'unit': 'ms'}}})
+
+
+def test_task_values_from_structure_columns(fake):
+    mappings = [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]
+    item = jira.compute_snapshot(client_for(fake), 7, mappings, structure_only_map())[0]
+    assert (item['estimate'], item['spent']) == (16.0, 6.0)  # колонка у эпика — Σ по поддереву
+    issues = {i['key']: i for i in item['issues']}
+    # у каждой задачи — та же колонка по самой задаче: оценка, затрачено и формула остатка (rest < 0 или статус «Готово» → 0)
+    assert {k: (i['estimate'], i['spent'], i['remaining']) for k, i in issues.items()} == {
+        'ABC-1': (12.0, 5.0, 7.0), 'ABC-2': (3.0, 1.0, 0.0), 'ABC-3': (1.0, None, 1.0)}
+    assert sum(i['estimate'] for i in issues.values()) == item['estimate']  # объём состава сходится с колонкой
+    assert issues['ABC-3']['problems'] == [] and issues['ABC-1']['problems'] == []
+
+
+def test_task_values_from_structure_in_chosen_section(fake, monkeypatch):
+    monkeypatch.setattr(fake_jira, 'FORMULA', NESTED)
+    mappings = [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]
+    item = jira.compute_snapshot(client_for(fake), 7, mappings, structure_only_map(), scope=EPIC_IN_41)[0]
+    assert sorted(i['key'] for i in item['issues']) == ['ABC-1', 'ABC-2', 'ABC-3']
+    assert [i['estimate'] for i in sorted(item['issues'], key=lambda i: i['key'])] == [12.0, 3.0, 1.0]
+
+
+def test_task_values_need_own_variant_of_column(fake):
+    assert jira.own_attribute({'attribute': {'id': 'sum', 'params': {'attribute': {'id': 'timespent'}}}}) == {'id': 'timespent'}
+    assert jira.own_attribute({'attribute': {'id': 'timespent'}}) == {'id': 'timespent'}
+    assert jira.own_attribute({'attribute': {'id': 'expr', 'params': {'formula': 'SUM#all{ a }'}}})['params']['formula'] == 'a'
+    assert jira.own_attribute({'attribute': {'id': 'expr', 'params': {'formula': 'a + 1'}}})['params']['formula'] == 'a + 1'
+    assert jira.own_attribute({'attribute': {'id': 'expr', 'params': {'formula': 'a + SUM{b}'}}}) is None
+    assert jira.own_attribute({'attribute': {'id': 'sum', 'params': {}}}) is None
+    fm = jira.normalize_field_map({'remaining': {'field': 'timeestimate', 'unit': 'seconds'},
+                                   'spent': {'field': '', 'structure': {'attribute': {'id': 'expr', 'params': {
+                                       'formula': 'a + SUM{b}', 'variables': {'a': {'id': 'timespent'}, 'b': {'id': 'timespent'}}}},
+                                       'unit': 'ms'}},
+                                   'estimate': {'field': '', 'unit': 'seconds'}})
+    item = jira.compute_snapshot(client_for(fake), 7, [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}], fm)[0]
+    assert all(i['spent'] is None for i in item['issues'])  # сумму из готовой формулы не убрать — по задачам пусто
+
+
+def test_task_values_tolerate_structure_errors(fake, monkeypatch):
+    client = client_for(fake)
+    original = client.structure_values
+    calls = []
+
+    def flaky(structure_id, rows, attributes, *a, **k):
+        calls.append(len(rows))
+        if len(calls) > 1:  # колонки эпика посчитаны, значения задач — нет
+            raise jira.JiraError('Structure недоступна')
+        return original(structure_id, rows, attributes, *a, **k)
+    monkeypatch.setattr(client, 'structure_values', flaky)
+    item = jira.compute_snapshot(client, 7, [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}],
+                                 structure_only_map())[0]
+    assert item['estimate'] == 16.0 and all(i['estimate'] is None for i in item['issues'])
+    assert any('Показатели задач из колонок Structure не получены' in w for w in item['warnings'])
+
+
+def test_snapshot_stores_task_values_from_structure(admin, fake):
+    connect(admin, fake)
+    button = create_button(admin, fieldMap=structure_only_map()).get_json()
+    assert admin.post(f"/api/jira/buttons/{button['id']}/snapshot", json={}).status_code == 200
+    issues = {i['key']: i for i in admin.get('/api/services/1/jira/issues').get_json()['issues']}
+    assert issues['ABC-2']['estimate'] == 3.0 and issues['ABC-1']['remaining'] == 7.0
+    latest = admin.get('/api/projects/1/jira/composition').get_json()['latest']['1']
+    assert latest['scope'] == 16.0 and latest['done'] == 3.0  # объём и выполнено — не 0, как раньше
+
+
+def test_jira_time_fields_always_in_seconds(fake):
+    fm = jira.normalize_field_map({'remaining': {'field': 'aggregatetimeestimate', 'unit': 'hours'},
+                                   'spent': {'field': 'timespent', 'unit': 'hours'},
+                                   'estimate': {'field': 'customfield_10050', 'unit': 'hours'}})
+    # учёт времени Jira (и Σ-поля) всегда в секундах — даже если раньше выбрали «часы»; своё поле — как выбрано
+    assert [fm[m]['unit'] for m in jira.METRICS] == ['seconds', 'seconds', 'hours']
+    fields = {f['id']: f for f in client_for(fake).list_fields()}
+    assert fields['aggregatetimeoriginalestimate'] == {'id': 'aggregatetimeoriginalestimate', 'name': 'Σ Первоначальная оценка',
+                                                       'custom': False, 'time': True}
+
+
+@pytest.mark.parametrize('subtask, estimate, own', [(True, 18.0, 12.0), (False, 24.0, 18.0)])
+def test_aggregate_fields_do_not_count_subtasks_twice(fake, monkeypatch, subtask, estimate, own):
+    # Σ-оценка ABC-1 = её 12 ч + подзадача ABC-6 (6 ч); обе в составе эпика
+    monkeypatch.setitem(fake_jira.ISSUES, 101, dict(fake_jira.ISSUES[101], aggregatetimeoriginalestimate=18 * 3600))
+    monkeypatch.setitem(fake_jira.ISSUES, 107, dict(fake_jira.ISSUES[107], aggregatetimeoriginalestimate=6 * 3600,
+                                                    subtask=subtask))
+    monkeypatch.setattr(fake_jira, 'FORMULA', '1:0:101,2:1:107')
+    fm = jira.normalize_field_map({'remaining': {'field': '', 'unit': 'seconds'}, 'spent': {'field': '', 'unit': 'seconds'},
+                                   'estimate': {'field': 'aggregatetimeoriginalestimate', 'unit': 'hours'}})
+    item = jira.compute_snapshot(client_for(fake), 7, [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}], fm)[0]
+    issues = {i['key']: i['estimate'] for i in item['issues']}
+    # подзадача: у родителя остаётся своя часть; не подзадача (дочерняя задача эпика) — Σ-поле её не включает
+    assert item['estimate'] == estimate and issues == {'ABC-1': own, 'ABC-6': 6.0}

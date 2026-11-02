@@ -249,6 +249,16 @@ def build_docx(md, title, reference):
     print(f'  docx: {out.relative_to(ROOT)}')
 
 
+# ---------------------------------------------------------------- HTML (онлайн-руководство в приложении)
+def build_html(md):
+    """Текст руководства для чтения внутри приложения (раздел «Руководство»): тот же документ, что в PDF и DOCX,
+    фрагментом HTML с якорями разделов и нумерацией; картинки — из docs/manuals/images (их отдаёт приложение)."""
+    out = md.with_suffix('.html')
+    run(['pandoc', str(md), '-f', 'markdown+implicit_figures+link_attributes', '-t', 'html5',
+         '--number-sections', '--wrap=none', '-o', str(out)])
+    print(f'  html: {out.relative_to(ROOT)}')
+
+
 def main(names):
     with tempfile.TemporaryDirectory() as tmp, sync_playwright() as p:
         reference = Path(tmp) / 'reference.docx'
@@ -258,6 +268,7 @@ def main(names):
             title = DOCS[name]
             md = MANUALS / f'{name}.md'
             print(name)
+            build_html(md)
             build_docx(md, title, reference)
             build_pdf(browser, md, title)
         browser.close()

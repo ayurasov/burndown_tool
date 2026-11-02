@@ -253,7 +253,7 @@ def test_about_version_history_and_manual(admin_ui):
     assert r.ok and r.headers['content-type'] == 'application/pdf'
     page.click('#aboutVersions')
     page.wait_for_selector('#confirmModal.show .versions-list')
-    assert page.get_attribute('#lnkManual', 'href') == '/manuals/user-guide.pdf'
+    assert page.get_attribute('#lnkManual', 'href') == '#/guide'
 
 
 # ─── Дашборд ─────────────────────────────────────────────────────
@@ -640,10 +640,10 @@ def test_enter_moves_to_next_row(admin_ui):
     admin_ui.go('data')
     page.focus('#entriesTable tbody tr:nth-child(1) input[data-field="spent"]')
     page.keyboard.press('Enter')
-    assert page.evaluate("document.activeElement.closest('tr').rowIndex") == 2
+    assert page.evaluate("document.activeElement.closest('tr').sectionRowIndex") == 1  # строка tbody
     assert page.evaluate("document.activeElement.dataset.field") == 'spent'
     page.keyboard.press('Shift+Enter')
-    assert page.evaluate("document.activeElement.closest('tr').rowIndex") == 1
+    assert page.evaluate("document.activeElement.closest('tr').sectionRowIndex") == 0
 
 
 def test_failed_save_rolls_back(admin_ui):
@@ -800,7 +800,13 @@ def test_deleted_user_is_sent_to_login(ui, make_user, admin):
     admin.delete(f'/api/users/{c.user_id}')
     ui.page.click('.nav-item[data-view="stages"]')
     ui.page.reload()
-    ui.page.wait_for_url(ui.base + '/login')
+    ui.page.wait_for_url(ui.base + '/login#/stages?project=1')  # раздел, откуда отправили на вход, сохраняется
+    make_user('temp2', project_id=1)
+    ui.page.fill('#username', 'temp2')
+    ui.page.fill('#password', 'pw-12345')
+    ui.page.click('button[type=submit]')
+    ui.page.wait_for_url(ui.base + '/#/stages?project=1')  # после входа — тот же раздел
+    ui.page.wait_for_selector('#view-stages.active')
 
 
 # ─── Связь с Jira ────────────────────────────────────────────────
@@ -1037,7 +1043,7 @@ def test_jira_field_mapping_in_editor(admin_ui, fake_jira, admin):
     page.fill('#jbName', 'Свои поля')
     assert page.input_value('#jbField_remaining') == 'timeestimate' and page.input_value('#jbUnit_remaining') == 'seconds'
     page.click('#jbLoadFields')
-    admin_ui.expect_toast('Числовых полей загружено: 5')  # с учётом поля «Шанс успеть» для записи прогноза
+    admin_ui.expect_toast('Числовых полей загружено: 6')  # с полем «Шанс успеть» для записи прогноза и Σ-оценкой
     page.select_option('#jbField_remaining', 'customfield_10050')
     assert page.input_value('#jbUnit_remaining') == 'hours'  # своё числовое поле — по умолчанию в часах
     page.select_option('#jbField_spent', '')
@@ -1131,6 +1137,20 @@ def test_jira_composition_on_dashboard(admin_ui, fake_jira, admin):
     visible = [t.strip() for t in page.locator('#jiTable tbody tr:not([hidden]) td:first-child').all_text_contents()]
     assert visible == ['ABC-2']
     assert 'Закрыта, но остаток не обнулён' in admin_ui.text('#jiTable tbody tr:not([hidden])')
+    # фильтр по полям вместе с кнопками: «Все» и остаток больше 1 ч
+    page.click('#jiFilter [data-filter="all"]')
+    page.click('#confirmModal .tf-toggle')
+    page.fill('#jiTable .tf-row input[data-col="3"]', '>1')
+    shown = lambda: [t.strip() for t in page.locator('#jiTable tbody tr:not([hidden]):not(.tf-hidden) td:first-child').all_text_contents()]
+    assert shown() == ['ABC-1', 'ABC-2'] and admin_ui.text('#confirmModal .tf-count') == 'Показано 2 из 3'
+    page.select_option('#jiTable .tf-row select[data-col="6"]', 'в порядке')
+    assert shown() == ['ABC-1']
+    page.fill('#jiTable .tf-row input[data-col="3"]', 'abc')  # не число — условие подсвечено и не применяется
+    assert 'tf-invalid' in page.get_attribute('#jiTable .tf-row input[data-col="3"]', 'class') and shown() == ['ABC-1', 'ABC-3']
+    page.click('#confirmModal .tf-reset')
+    assert len(shown()) == 3 and page.input_value('#jiTable .tf-row input[data-col="3"]') == ''
+    page.fill('#confirmModal .tf-search', 'еис')  # поиск по всем колонкам — тема ABC-2
+    assert shown() == ['ABC-2']
     page.click('#confirmOk')
     page.wait_for_selector('#confirmModal:not(.show)', state='attached')
     # в обычных окнах кнопка «Отмена» снова на месте
@@ -1762,3 +1782,82 @@ def test_structure_scope_and_places(admin_ui, admin, fake_jira, monkeypatch):
     page.click('#jbScopeLoad')  # раздел сохранён — блок открыт; после загрузки списка отмечена та же строка
     admin_ui.expect_toast('Разделов загружено: 4')
     assert page.is_checked(epic_41) and not page.is_checked('#jbScopeList [data-scope-item="101"][data-scope-row="21"]')
+
+
+# ─── Фильтр таблиц, адрес страницы и онлайн-руководство (1.9.4) ──
+
+def test_table_filter_survives_rerender(admin_ui):
+    page = admin_ui.page
+    bar = page.locator('.tf-bar:near(#summaryTable)').first
+    bar.locator('.tf-toggle').click()
+    assert page.is_visible('#summaryTable .tf-row')
+    page.fill('#summaryTable .tf-row input[data-col="2"]', '>250')  # остаток больше 250 ч
+    rows = lambda: page.locator('#summaryTable tbody tr:not(.tf-hidden):not(.total-row)').count()
+    assert rows() == 2 and bar.locator('.tf-count').text_content() == 'Показано 2 из 6'
+    page.select_option('#summaryTable .tf-row select[data-col="0"]', 'Этап 4')
+    assert rows() == 1 and 'Работа с жалобами' in admin_ui.text('#summaryTable tbody tr:not(.tf-hidden)')
+    assert page.locator('#summaryTable tbody tr.total-row').is_visible()  # «Итого» не скрывается
+    page.click('#summaryTable th[data-sort="remaining"]')  # таблица перерисована — фильтр на месте
+    assert rows() == 1 and page.input_value('#summaryTable .tf-row input[data-col="2"]') == '>250'
+    admin_ui.go('services')
+    page.locator('.tf-bar:near(#servicesTable)').first.locator('.tf-search').fill('ЕИО')  # значения полей ввода
+    assert page.locator('#servicesTable tbody tr:not(.tf-hidden)').count() == 1
+    assert not admin_ui.errors
+
+
+def test_reload_returns_to_same_page(admin_ui):
+    page = admin_ui.page
+    assert page.evaluate('location.hash').startswith('#/dashboard?project=1')
+    admin_ui.go('data')
+    page.select_option('#dataServiceSelect', '3')
+    assert page.evaluate('location.hash') == '#/data?project=1&epic=3'
+    page.reload()
+    page.wait_for_selector('#view-data.active')
+    assert page.input_value('#dataServiceSelect') == '3' and page.evaluate('location.hash') == '#/data?project=1&epic=3'
+    page.click('.nav-project[data-pid="2"]')
+    page.wait_for_function('location.hash === "#/data?project=2"')
+    admin_ui.go('stages')
+    page.go_back()  # «Назад» — к предыдущему разделу
+    page.wait_for_selector('#view-data.active')
+    page.go_back()  # в другой проект — с тем же эпиком
+    page.wait_for_function('document.querySelector(".nav-project.active").dataset.pid === "1"')
+    page.wait_for_function('document.getElementById("dataServiceSelect").value === "3"')
+    assert page.evaluate('location.hash') == '#/data?project=1&epic=3'
+    # прокрутка тоже восстанавливается
+    admin_ui.go('dashboard')
+    page.select_option('#chartServiceSelect', '2')
+    page.evaluate('window.scrollTo(0, 900)')
+    page.reload()
+    page.wait_for_selector('#summaryTable tbody tr')
+    page.wait_for_function('window.scrollY > 850')
+    assert page.input_value('#chartServiceSelect') == '2' and page.evaluate('location.hash') == '#/dashboard?project=1&epic=2'
+    assert not admin_ui.errors
+
+
+def test_online_guide(admin_ui):
+    page = admin_ui.page
+    page.click('#lnkManual')
+    page.wait_for_selector('#guideToc li')
+    assert admin_ui.text('#pageTitle') == 'Руководство пользователя'
+    assert page.get_attribute('#guideActions a >> nth=0', 'href') == '/manuals/user-guide.pdf'
+    page.fill('#guideSearch', 'burn-up')  # поиск и по тексту разделов, не только по заголовкам
+    found = page.locator('#guideToc a').all_text_contents()
+    assert found and len(found) < 20
+    page.fill('#guideSearch', '')
+    page.click('#guideToc a:has-text("Роли в проекте")')
+    page.wait_for_function('decodeURIComponent(location.hash) === "#/guide?project=1&s=роли-в-проекте"')
+    page.reload()
+    page.wait_for_selector('#guideToc li.active')
+    assert admin_ui.text('#guideToc li.active') == '2.3Роли в проекте'
+    top = page.evaluate('document.getElementById("роли-в-проекте").getBoundingClientRect().top')
+    assert -5 < top < 60  # раздел из адреса — вверху экрана
+    page.locator('#guideContent figure img').first.click()
+    assert page.is_visible('#guideZoom')
+    page.keyboard.press('Escape')
+    assert page.is_hidden('#guideZoom')
+    page.click('#guideDocs [data-guide="admin-guide"]')
+    page.wait_for_function('document.getElementById("pageTitle").textContent === "Руководство администратора"')
+    assert 'doc=admin-guide' in page.evaluate('location.hash')
+    admin_ui.go('dashboard')  # из руководства — обратно к проекту
+    page.wait_for_selector('#summaryTable tbody tr')
+    assert not admin_ui.errors

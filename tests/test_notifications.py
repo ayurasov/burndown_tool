@@ -198,6 +198,12 @@ def test_digest_test_send_with_pdf_and_telegram(admin, telegram, fake_smtp, mail
 
 def test_digest_schedule_once_per_day(admin, flask_app, fake_smtp, mail_ready):
     subscribe(admin)
+    # подписка как будто оформлена заранее: если тест идёт в понедельник из сценария после 9:00, сохранение отметило бы
+    # этот день отправленным, и сценарная отправка не случилась бы
+    with flask_app.app_context():
+        db = app_module.get_db()
+        db.execute('UPDATE notification_subscriptions SET last_digest_date = NULL')
+        db.commit()
     assert run(flask_app, app_module.run_due_digests, datetime(2026, 11, 2, 5, 59, tzinfo=timezone.utc)) == 0
     assert run(flask_app, app_module.run_due_digests, MONDAY_0930_MSK) == 1
     assert run(flask_app, app_module.run_due_digests, MONDAY_0930_MSK) == 0
