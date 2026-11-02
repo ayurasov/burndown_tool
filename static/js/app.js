@@ -268,7 +268,51 @@ function tableFilter(table, cols){
   row.querySelectorAll('.tf-input').forEach(function(el){
     el.addEventListener(el.tagName === 'SELECT' ? 'change' : 'input', function(){ st.values[el.dataset.col] = el.value; applyTableFilter(table); });
   });
+  bindDomSort(table, st);
+  applyTableSortDom(table);
   applyTableFilter(table);
+}
+/* Сортировка по щелчку на заголовок у таблиц, которые не сортируются по данным (нет th[data-sort]): строки
+   переставляются на месте, «Итого» — внизу, пустые значения — в конце; повторный щелчок меняет направление */
+function bindDomSort(table, st){
+  var head = table.tHead.rows[0];
+  if(!head || head.querySelector('th[data-sort]')) return;
+  Array.prototype.forEach.call(head.cells, function(th, i){
+    if(!table._tfCols[i] || th.colSpan > 1) return;
+    var dir = st.sort && st.sort.col === i ? st.sort.dir : null;
+    th.classList.add('sortable');
+    th.classList.toggle('sorted-asc', dir === 'asc');
+    th.classList.toggle('sorted-desc', dir === 'desc');
+    th.setAttribute('aria-sort', dir === 'asc' ? 'ascending' : dir === 'desc' ? 'descending' : 'none');
+    if(th._tfSort) return;  /* шапка та же (сброс фильтра) — обработчик уже есть */
+    th._tfSort = true;
+    th.tabIndex = 0;
+    var toggle = function(){
+      st.sort = {col: i, dir: st.sort && st.sort.col === i && st.sort.dir === 'asc' ? 'desc' : 'asc'};
+      tableFilter(table, table._tfCols);
+    };
+    th.addEventListener('click', toggle);
+    th.addEventListener('keydown', function(e){ if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); toggle(); } });
+  });
+}
+function applyTableSortDom(table){
+  var st = tableFilterState[table.id], body = table.tBodies[0];
+  if(!st || !st.sort || !body) return;
+  var i = st.sort.col, kind = (table._tfCols || [])[i];
+  var rows = tableFilterRows(table);
+  var key = function(tr){
+    var td = tr.cells[i];
+    if(!td) return null;
+    if(kind === 'num') return cellNumber(td);
+    var t = kind === 'list' ? cellValues(td)[0] : cellText(td);
+    var d = t.match(/^(\d{2})\.(\d{2})\.(\d{4})/);  /* дата ДД.ММ.ГГГГ — по времени */
+    return d ? d[3] + '-' + d[2] + '-' + d[1] : (t === '—' ? '' : t);
+  };
+  var keyed = rows.map(function(tr, idx){ return {tr: tr, k: key(tr), idx: idx}; });
+  keyed.sort(function(a, b){ return compareValues(a.k, b.k, st.sort.dir) || a.idx - b.idx; });
+  var rest = Array.prototype.filter.call(body.rows, function(tr){ return rows.indexOf(tr) === -1; });
+  keyed.forEach(function(x){ body.appendChild(x.tr); });
+  rest.forEach(function(tr){ body.appendChild(tr); });
 }
 function tableHeadText(table, i){
   var cell = table.tHead.rows[0] && table.tHead.rows[0].cells[i];
@@ -1677,7 +1721,7 @@ function renderServicesView(){
   var table = document.getElementById('servicesTable');
   var groupHint = 'Группа для «Свода по этапам»; пусто — группировка по этапу';
   var html = '<colgroup><col class="col-drag"><col class="col-etap"><col class="col-name"><col class="col-target"><col class="col-done"><col class="col-group"><col class="col-count"><col class="col-actions"></colgroup>'+
-    '<thead><tr><th class="drag-col"></th><th class="sortable" data-sort="etap">Этап</th><th class="sortable" data-sort="name">Название эпика</th><th class="sortable" data-sort="targetDate">Целевая дата</th><th class="center" title="Сданный функционал не учитывается в рамках этапа">Сдано</th><th class="sortable" data-sort="stageGroup" title="'+groupHint+'">Группа в своде</th><th class="sortable num" data-sort="count">Замеров</th><th class="actions-col"></th></tr></thead><tbody>';
+    '<thead><tr><th class="drag-col"></th><th class="sortable" data-sort="etap">Этап</th><th class="sortable" data-sort="name">Название эпика</th><th class="sortable" data-sort="targetDate">Целевая дата</th><th class="sortable center" data-sort="isDone" title="Сданный функционал не учитывается в рамках этапа">Сдано</th><th class="sortable" data-sort="stageGroup" title="'+groupHint+'">Группа в своде</th><th class="sortable num" data-sort="count">Замеров</th><th class="actions-col"></th></tr></thead><tbody>';
   var services = getSortedServices();
   if(!services.length){
     html += '<tr><td colspan="8" class="empty-cell">Эпиков пока нет — добавьте первый.</td></tr>';

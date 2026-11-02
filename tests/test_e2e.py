@@ -1151,6 +1151,13 @@ def test_jira_composition_on_dashboard(admin_ui, fake_jira, admin):
     assert len(shown()) == 3 and page.input_value('#jiTable .tf-row input[data-col="3"]') == ''
     page.fill('#confirmModal .tf-search', 'еис')  # поиск по всем колонкам — тема ABC-2
     assert shown() == ['ABC-2']
+    page.fill('#confirmModal .tf-search', '')
+    # сортировка по щелчку на заголовок: «Остаток, ч» — по возрастанию, затем по убыванию
+    page.click('#jiTable thead th:has-text("Остаток")')
+    assert shown() == ['ABC-3', 'ABC-2', 'ABC-1']
+    assert page.get_attribute('#jiTable thead th:has-text("Остаток")', 'aria-sort') == 'ascending'
+    page.click('#jiTable thead th:has-text("Остаток")')
+    assert shown() == ['ABC-1', 'ABC-2', 'ABC-3']
     page.click('#confirmOk')
     page.wait_for_selector('#confirmModal:not(.show)', state='attached')
     # в обычных окнах кнопка «Отмена» снова на месте
@@ -1799,9 +1806,22 @@ def test_table_filter_survives_rerender(admin_ui):
     assert page.locator('#summaryTable tbody tr.total-row').is_visible()  # «Итого» не скрывается
     page.click('#summaryTable th[data-sort="remaining"]')  # таблица перерисована — фильтр на месте
     assert rows() == 1 and page.input_value('#summaryTable .tf-row input[data-col="2"]') == '>250'
+    # burn rate по дням: сортировка по любой дате, «Итого» остаётся внизу и после перерисовки
+    head = '#burnRateTable thead tr:first-child th'
+    page.locator(head).nth(1).click()
+    page.locator(head).nth(1).click()  # по убыванию
+    values = lambda: [admin_ui.cells(f'#burnRateTable tbody tr:nth-child({n}) td')[1] for n in range(1, 7)]
+    nums = [float(v.replace(' ч', '').replace(',', '.').replace('\u2212', '-').replace(' ', '')) if v not in ('—', '') else None
+            for v in values()]
+    filled = [v for v in nums if v is not None]
+    assert filled == sorted(filled, reverse=True) and nums[len(filled):] == [None] * (len(nums) - len(filled))
+    assert 'total-row' in page.get_attribute('#burnRateTable tbody tr:last-child', 'class')
+    page.click('#burnResetRange')  # перерисовка — сортировка на месте
+    assert 'sorted-desc' in page.get_attribute(f'{head} >> nth=1', 'class')
     admin_ui.go('services')
     page.locator('.tf-bar:near(#servicesTable)').first.locator('.tf-search').fill('ЕИО')  # значения полей ввода
     assert page.locator('#servicesTable tbody tr:not(.tf-hidden)').count() == 1
+    assert 'sortable' in page.get_attribute('#servicesTable th[data-sort="isDone"]', 'class')  # «Сдано» тоже сортируется
     assert not admin_ui.errors
 
 
