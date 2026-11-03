@@ -771,15 +771,56 @@ VIEW_BLOCKS = {
 }
 
 
-def user_prefs(user):
+VIEW_STATE_PROJECTS = 200  # сколько проектов помнит вид одного пользователя
+
+
+def _raw_prefs(user):
     try:
         prefs = json.loads(user['prefs'] or '{}')
     except (ValueError, TypeError, IndexError, KeyError):
         prefs = {}
-    hidden = prefs.get('hiddenBlocks') if isinstance(prefs, dict) else None
+    return prefs if isinstance(prefs, dict) else {}
+
+
+def clean_view_state(raw):
+    """Вид проекта у пользователя: «Скрыть сданные», выключенные эпики дашборда, сданные в своде по этапам и период
+    таблиц burn rate → проверенный словарь (ValueError с понятным текстом)."""
+    if not isinstance(raw, dict):
+        raise ValueError('Некорректный вид проекта')
+    off = raw.get('epicsOff') or []
+    if not isinstance(off, list) or len(off) > 2000 or any(not isinstance(i, int) or isinstance(i, bool) for i in off):
+        raise ValueError('Некорректный список эпиков')
+
+    def date_range(value):
+        if not value:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError('Некорректный период')
+        out = {k: parse_date(value.get(k), 'Дата периода', required=False) or None for k in ('from', 'to')}
+        return out if out['from'] or out['to'] else None
+    return {'hideDone': bool(raw.get('hideDone')), 'epicsOff': sorted(set(off)), 'stageShowDone': bool(raw.get('stageShowDone')),
+            'burnRange': date_range(raw.get('burnRange')), 'stageBurnRange': date_range(raw.get('stageBurnRange'))}
+
+
+def user_prefs(user):
+    prefs = _raw_prefs(user)
+    hidden = prefs.get('hiddenBlocks')
+    views = {}
+    for pid, state in (prefs.get('views') or {}).items() if isinstance(prefs.get('views'), dict) else ():
+        try:
+            views[str(int(pid))] = clean_view_state(state)
+        except (ValueError, TypeError, ValidationError):
+            continue
     return {'hiddenBlocks': {view: [b for b in (hidden or {}).get(view, []) if b in blocks]
                              for view, blocks in VIEW_BLOCKS.items()} if isinstance(hidden, dict) else
-            {view: [] for view in VIEW_BLOCKS}}
+            {view: [] for view in VIEW_BLOCKS},
+            'views': views}
+
+
+def _save_prefs(user_id, prefs):
+    db = get_db()
+    db.execute('UPDATE users SET prefs = ? WHERE id = ?', (json.dumps(prefs, ensure_ascii=False), user_id))
+    db.commit()
 
 
 @app.route('/api/profile/prefs', methods=['PUT'])
@@ -795,10 +836,36 @@ def api_save_prefs():
         if not isinstance(items, list) or any(b not in blocks for b in items):
             raise ValidationError('Неизвестный блок')
         clean[view] = sorted(set(items), key=blocks.index)
-    db = get_db()
-    db.execute('UPDATE users SET prefs = ? WHERE id = ?', (json.dumps({'hiddenBlocks': clean}), session['user_id']))
-    db.commit()
-    return jsonify({'success': True, 'prefs': {'hiddenBlocks': clean}})
+    user = get_current_user()
+    prefs = _raw_prefs(user)
+    prefs['hiddenBlocks'] = clean  # вид проектов (views) сохраняется
+    _save_prefs(user['id'], prefs)
+    return jsonify({'success': True, 'prefs': user_prefs({'prefs': json.dumps(prefs)})})
+
+
+@app.route('/api/profile/view-state', methods=['PUT'])
+@login_required
+def api_save_view_state():
+    """Личный вид проекта — переживает обновление страницы и повторный вход: «Скрыть сданные», какие эпики показаны на
+    дашборде, сданные в своде по этапам и период таблиц burn rate."""
+    data = json_body()
+    pid = data.get('projectId')
+    if not isinstance(pid, int) or isinstance(pid, bool) or not can_view_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет доступа к проекту'}), 403
+    try:
+        state = clean_view_state(data.get('state'))
+    except ValueError as e:
+        raise ValidationError(str(e))
+    user = get_current_user()
+    prefs = _raw_prefs(user)
+    views = prefs.get('views') if isinstance(prefs.get('views'), dict) else {}
+    views.pop(str(pid), None)
+    views[str(pid)] = state  # последний изменённый — в конце: при переполнении забываются давние
+    while len(views) > VIEW_STATE_PROJECTS:
+        views.pop(next(iter(views)))
+    prefs['views'] = views
+    _save_prefs(user['id'], prefs)
+    return jsonify({'success': True, 'state': state})
 
 
 # ─── API: Projects ──────────────────────────────────────────────

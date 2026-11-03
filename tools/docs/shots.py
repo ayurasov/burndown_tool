@@ -201,6 +201,12 @@ def main():
         pg = ctx.new_page()
         pg.on('pageerror', lambda e: print('PAGEERR', e))
 
+        def tab(view, key, wait=None):
+            pg.click(f'[data-tabs="{view}"] [data-tab="{key}"]')
+            if wait:
+                pg.wait_for_selector(wait)
+            pg.wait_for_timeout(300)
+
         def go(view, wait=None):
             pg.click(f'.nav-item[data-view="{view}"]')
             pg.wait_for_selector(f'#view-{view}.active')
@@ -330,7 +336,9 @@ def main():
         shot(pg.locator('#view-portfolio'), 'user/53-portfolio.png')
 
         # ── Рассылки (администратор) и уведомления по проекту
-        go('integrations', '#notifyLogTable thead')
+        go('integrations')
+        tab('integrations', 'notify', '#naHost')
+        pg.wait_for_function("document.getElementById('naBotStatus').textContent !== ''")
         pg.fill('#naHost', 'smtp.example.ru')
         pg.fill('#naPort', '587')
         pg.fill('#naSender', 'burndown@example.ru')
@@ -364,9 +372,11 @@ def main():
         pg.wait_for_timeout(500)
         shot(pg.locator('#confirmModal .modal'), 'user/46-digest-preview.png')
         pg.keyboard.press('Escape')
-        go('integrations', '#notifyLogTable tbody tr')
+        go('integrations')
+        tab('integrations', 'notify', '#naTestTo')
         pg.fill('#naTestTo', 'ivanov@example.ru')
         shot(pg.locator('#notifyAdminForm'), 'admin/10-notify-admin.png')
+        tab('integrations', 'log', '#notifyLogTable tbody tr')
         shot(pg.locator('#view-integrations > .panel').last, 'admin/12-notify-log.png')
         # ── Данные по датам
         go('data', '#entriesTable tbody tr')
@@ -385,7 +395,11 @@ def main():
         go('services', '#servicesTable tbody tr')
         shot(pg.locator('#view-services .panel'), 'user/16-services.png')
         go('settings', '#settingsGrid select')
+        tab('settings', 'forecast', '#setForecastMethod')
         shot(pg.locator('#view-settings'), 'user/17-settings.png')
+        tab('settings', 'insights', '#setStaleDays')
+        shot(pg.locator('#view-settings'), 'user/66-settings-insights.png')
+        tab('settings', 'forecast')
 
         # ── Профиль
         pg.click('#userInfo')
@@ -419,7 +433,8 @@ def main():
         go('dashboard', '#summaryTable tbody tr')
 
         # ── Интеграции (администратор): общее подключение к Jira — Server/DC, логин и пароль (Basic)
-        go('integrations', '#notifyLogTable thead')
+        go('integrations')
+        tab('integrations', 'jira', '#jiraUrl')
         pg.wait_for_function("document.getElementById('jiraStatus').textContent !== ''")
         pg.fill('#jiraUrl', 'https://jira.example.ru')
         pg.select_option('#jiraType', 'server_basic')
@@ -440,6 +455,7 @@ def main():
 
         # ── Связь с Jira в проекте: состояние общего подключения (так его видит руководитель проекта) и кнопки
         go('jira')
+        tab('jira', 'buttons')
         pg.wait_for_selector('#jiraProjectStatus.ok')
         pg.evaluate("document.getElementById('jiraOpenIntegrations').hidden = true")  # кнопка видна только администратору
         shot(pg.locator('#view-jira .panel').first, 'user/24-jira-connection.png')
@@ -510,10 +526,12 @@ def main():
         api.put(base + '/api/admin/jira-options', json={'writebackAllowed': True, 'webhook': True})
         api.post(api.get(base + '/api/admin/jira-options').json()['webhook']['url'].replace('https://burndown.example.ru', base),
                  json={'webhookEvent': 'jira:issue_updated', 'issue': {'key': 'AISUZ-100', 'fields': {}}})
-        go('integrations', '#joWebhookUrl')
+        go('integrations')
+        tab('integrations', 'jira', '#joWebhookUrl')
         pg.wait_for_function("document.getElementById('joWebhookStatus').textContent.includes('Последнее событие')")
         shot(pg.locator('#jiraOptionsPanel'), 'admin/15-jira-options.png')
         confluence = FakeConfluence(mode='server', token='conf-pat', spaces=('PMO',))
+        tab('integrations', 'confluence', '#confUrl')
         pg.wait_for_function("document.getElementById('confStatus').textContent !== ''")
         pg.fill('#confUrl', confluence.url)
         pg.fill('#confToken', 'conf-pat')
@@ -530,7 +548,8 @@ def main():
         pg.fill('#confUrl', confluence.url)
 
         # ── Прогноз в Jira и отчёт в Confluence (проект)
-        go('jira', '#wbFields select')
+        go('jira')
+        tab('jira', 'writeback', '#wbFields select')
         pg.click('#wbLoadFields')
         pg.wait_for_selector('#wbField-forecast option[value="customfield_10100"]', state='attached')
         pg.select_option('#wbField-forecast', 'customfield_10100')
@@ -544,6 +563,7 @@ def main():
         pg.wait_for_timeout(500)
         hide_toast()
         shot(pg.locator('#wbPanel'), 'user/61-writeback.png')
+        tab('jira', 'confluence', '#crSpace')
         pg.fill('#crSpace', 'PMO')
         pg.select_option('#crMode', 'single')
         pg.select_option('#crWeekday', '1')
@@ -557,7 +577,8 @@ def main():
         confluence.stop()
 
         # ── Восстановление истории по журналу изменений Jira
-        go('jira', '#jiraButtonsTable [data-action="history"]')
+        go('jira')
+        tab('jira', 'buttons', '#jiraButtonsTable [data-action="history"]')
         pg.click(f'#jiraButtonsTable tr[data-bid="{bid1}"] [data-action="history"]')
         pg.fill('#hrFrom', '2026-08-03')
         pg.fill('#hrTo', '2026-08-31')

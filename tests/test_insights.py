@@ -247,7 +247,7 @@ def test_portfolio_api_for_admin(admin):
 
 def test_user_prefs_hide_blocks(admin, client):
     me = admin.get('/api/auth/me').get_json()['user']
-    assert me['prefs'] == {'hiddenBlocks': {'dashboard': [], 'stages': []}}
+    assert me['prefs'] == {'hiddenBlocks': {'dashboard': [], 'stages': []}, 'views': {}}
     r = admin.put('/api/profile/prefs', json={'hiddenBlocks': {'dashboard': ['drift', 'kpis', 'drift'], 'stages': ['stageCharts']}})
     assert r.status_code == 200 and r.get_json()['prefs']['hiddenBlocks']['dashboard'] == ['kpis', 'drift']
     assert admin.get('/api/auth/me').get_json()['user']['prefs']['hiddenBlocks']['stages'] == ['stageCharts']
@@ -324,3 +324,37 @@ def test_pdf_stages_insights_and_units(admin):
     text = pdf_text(admin, page='dashboard')
     assert 'Остаток, чел.-дн.' in text and '154.3' in text and 'чел.-дн./раб. день' in text
     assert 'Остаток, ч' in pdf_text(admin, page='data')  # данные по датам — в часах, как вводятся
+
+
+def test_view_state_survives_relogin(admin, make_user, client):
+    """Вид проекта (скрыть сданные, эпики дашборда, сданные в своде, период burn rate) — у пользователя на сервере."""
+    state = {'hideDone': True, 'epicsOff': [3, 2, 3], 'stageShowDone': True, 'burnRange': {'from': '2026-07-01', 'to': ''},
+             'stageBurnRange': None}
+    r = admin.put('/api/profile/view-state', json={'projectId': 1, 'state': state})
+    assert r.status_code == 200 and r.get_json()['state'] == {
+        'hideDone': True, 'epicsOff': [2, 3], 'stageShowDone': True, 'burnRange': {'from': '2026-07-01', 'to': None},
+        'stageBurnRange': None}
+    admin.put('/api/profile/prefs', json={'hiddenBlocks': {'dashboard': ['kpis'], 'stages': []}})  # вид блоков его не стирает
+    prefs = admin.get('/api/auth/me').get_json()['user']['prefs']
+    assert prefs['views']['1']['epicsOff'] == [2, 3] and prefs['hiddenBlocks']['dashboard'] == ['kpis']
+    # у другого пользователя — свой вид
+    other = make_user('petrova', project_id=1)
+    assert other.get('/api/auth/me').get_json()['user']['prefs']['views'] == {}
+    assert other.put('/api/profile/view-state', json={'projectId': 2, 'state': {}}).status_code == 403  # нет доступа
+    for bad in ({'projectId': 'x', 'state': {}}, {'projectId': 1, 'state': []}, {'projectId': 1, 'state': {'epicsOff': ['a']}},
+                {'projectId': 1, 'state': {'burnRange': {'from': '01.07.2026'}}}, {'projectId': 1, 'state': {'burnRange': 'x'}}):
+        assert admin.put('/api/profile/view-state', json=bad).status_code in (400, 403), bad
+    assert client.put('/api/profile/view-state', json={'projectId': 1, 'state': {}}).status_code == 401
+
+
+def test_view_state_keeps_recent_projects(admin, flask_app, monkeypatch):
+    monkeypatch.setattr(app_module, 'VIEW_STATE_PROJECTS', 1)
+    admin.put('/api/profile/view-state', json={'projectId': 1, 'state': {'hideDone': True}})
+    admin.put('/api/profile/view-state', json={'projectId': 2, 'state': {'hideDone': True}})
+    assert list(admin.get('/api/auth/me').get_json()['user']['prefs']['views']) == ['2']  # давние забываются
+    with flask_app.app_context():  # испорченная запись вида не мешает остальному
+        db = app_module.get_db()
+        db.execute("""UPDATE users SET prefs = '{"views": {"1": {"epicsOff": "x"}, "z": {}, "2": {"hideDone": true}}}' WHERE username = 'admin'""")
+        db.commit()
+    assert admin.get('/api/auth/me').get_json()['user']['prefs']['views'] == {
+        '2': {'hideDone': True, 'epicsOff': [], 'stageShowDone': False, 'burnRange': None, 'stageBurnRange': None}}
