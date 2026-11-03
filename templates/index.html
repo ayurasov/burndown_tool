@@ -24,61 +24,67 @@
 </div>
 <div class="app" id="appRoot">
   <div class="sidebar-scrim" id="sidebarScrim"></div>
-  <aside class="sidebar">
-    <div class="brand">
-      <svg viewBox="0 0 32 32" fill="none" aria-hidden="true" width="32" height="32"><rect width="32" height="32" rx="7" fill="currentColor"/><path d="M7 21 L13 14 L17 17 L24 9" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M24 9 L24 13 M24 9 L20 9" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round"/><path d="M7 24 L24 24" stroke="#fff" stroke-width="1.5" opacity="0.5"/></svg>
-      <div>
-        <div class="brand-title">Burndown</div>
-        <div class="brand-sub">Сгорание работ по эпикам</div>
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-top">
+      <div class="brand">
+        <svg viewBox="0 0 32 32" fill="none" aria-hidden="true" width="28" height="28"><rect width="32" height="32" rx="7" fill="currentColor"/><path d="M7 21 L13 14 L17 17 L24 9" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M24 9 L24 13 M24 9 L20 9" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round"/><path d="M7 24 L24 24" stroke="#fff" stroke-width="1.5" opacity="0.5"/></svg>
+        <div class="brand-text">
+          <div class="brand-title">Burndown</div>
+          <div class="brand-sub">Сгорание работ по эпикам</div>
+        </div>
       </div>
+      <button type="button" class="collapse-btn" id="sidebarCollapse" title="Свернуть меню" aria-label="Свернуть меню" aria-expanded="true"><i data-icon="chevronLeft"></i></button>
     </div>
 
-    <nav class="nav-group" id="overviewNav" hidden>
-      <div class="nav-label">Обзор</div>
-      <a href="#" class="nav-item" data-view="portfolio" id="navPortfolio">Портфель проектов</a>
+    <nav class="nav-group" id="overviewNav" data-group="overview" hidden>
+      <button type="button" class="nav-label" aria-expanded="true"><span>Обзор</span><i data-icon="chevronDown"></i></button>
+      <div class="nav-group-items">
+        <a href="#" class="nav-item" data-view="portfolio" id="navPortfolio" title="Портфель проектов"><i data-icon="portfolio"></i><span class="nav-text">Портфель проектов</span></a>
+      </div>
     </nav>
 
-    <nav class="nav-group" id="projectsNav">
-      <div class="nav-label">Проекты</div>
+    <nav class="nav-group" id="projectsNavGroup" data-group="projects">
+      <button type="button" class="nav-label" aria-expanded="true"><span>Проекты</span><i data-icon="chevronDown"></i></button>
+      <div class="nav-group-items" id="projectsNav"></div>
     </nav>
 
-    <nav class="nav-group" id="sectionsNav">
-      <div class="nav-label">Данные проекта</div>
-      <a href="#" class="nav-item active" data-view="dashboard">Дашборд <span class="chip" id="navServiceCount" title="Эпиков в проекте">0</span></a>
-      <a href="#" class="nav-item" data-view="stages">Свод по этапам</a>
-      <a href="#" class="nav-item" data-view="data">Данные по датам</a>
-      <a href="#" class="nav-item" data-view="services">Эпики (блоки задач)</a>
-      <a href="#" class="nav-item" data-view="settings" id="navSettings">Настройки проекта</a>
-      <a href="#" class="nav-item" data-view="jira" id="navJira">Jira и Confluence</a>
-      <a href="#" class="nav-item" data-view="autofill" id="navAutofill">Автозаполнение</a>
-      <a href="#" class="nav-item" data-view="notify" id="navNotify">Уведомления</a>
+    <nav class="nav-group" id="sectionsNav" data-group="sections">
+      <button type="button" class="nav-label" aria-expanded="true"><span>Данные проекта</span><i data-icon="chevronDown"></i></button>
+      <div class="nav-group-items">
+        <a href="#" class="nav-item active" data-view="dashboard" title="Дашборд"><i data-icon="dashboard"></i><span class="nav-text">Дашборд</span><span class="chip" id="navServiceCount" title="Эпиков в проекте">0</span></a>
+        <a href="#" class="nav-item" data-view="stages" title="Свод по этапам"><i data-icon="stages"></i><span class="nav-text">Свод по этапам</span></a>
+        <a href="#" class="nav-item" data-view="data" title="Данные по датам"><i data-icon="data"></i><span class="nav-text">Данные по датам</span></a>
+        <a href="#" class="nav-item" data-view="services" title="Эпики (блоки задач)"><i data-icon="epics"></i><span class="nav-text">Эпики (блоки задач)</span></a>
+        <a href="#" class="nav-item" data-view="settings" id="navSettings" title="Настройки проекта"><i data-icon="settings"></i><span class="nav-text">Настройки проекта</span></a>
+        <a href="#" class="nav-item" data-view="jira" id="navJira" title="Jira и Confluence"><i data-icon="link"></i><span class="nav-text">Jira и Confluence</span></a>
+        <a href="#" class="nav-item" data-view="autofill" id="navAutofill" title="Автозаполнение"><i data-icon="clock"></i><span class="nav-text">Автозаполнение</span></a>
+        <a href="#" class="nav-item" data-view="notify" id="navNotify" title="Уведомления"><i data-icon="bell"></i><span class="nav-text">Уведомления</span></a>
+      </div>
     </nav>
 
-    <nav class="nav-group" id="adminNav" style="display:none;">
-      <div class="nav-label">Администрирование</div>
-      <a href="#" class="nav-item" data-view="users" id="navUsers">Пользователи</a>
-      <a href="#" class="nav-item" data-view="projects" id="navProjects">Проекты</a>
-      <a href="#" class="nav-item" data-view="audit" id="navAudit">Реестр изменений</a>
-      <a href="#" class="nav-item" data-view="integrations" id="navIntegrations">Интеграции</a>
-      <a href="#" class="nav-item" data-view="calendar" id="navCalendar">Производственный календарь</a>
-      <a href="#" class="nav-item" data-view="health" id="navHealth">Состояние системы <span class="health-dot" id="navHealthDot" hidden></span></a>
+    <nav class="nav-group" id="adminNav" data-group="admin" style="display:none;">
+      <button type="button" class="nav-label" aria-expanded="true"><span>Администрирование</span><i data-icon="chevronDown"></i></button>
+      <div class="nav-group-items">
+        <a href="#" class="nav-item" data-view="users" id="navUsers" title="Пользователи"><i data-icon="users"></i><span class="nav-text">Пользователи</span></a>
+        <a href="#" class="nav-item" data-view="projects" id="navProjects" title="Проекты"><i data-icon="folder"></i><span class="nav-text">Проекты</span></a>
+        <a href="#" class="nav-item" data-view="audit" id="navAudit" title="Реестр изменений"><i data-icon="history"></i><span class="nav-text">Реестр изменений</span></a>
+        <a href="#" class="nav-item" data-view="integrations" id="navIntegrations" title="Интеграции"><i data-icon="plug"></i><span class="nav-text">Интеграции</span></a>
+        <a href="#" class="nav-item" data-view="calendar" id="navCalendar" title="Производственный календарь"><i data-icon="calendar"></i><span class="nav-text">Производственный календарь</span></a>
+        <a href="#" class="nav-item" data-view="health" id="navHealth" title="Состояние системы"><i data-icon="activity"></i><span class="nav-text">Состояние системы</span><span class="health-dot" id="navHealthDot" hidden></span></a>
+      </div>
     </nav>
 
     <div class="sidebar-actions">
-      <div class="user-info" id="userInfo" role="button" tabindex="0" title="Профиль"></div>
+      <a href="#/guide" class="nav-item" id="lnkManual" title="Руководство пользователя — оглавление, поиск, PDF"><i data-icon="book"></i><span class="nav-text">Руководство</span></a>
+      <button type="button" class="nav-item" id="btnExport" style="display:none;" title="Экспорт данных текущего проекта в JSON"><i data-icon="download"></i><span class="nav-text">Экспорт JSON</span></button>
       <button type="button" class="sidebar-warning" id="defaultPwWarning" hidden>⚠ Вы вошли с паролем по умолчанию — смените его</button>
-      <div class="sidebar-buttons">
-        <button type="button" class="btn btn-ghost btn-sm" id="btnExport" style="display:none;" title="Экспорт данных текущего проекта">⬇ JSON</button>
-        <button type="button" class="btn btn-ghost btn-sm" id="btnLogout">⏻ Выйти</button>
+      <div class="user-row">
+        <div class="user-info" id="userInfo" role="button" tabindex="0" title="Профиль"></div>
+        <button type="button" class="icon-btn" id="btnLogout" title="Выйти" aria-label="Выйти"><i data-icon="logout"></i></button>
       </div>
       <div class="sidebar-copyright">
-        <div>© Alexander Yurasov</div>
+        <div class="sidebar-author"><span>© Alexander Yurasov</span><button type="button" class="about-dot" id="btnAbout" title="О программе" aria-label="О программе">?</button></div>
         <button type="button" class="sidebar-version" id="btnVersions" title="История версий">Burndown — версия {{ app_version }}</button>
-        <div class="sidebar-links">
-          <a href="#/guide" id="lnkManual" title="Руководство пользователя — оглавление, поиск, PDF">Руководство</a>
-          <span aria-hidden="true">·</span>
-          <button type="button" id="btnAbout">О программе</button>
-        </div>
       </div>
     </div>
   </aside>
@@ -93,6 +99,12 @@
           <div class="page-title" id="pageTitle">Дашборд сгорания</div>
           <div class="page-sub" id="pageSub">Свод по эпикам и этапам</div>
         </div>
+      </div>
+      <div class="topbar-search" role="search">
+        <i data-icon="search"></i>
+        <input type="search" id="quickSearch" placeholder="Найти эпик, этап или раздел" aria-label="Быстрый поиск: эпик, этап, раздел или проект" autocomplete="off">
+        <kbd title="Клавиша / или Ctrl+K">/</kbd>
+        <div class="search-dropdown" id="quickSearchResults" role="listbox" hidden></div>
       </div>
       <div class="topbar-actions">
         <button type="button" class="btn btn-ghost btn-sm" id="btnPrint" style="display:none;" aria-label="Печать" title="Печать раздела с графиками (в т.ч. сохранение в PDF через диалог печати)">🖶<span class="btn-label"> Печать</span></button>
@@ -360,16 +372,23 @@
 
     <!-- SETTINGS -->
     <section class="view" id="view-settings">
-      <div class="panel">
+      <div class="tabs" role="tablist" aria-label="Настройки проекта" data-tabs="settings">
+        <button type="button" role="tab" class="tab" data-tab="forecast" id="tab-settings-forecast"><i data-icon="trend"></i>Прогноз</button>
+        <button type="button" role="tab" class="tab" data-tab="calendar" id="tab-settings-calendar"><i data-icon="calendar"></i>Календарь</button>
+        <button type="button" role="tab" class="tab" data-tab="units" id="tab-settings-units"><i data-icon="clock"></i>Единицы</button>
+        <button type="button" role="tab" class="tab" data-tab="insights" id="tab-settings-insights"><i data-icon="bulb"></i>Выводы</button>
+        <button type="button" role="tab" class="tab" data-tab="metrics" id="tab-settings-metrics"><i data-icon="info"></i>Как считаются метрики</button>
+      </div>
+      <div class="panel" data-tab-panel="forecast calendar units insights">
         <div class="panel-head">
           <div>
-            <div class="panel-title">Настройки проекта</div>
+            <div class="panel-title" id="settingsTabTitle">Параметры проекта</div>
             <div class="section-note">Целевые даты задаются по каждому эпику («Эпики (блоки задач)») и этапу («Свод по этапам»). Здесь — параметры прогноза и burn rate, календарь, единицы и пороги выводов.</div>
           </div>
         </div>
-        <div class="settings-grid" id="settingsGrid"></div>
+        <div class="settings-tabs" id="settingsGrid"></div>
       </div>
-      <div class="panel">
+      <div class="panel" data-tab-panel="metrics">
         <div class="panel-head"><div class="panel-title">Как считаются метрики</div></div>
         <ul class="metrics-help">
           <li><b>Burn rate</b> — средняя дневная скорость сгорания остатка: по всей истории или по скользящему окну; при расчёте в рабочих днях — за рабочий день.</li>
@@ -383,6 +402,12 @@
 
     <!-- JIRA -->
     <section class="view" id="view-jira">
+      <div class="tabs" role="tablist" aria-label="Jira и Confluence" data-tabs="jira">
+        <button type="button" role="tab" class="tab" data-tab="buttons" id="tab-jira-buttons"><i data-icon="link"></i>Кнопки среза</button>
+        <button type="button" role="tab" class="tab" data-tab="writeback" id="tab-jira-writeback"><i data-icon="trend"></i>Прогноз в Jira</button>
+        <button type="button" role="tab" class="tab" data-tab="confluence" id="tab-jira-confluence"><i data-icon="book"></i>Отчёт в Confluence</button>
+      </div>
+      <div class="tab-panel" data-tab-panel="buttons">
       <div class="panel">
         <div class="panel-head">
           <div>
@@ -410,7 +435,8 @@
         </div>
         <div class="table-scroll"><table class="data-table" id="jiraButtonsTable"></table></div>
       </div>
-      <div class="panel" id="wbPanel">
+      </div>
+      <div class="panel" id="wbPanel" data-tab-panel="writeback">
         <div class="panel-head">
           <div>
             <div class="panel-title">Прогноз в Jira</div>
@@ -427,7 +453,7 @@
         </div>
         <div class="table-scroll"><table class="data-table" id="wbTable"></table></div>
       </div>
-      <div class="panel" id="crPanel">
+      <div class="panel" id="crPanel" data-tab-panel="confluence">
         <div class="panel-head">
           <div>
             <div class="panel-title">Отчёт в Confluence</div>
@@ -593,6 +619,13 @@
 
     <!-- ADMIN: РАССЫЛКИ -->
     <section class="view" id="view-integrations">
+      <div class="tabs" role="tablist" aria-label="Интеграции" data-tabs="integrations">
+        <button type="button" role="tab" class="tab" data-tab="jira" id="tab-integrations-jira"><i data-icon="link"></i>Jira</button>
+        <button type="button" role="tab" class="tab" data-tab="confluence" id="tab-integrations-confluence"><i data-icon="book"></i>Confluence</button>
+        <button type="button" role="tab" class="tab" data-tab="notify" id="tab-integrations-notify"><i data-icon="bell"></i>Почта и Telegram</button>
+        <button type="button" role="tab" class="tab" data-tab="log" id="tab-integrations-log"><i data-icon="history"></i>Журнал отправок</button>
+      </div>
+      <div class="tab-panel" data-tab-panel="jira">
       <div class="panel">
         <div class="panel-head">
           <div>
@@ -646,7 +679,8 @@
           </div>
         </div>
       </div>
-      <div class="panel">
+      </div>
+      <div class="panel" data-tab-panel="confluence">
         <div class="panel-head">
           <div>
             <div class="panel-title">Подключение к Confluence</div>
@@ -675,7 +709,7 @@
           </div>
         </form>
       </div>
-      <form id="notifyAdminForm" novalidate autocomplete="off">
+      <form id="notifyAdminForm" class="tab-panel" data-tab-panel="notify" novalidate autocomplete="off">
         <div class="panel">
           <div class="panel-head">
             <div>
@@ -726,7 +760,7 @@
           <div class="form-actions"><button type="submit" class="btn btn-primary btn-sm" id="naSave">Сохранить настройки</button></div>
         </div>
       </form>
-      <div class="panel">
+      <div class="panel" data-tab-panel="log">
         <div class="panel-head"><div class="panel-title">Журнал отправок</div><button type="button" class="btn btn-ghost btn-sm" id="naLogReload">Обновить</button></div>
         <div class="table-scroll"><table class="data-table" id="notifyLogTable"></table></div>
       </div>
@@ -735,7 +769,7 @@
     <!-- NO PROJECT -->
     <section class="view" id="view-guide">
       <div class="guide-head">
-        <div class="guide-docs" id="guideDocs" role="group" aria-label="Руководство"></div>
+        <div class="guide-docs seg-filter" id="guideDocs" role="group" aria-label="Руководство"></div>
         <div class="guide-actions" id="guideActions"></div>
       </div>
       <div class="guide-layout">

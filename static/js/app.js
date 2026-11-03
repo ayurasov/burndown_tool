@@ -21,6 +21,7 @@ function todayIso(){ return localIsoDate(new Date()); }
 
 var dashboardFilter = { hideDone:false, epics:null }; /* epics: {id:bool} выбор эпиков для дашборда; null = видны все */
 var stageShowDone = false; /* показывать сданные эпики в своде по этапам */
+var viewStateProject = null; /* проект, чей личный вид восстановлен */
 
 var DEFAULT_SETTINGS = { forecastMethod:'linear', riskBufferDays:3, burnrateMethod:'all', burnrateWindowDays:14,
   rangeConfidence:70, workdays:false, holidays:[], extraWorkdays:[], orgHolidays:[], orgExtraWorkdays:[], units:'hours', hoursPerDay:8,
@@ -215,6 +216,7 @@ function initTableSort(table, renderFn){
       } else {
         tableSortState[key] = {field: field, dir: 'asc'};
       }
+      saveTableState();
       renderFn();
     });
   });
@@ -378,6 +380,7 @@ function applyTableFilter(table){
     }
   });
   var search = st.search.trim().toLowerCase();
+  if(table.id !== 'jiTable') saveTableState();
   var rows = tableFilterRows(table), shown = 0, total = 0;
   rows.forEach(function(tr){
     var ok = tests.every(function(t){ return t(tr.cells); }) &&
@@ -524,18 +527,94 @@ themeToggle.addEventListener('click', function(){
 });
 
 /* ════════════════════════════════════════════════════════════════
-   Sidebar
+   Иконки (линейные, 24×24, в духе lucide): <i data-icon="имя"> → svg
+════════════════════════════════════════════════════════════════ */
+var ICON_PATHS = {
+  chevronLeft: '<path d="m15 18-6-6 6-6"/>', chevronRight: '<path d="m9 18 6-6-6-6"/>', chevronDown: '<path d="m6 9 6 6 6-6"/>',
+  portfolio: '<rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>',
+  dashboard: '<rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/>',
+  stages: '<path d="m12 2 10 5-10 5L2 7l10-5z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/>',
+  data: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18M8 14h.01M12 14h.01M16 14h.01M8 18h.01M12 18h.01"/>',
+  epics: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
+  settings: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
+  link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
+  users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
+  folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  history: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
+  plug: '<path d="M12 22v-5M9 8V2M15 8V2M18 8v5a6 6 0 0 1-12 0V8z"/>',
+  calendar: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18M9 16l2 2 4-4"/>',
+  activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+  book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V3H6.5A2.5 2.5 0 0 0 4 5.5z"/><path d="M4 19.5V21h16"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',
+  trend: '<path d="m3 17 6-6 4 4 8-8"/><path d="M14 7h7v7"/>',
+  bulb: '<path d="M9 18h6M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/>',
+  logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>'
+};
+function iconSvg(name, size){
+  return '<svg class="icon" viewBox="0 0 24 24" width="'+(size || 16)+'" height="'+(size || 16)+'" fill="none" stroke="currentColor" '+
+    'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+(ICON_PATHS[name] || '')+'</svg>';
+}
+function renderIcons(root){
+  (root || document).querySelectorAll('i[data-icon]').forEach(function(el){
+    var tmp = document.createElement('span');
+    tmp.innerHTML = iconSvg(el.dataset.icon);
+    el.replaceWith(tmp.firstChild);
+  });
+}
+renderIcons();
+
+/* ════════════════════════════════════════════════════════════════
+   Sidebar: на компьютере — кнопка «‹» сворачивает меню в узкую полосу с иконками (запоминается),
+   группы разделов раскрываются и сворачиваются; на телефоне — меню выезжает по кнопке ☰
 ════════════════════════════════════════════════════════════════ */
 var appRoot = document.getElementById('appRoot');
 var sidebarToggle = document.getElementById('sidebarToggle');
+var sidebarCollapse = document.getElementById('sidebarCollapse');
 var sidebarScrim = document.getElementById('sidebarScrim');
 var sidebarEl = document.querySelector('.sidebar');
 var mobileLayout = window.matchMedia('(max-width: 900px)');
+var SIDEBAR_KEY = 'burndown-sidebar', NAV_GROUPS_KEY = 'burndown-nav-groups';
 function setSidebarCollapsed(collapsed){
   appRoot.classList.toggle('collapsed', collapsed);
   sidebarEl.inert = collapsed;  /* скрытое меню не попадает в обход клавишей Tab */
   sidebarToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
 }
+function setSidebarRail(rail){
+  appRoot.classList.toggle('rail', rail);
+  sidebarCollapse.title = rail ? 'Развернуть меню' : 'Свернуть меню';
+  sidebarCollapse.setAttribute('aria-label', sidebarCollapse.title);
+  sidebarCollapse.setAttribute('aria-expanded', rail ? 'false' : 'true');
+  sidebarCollapse.innerHTML = iconSvg(rail ? 'chevronRight' : 'chevronLeft', 14);
+  try { localStorage.setItem(SIDEBAR_KEY, rail ? 'rail' : 'full'); } catch(e){}
+}
+sidebarCollapse.addEventListener('click', function(){
+  if(mobileLayout.matches){ setSidebarCollapsed(true); sidebarToggle.focus(); return; }
+  setSidebarRail(!appRoot.classList.contains('rail'));
+});
+try { setSidebarRail(localStorage.getItem(SIDEBAR_KEY) === 'rail'); } catch(e){ setSidebarRail(false); }
+/* группы меню: «Обзор», «Проекты», «Данные проекта», «Администрирование» — раскрыты, пока их не свернули */
+var navGroupState = {};
+try { navGroupState = JSON.parse(localStorage.getItem(NAV_GROUPS_KEY) || '{}') || {}; } catch(e){ navGroupState = {}; }
+function setNavGroupOpen(group, open){
+  var nav = document.querySelector('.nav-group[data-group="'+group+'"]');
+  if(!nav) return;
+  nav.classList.toggle('closed', !open);
+  nav.querySelector('.nav-label').setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+document.querySelectorAll('.nav-group[data-group]').forEach(function(nav){
+  var group = nav.dataset.group;
+  setNavGroupOpen(group, navGroupState[group] !== false);
+  nav.querySelector('.nav-label').addEventListener('click', function(){
+    var open = nav.classList.contains('closed');
+    setNavGroupOpen(group, open);
+    navGroupState[group] = open;
+    try { localStorage.setItem(NAV_GROUPS_KEY, JSON.stringify(navGroupState)); } catch(e){}
+  });
+});
 sidebarToggle.addEventListener('click', function(){
   var open = appRoot.classList.contains('collapsed');
   setSidebarCollapsed(!open);
@@ -553,6 +632,52 @@ document.addEventListener('keydown', function(e){
   }
 });
 setSidebarCollapsed(mobileLayout.matches);
+if(mobileLayout.addEventListener) mobileLayout.addEventListener('change', function(){ setSidebarCollapsed(mobileLayout.matches); });
+
+/* ════════════════════════════════════════════════════════════════
+   Вкладки разделов (настройки, интеграции, Jira): .tabs[data-tabs="раздел"] и [data-tab-panel="ключ …"] внутри
+   раздела; выбранная вкладка — в адресе страницы (…&tab=…), стрелки ← → переключают вкладки
+════════════════════════════════════════════════════════════════ */
+var tabState = {};
+function tabBar(scope){ return document.querySelector('[data-tabs="'+scope+'"]'); }
+function visibleTabs(scope){
+  var bar = tabBar(scope);
+  return bar ? Array.prototype.filter.call(bar.querySelectorAll('[data-tab]'), function(b){ return !b.hidden; })
+    .map(function(b){ return b.dataset.tab; }) : [];
+}
+function selectTab(scope, key){
+  var bar = tabBar(scope);
+  if(!bar) return;
+  var keys = visibleTabs(scope);
+  if(keys.indexOf(key) === -1) key = keys[0];
+  tabState[scope] = key;
+  bar.querySelectorAll('[data-tab]').forEach(function(b){
+    var on = b.dataset.tab === key;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+    b.tabIndex = on ? 0 : -1;
+  });
+  document.querySelectorAll('#view-'+scope+' [data-tab-panel]').forEach(function(p){
+    p.hidden = p.dataset.tabPanel.split(' ').indexOf(key) === -1;
+  });
+}
+document.querySelectorAll('[data-tabs]').forEach(function(bar){
+  var scope = bar.dataset.tabs;
+  bar.addEventListener('click', function(e){
+    var b = e.target.closest('[data-tab]');
+    if(!b) return;
+    selectTab(scope, b.dataset.tab);
+    syncRoute(false);
+  });
+  bar.addEventListener('keydown', function(e){
+    if(e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+    var keys = visibleTabs(scope), i = keys.indexOf(tabState[scope]);
+    var next = keys[(i + (e.key === 'ArrowRight' ? 1 : keys.length - 1)) % keys.length];
+    selectTab(scope, next);
+    bar.querySelector('[data-tab="'+next+'"]').focus();
+    syncRoute(false);
+  });
+});
 
 document.getElementById('btnLogout').addEventListener('click', function(){
   apiPost('/api/auth/logout').then(function(){ window.location.href = '/login'; });
@@ -949,6 +1074,8 @@ function tuneChartConfig(cfg){
   return cfg;
 }
 function makeChart(el, cfg){ return new Chart(el, tuneChartConfig(cfg)); }
+/* подписи графиков — тем же шрифтом, что интерфейс */
+if(window.Chart){ Chart.defaults.font.family = "Inter, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif"; Chart.defaults.font.size = 11; }
 
 function baseChartOptions(yTitle, extraTooltipCtx){
   var opts = {
@@ -1469,7 +1596,7 @@ var epicTargetLabelPlugin = {
     var area = chart.chartArea;
     if(!area) return;
     ctx.save();
-    ctx.font = '600 10px "General Sans", Arial, sans-serif';
+    ctx.font = '600 10px Inter, Arial, sans-serif';
     ctx.textBaseline = 'top';
     var rows = []; /* занятые диапазоны подписей по строкам, чтобы не наползали */
     chart.data.datasets.forEach(function(ds){
@@ -1511,7 +1638,7 @@ var todayLinePlugin = {
     ctx.beginPath(); ctx.moveTo(px, area.top); ctx.lineTo(px, area.bottom); ctx.stroke();
     ctx.setLineDash([]);
     ctx.fillStyle = getCss('--color-text-muted');
-    ctx.font = '600 10px "General Sans", Arial, sans-serif';
+    ctx.font = '600 10px Inter, Arial, sans-serif';
     ctx.textBaseline = 'bottom';
     var label = 'Сегодня';
     var w = ctx.measureText(label).width;
@@ -1839,8 +1966,9 @@ function renderSettingsView(){
     return '<div class="setting-item"><label class="small" for="'+id+'">'+label+'</label><input type="number" id="'+id+'" min="'+min+'" max="'+max+'" step="1" value="'+value+'">'+
       (hint ? '<div class="setting-hint">'+hint+'</div>' : '')+'</div>';
   };
+  /* группы — по вкладкам раздела (прогноз, календарь, единицы, выводы) */
   document.getElementById('settingsGrid').innerHTML =
-    '<div class="settings-divider">Прогноз</div>'+
+    '<div class="settings-grid" data-tab-panel="forecast"><div class="settings-divider">Прогноз</div>'+
     '<div class="setting-item"><label class="small" for="setForecastMethod">Метод прогноза</label><select id="setForecastMethod">'+opt('linear','Линейная регрессия',st.forecastMethod)+opt('average','Средняя скорость сгорания (burn rate)',st.forecastMethod)+'</select></div>'+
     num('setRiskBuffer', 'Буфер риска, дней', st.riskBufferDays ?? 3, 0, 365, 'Прогноз позже цели не больше чем на столько дней — «Риск», а не «Не успеваем»')+
     '<div class="setting-item"><label class="small" for="setConfidence">Диапазон прогноза</label><select id="setConfidence">'+
@@ -1849,7 +1977,7 @@ function renderSettingsView(){
     '<div class="settings-divider">Расчёт среднего burn rate</div>'+
     '<div class="setting-item"><label class="small" for="setBurnrateMethod">Метод расчёта</label><select id="setBurnrateMethod">'+opt('all','По всей истории',burnMethod)+opt('rolling','Скользящее среднее',burnMethod)+'</select></div>'+
     '<div class="setting-item"><label class="small" for="setBurnrateWindow">Окно скользящего среднего, дней</label><input type="number" id="setBurnrateWindow" min="1" step="1" value="'+(st.burnrateWindowDays || 14)+'"'+(burnMethod!=='rolling'?' disabled':'')+'></div>'+
-    '<div class="settings-divider">Календарь</div>'+
+    '</div><div class="settings-grid" data-tab-panel="calendar"><div class="settings-divider">Календарь</div>'+
     '<div class="setting-item setting-wide"><label class="checkbox-row"><input type="checkbox" id="setWorkdays"'+(st.workdays?' checked':'')+'> Считать сроки в рабочих днях</label>'+
       '<div class="setting-hint">Прогноз, burn rate и шанс успеть — без выходных и праздников: работа идёт с понедельника по пятницу, кроме праздников, плюс рабочие выходные.</div></div>'+
     '<div class="setting-item setting-wide setting-hint">Общий производственный календарь задаёт администратор: '+
@@ -1859,16 +1987,17 @@ function renderSettingsView(){
       '<div class="setting-hint">Даты или диапазоны, по одному в строке</div></div>'+
     '<div class="setting-item"><label class="small" for="setExtraWorkdays">Дополнительные рабочие выходные проекта</label><textarea id="setExtraWorkdays" rows="5" placeholder="27.12.2025"'+(st.workdays?'':' disabled')+'>'+escapeHtml(formatDateList(st.extraWorkdays || []))+'</textarea>'+
       '<div class="setting-hint">Суббота или воскресенье, которые объявлены рабочими</div></div>'+
-    '<div class="settings-divider">Единицы</div>'+
+    '</div><div class="settings-grid" data-tab-panel="units"><div class="settings-divider">Единицы</div>'+
     '<div class="setting-item"><label class="small" for="setUnits">Показывать объём работ</label><select id="setUnits">'+opt('hours','В часах',st.units)+opt('days','В человеко-днях',st.units)+'</select>'+
       '<div class="setting-hint">Только отображение: замеры вводятся и хранятся в часах</div></div>'+
     '<div class="setting-item"><label class="small" for="setHoursPerDay">Часов в человеко-дне</label><input type="number" id="setHoursPerDay" min="1" max="24" step="0.5" value="'+(st.hoursPerDay || 8)+'"'+(st.units!=='days'?' disabled':'')+'></div>'+
-    '<div class="settings-divider">Выводы</div>'+
+    '</div><div class="settings-grid" data-tab-panel="insights"><div class="settings-divider">Выводы</div>'+
     num('setStaleDays', 'Замер устарел через, дней', st.staleDays || 10, 1, 365, 'Нет замера дольше — вывод «данные могли устареть»')+
     num('setScopeThreshold', 'Рост объёма, %', st.scopeThreshold || 10, 1, 1000, 'Объём вырос сильнее за период сравнения — вывод о росте объёма')+
     num('setSlipThreshold', 'Сдвиг прогноза, дней', st.slipThreshold || 7, 1, 365, 'Прогноз сдвинулся сильнее за период сравнения — вывод о сдвиге')+
     num('setChanceThreshold', 'Порог шанса успеть, %', st.chanceThreshold || 50, 1, 99, 'Прогноз в срок, но шанс ниже — вывод о неустойчивом темпе')+
-    num('setInsightWindow', 'Период сравнения, дней', st.insightWindowDays || 28, 7, 365, 'За какой срок сравниваются темп, объём и прогноз');
+    num('setInsightWindow', 'Период сравнения, дней', st.insightWindowDays || 28, 7, 365, 'За какой срок сравниваются темп, объём и прогноз')+
+    '</div>';
 
   var bind = function(id, apply, event){
     document.getElementById(id).addEventListener(event || 'change', function(e){
@@ -1900,6 +2029,7 @@ function renderSettingsView(){
   bind('setChanceThreshold', function(el){ st.chanceThreshold = intIn(el, 1, 99, 50); });
   bind('setInsightWindow', function(el){ st.insightWindowDays = intIn(el, 7, 365, 28); });
   applyReadonlyToView('view-settings');
+  selectTab('settings', tabState.settings);
 }
 
 var SETTINGS_KEYS = ['forecastMethod', 'riskBufferDays', 'burnrateMethod', 'burnrateWindowDays', 'rangeConfidence', 'workdays',
@@ -2184,7 +2314,7 @@ function updateRoleUI(){
 /* ════════════════════════════════════════════════════════════════
    Navigation
 ════════════════════════════════════════════════════════════════ */
-var navItems = document.querySelectorAll('.nav-item');
+var navItems = document.querySelectorAll('.nav-item[data-view]');
 var pageTitle = document.getElementById('pageTitle');
 var pageSub = document.getElementById('pageSub');
 var ADMIN_VIEWS = ['users', 'projects', 'audit', 'integrations', 'calendar', 'health'];
@@ -2236,6 +2366,7 @@ function navigate(view){
     integrations:renderIntegrationsView, users:renderUsersView, projects:renderProjectsMgmtTable, audit:function(){ renderAuditTable(); },
     portfolio:renderPortfolioView, calendar:renderCalendarView, health:renderHealthView, guide:renderGuideView};
   if(renderers[view] && (currentProjectId || GLOBAL_VIEWS.indexOf(view) !== -1)) renderers[view]();
+  if(tabBar(view)) selectTab(view, tabState[view]);
   var reportView = PDF_VIEWS.indexOf(view) !== -1 && currentProjectId;
   document.getElementById('btnPdf').style.display = reportView ? '' : 'none';
   document.getElementById('btnPrint').style.display = (reportView && view !== 'data') ? '' : 'none';
@@ -2253,7 +2384,7 @@ function parseRoute(){
   if(!m || !(titles[m[1]] || m[1] === 'guide')) return null;
   var q = new URLSearchParams(m[2] || '');
   var num = function(k){ var n = parseInt(q.get(k), 10); return n > 0 ? n : null; };
-  return {view: m[1], project: num('project'), epic: num('epic'), doc: q.get('doc'), section: q.get('s')};
+  return {view: m[1], project: num('project'), epic: num('epic'), doc: q.get('doc'), section: q.get('s'), tab: q.get('tab')};
 }
 function routeEpic(){
   if(currentView === 'dashboard') return parseInt(document.getElementById('chartServiceSelect').value, 10) || null;
@@ -2265,6 +2396,8 @@ function routeHash(){
   if(currentProjectId) q.push('project=' + currentProjectId);  /* и в общих разделах — выбранный проект остаётся тем же */
   var epic = routeEpic();
   if(epic) q.push('epic=' + epic);
+  var tabs = visibleTabs(currentView);
+  if(tabs.length && tabState[currentView] && tabState[currentView] !== tabs[0]) q.push('tab=' + encodeURIComponent(tabState[currentView]));
   if(currentView === 'guide') q = q.concat(guideRouteParams());
   return '#/' + currentView + (q.length ? '?' + q.join('&') : '');
 }
@@ -2313,6 +2446,7 @@ window.addEventListener('popstate', function(){
   var r = parseRoute();
   if(!r || !currentUser) return;
   routeReplaceNext = true;
+  if(r.tab || tabBar(r.view)) tabState[r.view] = r.tab || null;
   if(r.project && r.project !== currentProjectId && projects.some(function(p){ return p.id === r.project; })){
     pendingRoute = r;
     currentView = r.view;
@@ -2512,6 +2646,120 @@ document.getElementById('lnkManual').addEventListener('click', function(e){
 });
 
 /* ════════════════════════════════════════════════════════════════
+   Быстрый поиск в шапке (как в «По Делу»): эпик, этап, раздел или проект — «/» или Ctrl+K, стрелки и Enter
+════════════════════════════════════════════════════════════════ */
+var quickSearch = document.getElementById('quickSearch');
+var quickResults = document.getElementById('quickSearchResults');
+var quickItems = [], quickActive = 0;
+function quickSearchItems(query){
+  var q = query.trim().toLowerCase(), out = [];
+  var hit = function(){ for(var i = 0; i < arguments.length; i++){ if(String(arguments[i] || '').toLowerCase().indexOf(q) !== -1) return true; } return false; };
+  if(!q) return out;
+  STATE.services.forEach(function(sv){
+    if(hit(sv.name, sv.etap)) out.push({kind: 'Эпик', title: sv.name, meta: sv.etap + (sv.isDone ? ' · сдан' : ''), run: function(){ showEpicOnDashboard(sv.id); }});
+  });
+  Object.keys(computeStageGroups()).forEach(function(name){
+    if(hit(name)) out.push({kind: 'Этап', title: name, meta: 'Свод по этапам', run: function(){ showStageInsight(name); }});
+  });
+  Array.prototype.forEach.call(navItems, function(n){
+    var title = (n.querySelector('.nav-text') || n).textContent.trim();
+    if(n.style.display !== 'none' && !n.closest('[hidden]') && n.closest('.nav-group').style.display !== 'none' && hit(title, (titles[n.dataset.view] || [])[1]))
+      out.push({kind: 'Раздел', title: title, meta: (titles[n.dataset.view] || [])[1] || '', run: function(){ navigate(n.dataset.view); }});
+  });
+  projects.forEach(function(p){
+    if(hit(p.name, p.description)) out.push({kind: 'Проект', title: p.name, meta: p.description || '', run: function(){ switchProject(p.id); }});
+  });
+  if(hit('руководство', 'справка', 'помощь')) out.push({kind: 'Раздел', title: 'Руководство', meta: 'Как работать с Burndown', run: function(){ navigate('guide'); }});
+  return out.slice(0, 12);
+}
+function renderQuickResults(){
+  quickItems = quickSearchItems(quickSearch.value);
+  quickActive = Math.min(quickActive, Math.max(quickItems.length - 1, 0));
+  quickResults.hidden = !quickSearch.value.trim();
+  quickResults.innerHTML = quickItems.length ? quickItems.map(function(it, i){
+    return '<button type="button" class="search-result'+(i === quickActive ? ' active' : '')+'" role="option" aria-selected="'+(i === quickActive)+'" data-i="'+i+'">'+
+      '<span class="search-kind">'+escapeHtml(it.kind)+'</span><span class="search-title">'+escapeHtml(it.title)+'</span>'+
+      (it.meta ? '<span class="search-meta">'+escapeHtml(it.meta)+'</span>' : '')+'</button>';
+  }).join('') : '<div class="search-empty">Ничего не найдено по «'+escapeHtml(quickSearch.value.trim())+'»</div>';
+}
+function runQuickResult(i){
+  var it = quickItems[i];
+  if(!it) return;
+  quickSearch.value = '';
+  quickResults.hidden = true;
+  quickSearch.blur();
+  it.run();
+}
+quickSearch.addEventListener('input', function(){ quickActive = 0; renderQuickResults(); });
+quickSearch.addEventListener('focus', function(){ if(quickSearch.value.trim()) renderQuickResults(); });
+quickSearch.addEventListener('keydown', function(e){
+  if(e.key === 'ArrowDown' || e.key === 'ArrowUp'){
+    e.preventDefault();
+    if(!quickItems.length) return;
+    quickActive = (quickActive + (e.key === 'ArrowDown' ? 1 : quickItems.length - 1)) % quickItems.length;
+    renderQuickResults();
+  } else if(e.key === 'Enter'){
+    e.preventDefault();
+    runQuickResult(quickActive);
+  } else if(e.key === 'Escape'){
+    quickSearch.value = '';
+    quickResults.hidden = true;
+    quickSearch.blur();
+  }
+});
+quickResults.addEventListener('mousedown', function(e){
+  var b = e.target.closest('[data-i]');
+  if(!b) return;
+  e.preventDefault();  /* до потери фокуса полем */
+  runQuickResult(parseInt(b.dataset.i, 10));
+});
+/* после ухода из поля список прячется с задержкой (щелчок по результату успевает сработать), но не если поле
+   уже снова в фокусе — иначе старая задержка скрыла бы новые результаты */
+quickSearch.addEventListener('blur', function(){
+  setTimeout(function(){ if(document.activeElement !== quickSearch) quickResults.hidden = true; }, 120);
+});
+document.addEventListener('keydown', function(e){
+  var t = e.target, typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+  if(((e.key === '/' && !typing) || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k')) && !confirmModal.classList.contains('show')){
+    e.preventDefault();
+    if(mobileLayout.matches && appRoot.classList.contains('collapsed')) quickSearch.scrollIntoView({block: 'nearest'});
+    quickSearch.focus();
+    quickSearch.select();
+  }
+});
+
+/* ── Сворачиваемые панели дашборда и свода (запоминаются в браузере) ── */
+var PANELS_KEY = 'burndown-collapsed-panels';
+var collapsedPanels = {};
+try { collapsedPanels = JSON.parse(localStorage.getItem(PANELS_KEY) || '{}') || {}; } catch(e){ collapsedPanels = {}; }
+document.querySelectorAll('.view .panel[data-block] > .panel-head').forEach(function(head){
+  var panel = head.parentNode, view = panel.closest('.view').id.replace('view-', ''), key = view + ':' + panel.dataset.block;
+  var title = (head.querySelector('.panel-title') || {}).textContent || '';
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'panel-collapse';
+  btn.innerHTML = iconSvg('chevronDown', 14);
+  var apply = function(collapsed){
+    panel.classList.toggle('panel-collapsed', collapsed);
+    btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    btn.title = (collapsed ? 'Развернуть' : 'Свернуть') + ' блок' + (title ? ' «' + title.trim() + '»' : '');
+    btn.setAttribute('aria-label', btn.title);
+  };
+  btn.addEventListener('click', function(){
+    var collapsed = !panel.classList.contains('panel-collapsed');
+    apply(collapsed);
+    if(collapsed) collapsedPanels[key] = true; else delete collapsedPanels[key];
+    try { localStorage.setItem(PANELS_KEY, JSON.stringify(collapsedPanels)); } catch(e){}
+  });
+  head.appendChild(btn);
+  apply(!!collapsedPanels[key]);
+});
+
+/* шапка раздела закреплена: при прокрутке — тень, чтобы отделить её от содержимого */
+var topbarEl = document.querySelector('.topbar');
+window.addEventListener('scroll', function(){ topbarEl.classList.toggle('scrolled', window.scrollY > 4); }, {passive: true});
+
+/* ════════════════════════════════════════════════════════════════
    Dashboard render
 ════════════════════════════════════════════════════════════════ */
 function renderStagesView(){
@@ -2690,8 +2938,9 @@ function showEpicOnDashboard(sid){
     var sel = document.getElementById('chartServiceSelect');
     if(!Array.prototype.some.call(sel.options, function(o){ return parseInt(o.value, 10) === sid; })){
       /* эпик скрыт фильтром дашборда — показываем его */
-      if(dashboardFilter.epics) dashboardFilter.epics.push(sid);
-      if(dashboardFilter.hideDone && isSvcDone(sid)) dashboardFilter.hideDone = false;
+      if(dashboardFilter.epics) dashboardFilter.epics[sid] = true;
+      if(dashboardFilter.hideDone && isSvcDone(serviceById(sid))) dashboardFilter.hideDone = false;
+      saveViewState();
       renderDashboard();
     }
     sel.value = String(sid);
@@ -2855,6 +3104,60 @@ document.querySelectorAll('.view-blocks-btn').forEach(function(btn){
   btn.addEventListener('click', function(){ openBlocksModal(btn.dataset.blocks); });
 });
 
+/* ── Личный вид проекта: переживает обновление страницы и повторный вход (хранится на сервере у пользователя) ── */
+var viewStateTimer = null;
+function currentViewState(){
+  var off = [];
+  if(dashboardFilter.epics) Object.keys(dashboardFilter.epics).forEach(function(id){ if(dashboardFilter.epics[id] === false) off.push(parseInt(id, 10)); });
+  return {hideDone: !!dashboardFilter.hideDone, epicsOff: off, stageShowDone: !!stageShowDone,
+          burnRange: burnRangeOverride, stageBurnRange: stageBurnRangeOverride};
+}
+function saveViewState(){
+  if(!currentUser || !currentProjectId) return;
+  var pid = currentProjectId, state = currentViewState();
+  currentUser.prefs = currentUser.prefs || {};
+  currentUser.prefs.views = currentUser.prefs.views || {};
+  currentUser.prefs.views[pid] = state;
+  clearTimeout(viewStateTimer);
+  viewStateTimer = setTimeout(function(){
+    apiPut('/api/profile/view-state', {projectId: pid, state: state}).catch(function(){});
+  }, 400);
+}
+/* при открытии проекта — его сохранённый вид; эпики, которых нет в проекте, игнорируются */
+function restoreViewState(pid){
+  var st = ((currentUser && currentUser.prefs && currentUser.prefs.views) || {})[pid] || {};
+  dashboardFilter = {hideDone: !!st.hideDone, epics: null};
+  (st.epicsOff || []).forEach(function(id){
+    if(!dashboardFilter.epics) dashboardFilter.epics = {};
+    dashboardFilter.epics[id] = false;
+  });
+  stageShowDone = !!st.stageShowDone;
+  burnRangeOverride = st.burnRange || null;
+  stageBurnRangeOverride = st.stageBurnRange || null;
+  [['burnFrom', burnRangeOverride, 'from'], ['burnTo', burnRangeOverride, 'to'], ['stageBurnFrom', stageBurnRangeOverride, 'from'],
+   ['stageBurnTo', stageBurnRangeOverride, 'to']].forEach(function(x){ document.getElementById(x[0]).value = (x[1] && x[1][x[2]]) || ''; });
+  restoreTableState(pid);
+}
+/* сортировка и фильтры таблиц — в этом браузере, у каждого пользователя и проекта свои */
+function tableStateKey(pid){ return 'burndown-tables:' + (currentUser ? currentUser.id : 0) + ':' + pid; }
+function restoreTableState(pid){
+  var saved = null;
+  try { saved = JSON.parse(localStorage.getItem(tableStateKey(pid)) || 'null'); } catch(e){}
+  Object.keys(tableSortState).forEach(function(k){ delete tableSortState[k]; });
+  Object.keys(tableFilterState).forEach(function(k){ delete tableFilterState[k]; });
+  if(saved && saved.sort) Object.assign(tableSortState, saved.sort);
+  if(saved && saved.filter) Object.keys(saved.filter).forEach(function(k){
+    var f = saved.filter[k] || {};
+    tableFilterState[k] = {open: !!f.open, search: f.search || '', values: f.values || {}, sort: f.sort || null};
+  });
+}
+function saveTableState(){
+  if(!currentProjectId) return;
+  var filter = {};
+  Object.keys(tableFilterState).forEach(function(k){ if(k !== 'jiTable') filter[k] = tableFilterState[k]; });
+  try { localStorage.setItem(tableStateKey(currentProjectId), JSON.stringify({sort: tableSortState, filter: filter})); } catch(e){}
+}
+
 /* ── Быстрые фильтры дашборда и свода ────────────────────────── */
 function renderDashboardFilterBar(){
   var box = document.getElementById('dashEpicChecks');
@@ -2867,6 +3170,7 @@ function renderDashboardFilterBar(){
     inp.addEventListener('change', function(){
       if(!dashboardFilter.epics) dashboardFilter.epics = {};
       dashboardFilter.epics[parseInt(inp.dataset.sid, 10)] = inp.checked;
+      saveViewState();
       renderDashboard();
     });
   });
@@ -2874,19 +3178,23 @@ function renderDashboardFilterBar(){
 
 document.getElementById('dashHideDone').addEventListener('change', function(e){
   dashboardFilter.hideDone = e.target.checked;
+  saveViewState();
   renderDashboard();
 });
 document.getElementById('dashEpicAll').addEventListener('click', function(){
   dashboardFilter.epics = null;
+  saveViewState();
   renderDashboard();
 });
 document.getElementById('dashEpicNone').addEventListener('click', function(){
   dashboardFilter.epics = {};
   STATE.services.forEach(function(s){ dashboardFilter.epics[s.id] = false; });
+  saveViewState();
   renderDashboard();
 });
 document.getElementById('stageShowDone').addEventListener('change', function(e){
   stageShowDone = e.target.checked;
+  saveViewState();
   renderStagesView();
 });
 
@@ -5452,21 +5760,16 @@ document.getElementById('btnAddService').addEventListener('click', function(){
 /* Диапазон дат таблиц burn rate (дашборд и свод по этапам) */
 function bindBurnRange(fromId, toId, resetId, setRange, render){
   var fromEl = document.getElementById(fromId), toEl = document.getElementById(toId);
-  var onChange = function(){ setRange({from: fromEl.value || null, to: toEl.value || null}); render(); };
+  var onChange = function(){ setRange({from: fromEl.value || null, to: toEl.value || null}); saveViewState(); render(); };
   fromEl.addEventListener('change', onChange);
   toEl.addEventListener('change', onChange);
   document.getElementById(resetId).addEventListener('click', function(){
     fromEl.value = ''; toEl.value = '';
-    setRange(null); render();
+    setRange(null); saveViewState(); render();
   });
 }
 bindBurnRange('burnFrom', 'burnTo', 'burnResetRange', function(r){ burnRangeOverride = r; }, renderBurnRateTable);
 bindBurnRange('stageBurnFrom', 'stageBurnTo', 'stageBurnResetRange', function(r){ stageBurnRangeOverride = r; }, renderStageBurnRateTable);
-function resetBurnRanges(){
-  burnRangeOverride = null;
-  stageBurnRangeOverride = null;
-  ['burnFrom','burnTo','stageBurnFrom','stageBurnTo'].forEach(function(id){ document.getElementById(id).value = ''; });
-}
 
 document.getElementById('btnExport').addEventListener('click', function(){
   if(!currentProjectId){ toast('Нет выбранного проекта'); return; }
@@ -5675,14 +5978,16 @@ document.getElementById('btnAddProject').addEventListener('click', function(){ o
 function renderProjectsNav(){
   var nav = document.getElementById('projectsNav');
   document.getElementById('overviewNav').hidden = projects.length < 2;  /* портфель — когда проектов несколько */
-  var html = '<div class="nav-label">Проекты</div>';
+  var html = '';
   if(!projects.length){
     nav.innerHTML = html + '<div class="nav-empty">Нет доступных проектов</div>';
     return;
   }
   var palette = colorPalette();
   projects.forEach(function(p, i){
-    html += '<a href="#" class="nav-project'+(p.id === currentProjectId ? ' active' : '')+'" data-pid="'+p.id+'" title="'+escapeAttr(p.description||p.name)+'"><span class="dot" style="background:'+palette[i % palette.length]+'"></span><span class="nav-project-name">'+escapeHtml(p.name)+'</span></a>';
+    html += '<a href="#" class="nav-project'+(p.id === currentProjectId ? ' active' : '')+'" data-pid="'+p.id+'" title="'+escapeAttr(p.description||p.name)+'">'+
+      '<span class="dot" data-initial="'+escapeAttr((p.name || '?').trim().charAt(0).toUpperCase())+'" style="background:'+palette[i % palette.length]+'"></span>'+
+      '<span class="nav-project-name">'+escapeHtml(p.name)+'</span></a>';
   });
   nav.innerHTML = html;
   nav.querySelectorAll('.nav-project').forEach(function(el){
@@ -5701,9 +6006,8 @@ function switchProject(pid){
   currentDataServiceId = null;
   /* данные прежнего проекта не должны быть видны (и редактируемы) под новым, пока грузятся новые */
   STATE = { services:[], entries:[], stageTargets:{}, settings:Object.assign({}, DEFAULT_SETTINGS) };
-  dashboardFilter = { hideDone: dashboardFilter.hideDone, epics: null };
-  stageShowDone = false;
-  resetBurnRanges();
+  viewStateProject = pid;
+  restoreViewState(pid);
   renderProjectsNav();
   updateRoleUI();
   /* из админ-разделов переходим к данным выбранного проекта */
@@ -5731,11 +6035,8 @@ function loadProjects(){
   return api('/api/projects').then(function(projs){
     projects = projs;
     var proj = projects.find(function(p){ return p.id === currentProjectId; });
-    if(!proj && projects.length){
-      proj = projects[0];
-      resetBurnRanges();
-      dashboardFilter.epics = null;
-    }
+    if(!proj && projects.length) proj = projects[0];
+    if(proj && proj.id !== viewStateProject){ viewStateProject = proj.id; restoreViewState(proj.id); }
     currentProjectId = proj ? proj.id : null;
     currentProjectRole = proj ? proj.role : null;
     renderProjectsNav();
@@ -5759,6 +6060,7 @@ function init(){
     if(route){
       pendingRoute = route;
       currentView = route.view;
+      if(route.tab) tabState[route.view] = route.tab;
       if(route.project) currentProjectId = route.project;
       if(route.view === 'data' && route.epic) currentDataServiceId = route.epic;
     }

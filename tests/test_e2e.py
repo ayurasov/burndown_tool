@@ -77,6 +77,11 @@ class App:
             self.page.click(f'.nav-item[data-view="{view}"]')
         self.page.wait_for_selector(f'#view-{view}.active')
 
+    def tab(self, view, key):
+        """Вкладка раздела (настройки, интеграции, Jira и Confluence)."""
+        self.page.click(f'[data-tabs="{view}"] [data-tab="{key}"]')
+        self.page.wait_for_selector(f'[data-tabs="{view}"] [data-tab="{key}"][aria-selected="true"]')
+
     def project(self, pid):
         name = self.text(f'.nav-project[data-pid="{pid}"]')
         self.page.click(f'.nav-project[data-pid="{pid}"]')
@@ -839,6 +844,7 @@ def test_writeback_panel_and_webhook_options(admin_ui, admin, fake_jira):
     admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'structureId': 7, 'structureName': 'Релиз 2026',
                                                        'mappings': [{'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]})
     admin_ui.go('jira')
+    admin_ui.tab('jira', 'writeback')
     page.wait_for_selector('#wbStatus:has-text("не разрешена")')
     assert page.is_disabled('#wbRun') and page.is_disabled('#wbField-forecast')
     admin_ui.go('integrations')
@@ -872,9 +878,11 @@ def test_confluence_report_panel(admin_ui, admin):
     try:
         page = admin_ui.page
         admin_ui.go('jira')
+        admin_ui.tab('jira', 'confluence')
         page.wait_for_selector('#crStatus:has-text("Подключение к Confluence не настроено")')
         assert page.is_disabled('#crPublish')
         admin_ui.go('integrations')
+        admin_ui.tab('integrations', 'confluence')
         page.wait_for_selector('#confStatus:has-text("не настроено")')
         page.fill('#confUrl', conf.url)
         page.fill('#confToken', 'conf-pat')
@@ -1352,7 +1360,8 @@ def fake_tg(flask_app, monkeypatch):
 def test_notify_admin_settings_ui(admin_ui, fake_mail, fake_tg):
     page = admin_ui.page
     admin_ui.go('integrations')
-    page.wait_for_selector('#notifyLogTable thead')
+    admin_ui.tab('integrations', 'notify')
+    page.wait_for_selector('#notifyLogTable thead', state='attached')
     # настройки приходят отдельным запросом и перезаписывают поля — заполняем только после них
     page.wait_for_function("document.getElementById('naBotStatus').textContent !== ''")
     page.fill('#naHost', 'smtp.example.ru')
@@ -1372,6 +1381,7 @@ def test_notify_admin_settings_ui(admin_ui, fake_mail, fake_tg):
     admin_ui.expect_toast('Тестовое письмо отправлено на ops@example.ru')
     conn = fake_mail.connections[-1]
     assert (conn.port, conn.user) == (465, 'burndown') and fake_mail.sent[-1]['To'] == 'ops@example.ru'
+    admin_ui.tab('integrations', 'log')
     page.wait_for_selector('#notifyLogTable tbody tr')
     assert 'Проверка' in admin_ui.text('#notifyLogTable tbody tr') and '✓' in admin_ui.text('#notifyLogTable tbody tr')
     assert not admin_ui.errors
@@ -1533,9 +1543,13 @@ def test_view_blocks_are_personal_and_saved(admin_ui):
 def test_settings_units_confidence_and_calendar(admin_ui):
     page = admin_ui.page
     admin_ui.go('settings')
+    admin_ui.tab('settings', 'units')
+    assert page.evaluate('location.hash') == '#/settings?project=1&tab=units'  # вкладка — в адресе страницы
     page.select_option('#setUnits', 'days')
     admin_ui.expect_toast('Настройки сохранены')
-    assert page.is_enabled('#setHoursPerDay')
+    assert page.is_enabled('#setHoursPerDay') and page.is_visible('#setHoursPerDay')  # перерисовка — та же вкладка
+    admin_ui.tab('settings', 'forecast')
+    assert page.is_hidden('#setUnits')
     page.select_option('#setConfidence', '90')
     admin_ui.expect_toast('Настройки сохранены')
     admin_ui.go('dashboard')
@@ -1545,6 +1559,7 @@ def test_settings_units_confidence_and_calendar(admin_ui):
     page.wait_for_selector('#insightsBody:not(.insight-loading) .insight-fact')
     assert 'чел.-дн.' in admin_ui.text('#insightsBody .insight-facts')
     admin_ui.go('settings')
+    admin_ui.tab('settings', 'calendar')
     page.check('#setWorkdays')
     admin_ui.expect_toast('Настройки сохранены')
     page.fill('#setHolidays', '01.01.2027 - 03.01.2027, 23.02.2027')
@@ -1923,3 +1938,86 @@ def test_snapshots_button_hidden_for_viewer(ui, make_user, admin, fake_jira):
     make_user('viewer9', project_id=1)
     ui.login('viewer9', 'pw-12345')
     assert ui.page.is_hidden('#jiraSnapshotsBtn')
+
+
+# ─── Вёрстка в стиле «По Делу» (1.10.0) ──────────────────────────
+
+def test_sidebar_rail_and_groups_are_remembered(admin_ui):
+    page = admin_ui.page
+    width = lambda: page.evaluate("document.querySelector('.sidebar').getBoundingClientRect().width")
+    assert 220 <= width() <= 240 and page.is_hidden('#sidebarToggle')  # на компьютере — кнопка «‹» в меню
+    page.click('#sidebarCollapse')
+    page.wait_for_function("document.querySelector('.sidebar').getBoundingClientRect().width < 70")
+    assert page.is_hidden('.nav-item[data-view="stages"] .nav-text') and page.get_attribute('#sidebarCollapse', 'aria-expanded') == 'false'
+    page.click('.nav-item[data-view="stages"]')  # иконки работают и в узком меню
+    page.wait_for_selector('#view-stages.active')
+    page.click('#sidebarCollapse')
+    page.click('#adminNav .nav-label')  # группа сворачивается
+    assert page.is_hidden('#navUsers') and page.get_attribute('#adminNav .nav-label', 'aria-expanded') == 'false'
+    page.reload()
+    page.wait_for_selector('#view-stages.active')
+    assert page.is_hidden('#navUsers') and 220 <= width() <= 240  # после F5 — как было
+    page.click('#adminNav .nav-label')
+    assert page.is_visible('#navUsers')
+    assert not admin_ui.errors
+
+
+def test_dashboard_view_state_survives_reload_and_relogin(admin_ui, browser, live_server):
+    page = admin_ui.page
+    page.check('#dashHideDone')
+    page.uncheck('#dashEpicChecks input[data-sid="2"]')
+    page.locator('.tf-bar:near(#summaryTable)').first.locator('.tf-search').fill('Этап 4')
+    page.click('#summaryTable th[data-sort="remaining"]')
+    page.wait_for_timeout(700)  # вид сохраняется с небольшой задержкой
+    page.reload()
+    page.wait_for_selector('#summaryTable tbody tr:not(.tf-hidden)')  # поиск по таблице тоже сохранился
+    assert page.is_checked('#dashHideDone') and not page.is_checked('#dashEpicChecks input[data-sid="2"]')
+    assert page.input_value('.tf-bar:near(#summaryTable) >> .tf-search') == 'Этап 4'
+    assert 'sorted-asc' in page.get_attribute('#summaryTable th[data-sort="remaining"]', 'class')
+    # в другом браузере после входа — тот же вид проекта (он хранится на сервере)
+    ctx = browser.new_context(viewport={'width': 1366, 'height': 900})
+    other = App(ctx.new_page(), live_server).login(*ADMIN)
+    assert other.page.is_checked('#dashHideDone') and not other.page.is_checked('#dashEpicChecks input[data-sid="2"]')
+    ctx.close()
+    page.click('#dashEpicAll')
+    page.uncheck('#dashHideDone')
+    page.wait_for_timeout(700)
+    page.reload()
+    page.wait_for_selector('#summaryTable tbody tr:not(.tf-hidden)')
+    assert not page.is_checked('#dashHideDone') and page.is_checked('#dashEpicChecks input[data-sid="2"]')
+    assert not admin_ui.errors
+
+
+def test_quick_search_and_collapsible_panels(admin_ui):
+    page = admin_ui.page
+    admin_ui.go('services')
+    page.keyboard.press('/')  # «/» — к поиску
+    assert page.evaluate('document.activeElement.id') == 'quickSearch'
+    page.keyboard.type('ЕИО')
+    page.wait_for_selector('#quickSearchResults .search-result')
+    assert 'ЕИО' in admin_ui.text('#quickSearchResults .search-result.active')
+    page.keyboard.press('Enter')  # эпик — на дашборде, выбран в графиках
+    page.wait_for_selector('#view-dashboard.active')
+    page.wait_for_function("document.getElementById('chartServiceSelect').selectedOptions[0].textContent.indexOf('ЕИО') !== -1")
+    page.fill('#quickSearch', 'интегр')
+    page.wait_for_selector('#quickSearchResults .search-result:has-text("Интеграции")')
+    page.click('#quickSearchResults .search-result:has-text("Интеграции")')
+    page.wait_for_selector('#view-integrations.active')
+    page.fill('#quickSearch', 'нет такого')
+    assert 'Ничего не найдено' in admin_ui.text('#quickSearchResults')
+    # ушли из поля и сразу вернулись: отложенное скрытие не прячет новые результаты
+    page.evaluate("""() => { const q = document.getElementById('quickSearch');
+        q.blur(); q.focus(); q.value = 'ЕИО'; q.dispatchEvent(new Event('input')); }""")
+    page.wait_for_timeout(300)
+    assert page.is_visible('#quickSearchResults .search-result')
+    page.keyboard.press('Escape')
+    admin_ui.go('dashboard')
+    panel = '#view-dashboard [data-block="summary"]'
+    page.click(f'{panel} .panel-collapse')
+    assert page.is_hidden('#summaryTable') and page.get_attribute(f'{panel} .panel-collapse', 'aria-expanded') == 'false'
+    page.reload()
+    page.wait_for_selector('#view-dashboard.active')
+    assert page.is_hidden('#summaryTable')  # свёрнутый блок запомнен
+    page.click(f'{panel} .panel-collapse')
+    page.wait_for_selector('#summaryTable tbody tr')
+    assert not admin_ui.errors
