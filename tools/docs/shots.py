@@ -279,6 +279,23 @@ def main():
         pg.wait_for_timeout(200)
         shot(pg.locator('#confirmModal .modal'), 'user/37-jira-issues-problems.png')
         pg.keyboard.press('Escape')
+        # срезы задач по датам: ошибочный срез (значения ×3600) отмечен и выбран заранее
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            wrong = db.execute('SELECT MIN(snap_date) FROM jira_issue_snapshots').fetchone()[0]
+            db.execute('UPDATE jira_issue_snapshots SET remaining = remaining * 3600, spent = spent * 3600, '
+                       'estimate = estimate * 3600 WHERE snap_date = ?', (wrong,))
+            db.commit()
+        pg.click('#jiraSnapshotsBtn')
+        pg.wait_for_selector('#snapTable tbody tr')
+        pg.wait_for_timeout(300)
+        shot(pg.locator('#confirmModal .modal'), 'user/65-jira-snapshots.png')
+        pg.keyboard.press('Escape')
+        with app_module.app.app_context():
+            db = app_module.get_db()
+            db.execute('UPDATE jira_issue_snapshots SET remaining = remaining / 3600, spent = spent / 3600, '
+                       'estimate = estimate / 3600 WHERE snap_date = ?', (wrong,))
+            db.commit()
         # что изменилось в эпике за неделю: каскад объёма и списки задач
         pg.select_option('#chartServiceSelect', '1')
         pg.click('#jiraBurnupChanges')

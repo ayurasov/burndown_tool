@@ -1881,3 +1881,45 @@ def test_online_guide(admin_ui):
     admin_ui.go('dashboard')  # из руководства — обратно к проекту
     page.wait_for_selector('#summaryTable tbody tr')
     assert not admin_ui.errors
+
+
+def test_delete_wrong_jira_snapshots(admin_ui, fake_jira, admin, flask_app):
+    """Ошибочный срез (значения ×3600) отмечен в «Срезах задач» и удаляется — Δ объёма считается по оставшимся."""
+    import app as app_module
+    page = admin_ui.page
+    admin.put('/api/admin/jira-connection', json={'baseUrl': fake_jira.url, 'instanceType': 'server', 'token': 'secret-pat'})
+    bid = admin.post('/api/projects/1/jira/buttons', json={'name': 'Срез', 'structureId': 7, 'mappings': [
+        {'serviceId': 1, 'issueKeys': 'ABC-1', 'includeSubtree': True}]}).get_json()['id']
+    for date in ('2026-11-01', '2026-11-02', '2026-11-03'):
+        admin.post(f'/api/jira/buttons/{bid}/snapshot', json={'date': date})
+    with flask_app.app_context():
+        db = app_module.get_db()
+        db.execute("UPDATE jira_issue_snapshots SET remaining = remaining * 3600, spent = spent * 3600, "
+                   "estimate = estimate * 3600 WHERE snap_date = '2026-11-02'")
+        db.execute("UPDATE jira_issue_snapshots SET remaining = NULL, spent = NULL, estimate = NULL WHERE snap_date = '2026-11-01'")
+        db.commit()
+    app_module._RESULT_CACHE.clear()
+    page.reload()
+    page.wait_for_selector('#jiraCompTable tbody tr[data-sid="1"]')
+    delta = lambda: admin_ui.cells('#jiraCompTable tbody tr[data-sid="1"] td')[5]
+    assert delta().startswith('-')  # сравнение с ошибочным срезом: минус тысячи часов
+    page.click('#jiraSnapshotsBtn')
+    page.wait_for_selector('#snapTable tbody tr')
+    rows = page.locator('#snapTable tbody tr')
+    assert rows.count() == 3
+    assert 'похоже на ошибку единиц' in rows.nth(1).text_content() and page.is_checked('#snapTable [data-snap="2026-11-02"]')
+    assert 'нет часов' in rows.nth(2).text_content() and page.is_checked('#snapTable [data-snap="2026-11-01"]')
+    assert not page.is_checked('#snapTable [data-snap="2026-11-03"]') and not page.is_checked('#snapEntries')
+    page.click('#confirmOk')
+    admin_ui.expect_toast('Удалено срезов: 2')
+    page.wait_for_function('document.querySelectorAll("#jiraCompTable tbody tr[data-sid=\\"1\\"] td")[5].textContent.trim() === "—"')
+    page.click('#jiraCompTable tbody tr[data-sid="1"]')
+    page.wait_for_selector('#jiTable tbody tr')
+    assert page.locator('#jiTable .cell-delta').count() == 0  # сравнивать не с чем — без ложных «+N»
+    assert not admin_ui.errors
+
+
+def test_snapshots_button_hidden_for_viewer(ui, make_user, admin, fake_jira):
+    make_user('viewer9', project_id=1)
+    ui.login('viewer9', 'pw-12345')
+    assert ui.page.is_hidden('#jiraSnapshotsBtn')

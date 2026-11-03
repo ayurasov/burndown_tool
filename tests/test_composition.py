@@ -299,3 +299,101 @@ def test_pdf_burnup_forecast_and_totals(admin, fake):
     assert '01.02.2027 (позже)' in dash and 'не сходится' in dash and 'Итого по проекту' in dash
     stages = text('stages')
     assert 'Задачи Jira по этапам' in stages and 'Этап 4' in stages and 'Итого по проекту' in stages
+
+
+# ─── Ошибочные срезы: сравнение без «нет часов» и удаление (1.9.5) ──
+
+def measure(client, date):
+    """Замеры двух эпиков на дату — как после «Сохранить» в окне среза или автозаполнения."""
+    r = client.post('/api/projects/1/measurements', json={'date': date, 'items': [
+        {'serviceId': 1, 'remaining': 10, 'spent': 5, 'estimate': 15}, {'serviceId': 2, 'remaining': 3, 'spent': 1, 'estimate': 4}]})
+    assert r.status_code == 200, r.get_json()
+
+
+def set_hours(flask_app, date, factor=None):
+    """Срез за дату как будто сделан с ошибкой: значения ×factor (неверные единицы) или без часов (factor=None)."""
+    with flask_app.app_context():
+        db = app_module.get_db()
+        if factor:
+            db.execute('UPDATE jira_issue_snapshots SET remaining = remaining * ?, spent = spent * ?, estimate = estimate * ? '
+                       'WHERE snap_date = ?', (factor, factor, factor, date))
+        else:
+            db.execute('UPDATE jira_issue_snapshots SET remaining = NULL, spent = NULL, estimate = NULL WHERE snap_date = ?',
+                       (date,))
+        db.commit()
+    app_module._RESULT_CACHE.clear()
+    app_module._PAYLOAD_CACHE.clear()
+
+
+def test_snapshot_without_hours_is_not_zero_volume(admin, flask_app, button):
+    snap(admin, button, '2026-11-01')
+    snap(admin, button, '2026-11-02')
+    set_hours(flask_app, '2026-11-01')  # до настройки показателей у задач не было часов
+    history = admin.get('/api/projects/1/jira/composition').get_json()['history']['1']
+    assert [(p['date'], p['measured']) for p in history] == [('2026-11-01', 0), ('2026-11-02', 3)]
+    issues = {i['key']: i for i in admin.get('/api/services/1/jira/issues').get_json()['issues']}
+    assert issues['ABC-1']['prev'] == {'remaining': None, 'spent': None, 'estimate': None, 'category': 'indeterminate'}
+    changes = admin.get('/api/services/1/jira/changes').get_json()
+    assert changes['reestimated']['count'] == 0  # часы появились — это не переоценка
+    assert jira.issue_measured({'estimate': 0}) and not jira.issue_measured({'remaining': None})
+
+
+def test_snapshots_list_marks_suspicious_ones(admin, flask_app, button, make_user):
+    for d in ('2026-10-30', '2026-10-31', '2026-11-01', '2026-11-02'):
+        snap(admin, button, d)
+    measure(admin, '2026-11-02')
+    set_hours(flask_app, '2026-10-31', 3600)  # Σ-поле в «часах» — значения в 3600 раз больше
+    set_hours(flask_app, '2026-11-01')
+    data = admin.get('/api/projects/1/jira/snapshots').get_json()
+    assert [x['date'] for x in data] == ['2026-11-02', '2026-11-01', '2026-10-31', '2026-10-30']
+    flags = {x['date']: (x['suspicious'], x['noHours']) for x in data}
+    assert flags == {'2026-11-02': (False, False), '2026-11-01': (False, True), '2026-10-31': (True, False),
+                     '2026-10-30': (False, False)}
+    set_hours(flask_app, '2026-10-30', 3600)  # ошибочных срезов больше, чем верных, — всё равно отмечены
+    data = admin.get('/api/projects/1/jira/snapshots').get_json()
+    assert [x['date'] for x in data if x['suspicious']] == ['2026-10-31', '2026-10-30']
+    first = data[0]
+    assert (first['epics'], first['issues'], first['measured'], first['entries']) == (2, 4, 5, 2) and not first['restored']
+    assert make_user('viewer1', project_id=1).get('/api/projects/1/jira/snapshots').status_code == 200
+    assert make_user('stranger').get('/api/projects/1/jira/snapshots').status_code == 403
+    assert admin.get('/api/projects/999/jira/snapshots').status_code == 404
+
+
+def test_delete_wrong_snapshots(admin, flask_app, button, make_user):
+    for d in ('2026-11-01', '2026-11-02', '2026-11-03'):
+        snap(admin, button, d)
+        measure(admin, d)
+    set_hours(flask_app, '2026-11-02', 3600)
+    before = admin.get('/api/projects/1/jira/composition').get_json()['history']['1']
+    assert [p['date'] for p in before] == ['2026-11-01', '2026-11-02', '2026-11-03']
+    with flask_app.app_context():
+        app_module.store_insight_snapshot(1, '2026-11-02', {'x': 1}, 'live')
+    manager = make_user('ivanov', project_id=1, project_role='manager')
+    viewer = make_user('petrov', project_id=1)
+    assert viewer.post('/api/projects/1/jira/snapshots/delete', json={'dates': ['2026-11-02']}).status_code == 403
+    assert manager.post('/api/projects/1/jira/snapshots/delete', json={'dates': []}).status_code == 400
+    assert manager.post('/api/projects/1/jira/snapshots/delete', json={'dates': ['31.12.2026']}).status_code == 400
+    assert manager.post('/api/projects/1/jira/snapshots/delete', json={'dates': ['2027-01-01']}).status_code == 404
+    # без замеров: состав за дату удалён, замеры эпиков остались
+    r = manager.post('/api/projects/1/jira/snapshots/delete', json={'dates': ['2026-11-02']}).get_json()
+    assert r == {'dates': ['2026-11-02'], 'issues': 5, 'entries': 0}
+    after = admin.get('/api/projects/1/jira/composition').get_json()['history']['1']
+    assert [p['date'] for p in after] == ['2026-11-01', '2026-11-03']  # кэш состава обновился
+    with flask_app.app_context():
+        db = app_module.get_db()
+        assert db.execute("SELECT COUNT(*) FROM entries WHERE date = '2026-11-02'").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM insight_snapshots WHERE snap_date = '2026-11-02'").fetchone()[0] == 1
+    # с замерами: и замеры эпиков из среза, и недельная лента с этой даты пересоберётся
+    r = manager.post('/api/projects/1/jira/snapshots/delete', json={'dates': ['2026-11-03', '2026-11-01'],
+                                                                   'measurements': True}).get_json()
+    assert r['dates'] == ['2026-11-01', '2026-11-03'] and r['entries'] == 4
+    assert admin.get('/api/projects/1/jira/composition').get_json()['history'] == {}
+    with flask_app.app_context():
+        db = app_module.get_db()
+        assert db.execute("SELECT COUNT(*) FROM entries WHERE date IN ('2026-11-01', '2026-11-03')").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM insight_snapshots WHERE snap_date >= '2026-11-01'").fetchone()[0] == 0
+        log = db.execute("SELECT entity_type, old_value FROM audit_log WHERE entity_type = 'jira_snapshot' "
+                         'ORDER BY id').fetchall()
+    assert [tuple(x) for x in log] == [('jira_snapshot', '2026-11-02'), ('jira_snapshot', '2026-11-01 (замеров: 2)'),
+                                      ('jira_snapshot', '2026-11-03 (замеров: 2)')]
+    assert admin.post('/api/projects/999/jira/snapshots/delete', json={'dates': ['2026-11-01']}).status_code == 404

@@ -4219,12 +4219,13 @@ function aggregateComposition(sids){
   var pos = hists.map(function(){ return 0; }), cur = hists.map(function(){ return null; });
   var round = function(v){ return Math.round(v * 100) / 100; };
   var history = Object.keys(dateSet).sort().map(function(date){
-    var agg = {date: date, scope: 0, done: 0, total: 0, doneCount: 0, counts: {}, volume: {}};
+    var agg = {date: date, scope: 0, done: 0, total: 0, doneCount: 0, measured: 0, counts: {}, volume: {}};
     CATEGORY_ORDER.forEach(function(k){ agg.counts[k] = 0; agg.volume[k] = 0; });
     hists.forEach(function(h, i){
       while(pos[i] < h.length && h[pos[i]].date <= date) cur[i] = h[pos[i]++];
       var p = cur[i] || h[0];  /* до первого среза эпика — его первый срез: без ложного «роста объёма» в итоге */
       agg.scope += p.scope; agg.done += p.done; agg.total += p.total; agg.doneCount += p.doneCount;
+      agg.measured += p.measured === undefined ? 1 : p.measured;
       CATEGORY_ORDER.forEach(function(k){ agg.counts[k] += p.counts[k]; agg.volume[k] += p.volume[k]; });
     });
     agg.scope = round(agg.scope); agg.done = round(agg.done);
@@ -4242,15 +4243,21 @@ function aggregateComposition(sids){
 }
 
 /* Строка таблицы состава: эпик, этап или итог по проекту */
+/* Срезы, где у задач были часы: срез без часов (до настройки показателей) — не «нулевой объём», а нет данных;
+   по нему не считаются ни Δ объёма, ни burn-up */
+function measuredHistory(hist){
+  var measured = (hist || []).filter(function(p){ return p.measured !== 0; });
+  return measured.length ? measured : (hist || []);
+}
 function compositionRowHtml(o){
-  var l = o.latest, hist = o.history || [];
+  var l = o.latest, hist = measuredHistory(o.history);
   var labels = (STATE.jiraComp && STATE.jiraComp.problemLabels) || {};
   var pct = l.scope > 0 ? Math.round(l.done / l.scope * 100) : null;
   var probs = problemCount(l);
   var probTitle = Object.keys(l.problems || {}).map(function(k){ return (labels[k] || k) + ': ' + l.problems[k]; }).join('\n');
   var delta = '<span class="muted-cell">—</span>';
-  if(hist.length >= 2){
-    var prev = hist[hist.length - 2];
+  var prev = hist.length >= 2 && hist[hist.length - 1].date === l.date ? hist[hist.length - 2] : null;
+  if(prev && l.measured !== 0){
     var d = Math.round((l.scope - prev.scope) * 100) / 100;
     var cls = d > 0 ? 'delta-up' : (d < 0 ? 'delta-down' : 'muted-cell');
     var text = signedWork(d);
@@ -4302,9 +4309,56 @@ function renderJiraComposition(){
   });
 }
 
+/* Срезы задач по датам: найти и удалить ошибочные (неверные единицы, срез без часов) — сравнение, burn-up и
+   «что изменилось» пересчитываются по оставшимся срезам */
+function openJiraSnapshots(){
+  var pid = currentProjectId;
+  api('/api/projects/'+pid+'/jira/snapshots').then(function(list){
+    var rows = list.map(function(x){
+      var flags = (x.suspicious ? '<div class="text-danger">⚠ часы в задачах во много раз больше, чем в остальных срезах — похоже на ошибку единиц</div>' : '')+
+        (x.noHours ? '<div class="muted-cell">у задач нет часов — показатели не были настроены</div>' : '')+
+        (x.restored ? '<div class="muted-cell">восстановлен по журналу Jira</div>' : '');
+      return '<tr><td class="center"><input type="checkbox" data-snap="'+x.date+'"'+(x.suspicious || x.noHours ? ' checked' : '')+' aria-label="Срез '+fmtDate(x.date)+'"></td>'+
+        '<td class="mono nowrap">'+fmtDate(x.date)+'</td><td class="num">'+x.epics+'</td><td class="num">'+x.issues+'</td>'+
+        '<td class="num">'+x.measured+'</td><td class="num">'+hoursToStr(x.volume)+'</td><td class="num">'+x.entries+'</td><td>'+flags+'</td></tr>';
+    }).join('');
+    openModal({
+      title: 'Срезы задач Jira', size: 'xl', okLabel: 'Удалить выбранные', danger: true,
+      html: '<p class="bulk-intro">Каждый срез сохраняет состав эпиков по задачам на дату. Если срез сделан с ошибкой — например, '+
+          'с неверными единицами или до того, как у показателей появились часы, — удалите его: «Δ объёма», burn-up, прогноз по задачам '+
+          'и «Что изменилось» пересчитаются по оставшимся срезам. Срез за сегодня можно просто повторить кнопкой среза.</p>'+
+        (list.length ? '<div class="table-scroll jira-issues-scroll"><table class="data-table compact-table" id="snapTable"><thead><tr><th class="center">'+
+          '<input type="checkbox" id="snapAll" aria-label="Выбрать все"></th><th>Дата</th><th class="num">Эпиков</th><th class="num">Задач</th>'+
+          '<th class="num" title="Задач, у которых в срезе есть остаток, затрачено или оценка">С часами</th><th class="num">Объём</th>'+
+          '<th class="num" title="Замеров эпиков из этого среза на эту дату">Замеров</th><th>Признаки</th></tr></thead><tbody>'+rows+'</tbody></table></div>'+
+          '<label class="checkbox-row"><input type="checkbox" id="snapEntries"> Удалить и замеры эпиков за эти даты (остаток, затрачено, оценка), '+
+          'записанные такими срезами — если в них попали те же ошибочные значения</label>' :
+          '<p class="insight-empty">Срезов задач пока нет.</p>'),
+      onOk: function(){
+        var dates = Array.prototype.map.call(document.querySelectorAll('#snapTable [data-snap]:checked'), function(el){ return el.dataset.snap; });
+        if(!dates.length){ toast('Отметьте срезы, которые нужно удалить'); return false; }
+        var withEntries = document.getElementById('snapEntries').checked;
+        apiPost('/api/projects/'+pid+'/jira/snapshots/delete', {dates: dates, measurements: withEntries}).then(function(r){
+          closeModal();
+          toast('Удалено срезов: ' + r.dates.length + (r.entries ? ', замеров: ' + r.entries : ''));
+          invalidateInsights();
+          if(pid === currentProjectId) loadProjectData(pid, currentView);
+        }).catch(function(){});
+        return false;
+      }
+    });
+    var all = document.getElementById('snapAll');
+    if(all) all.addEventListener('change', function(){
+      document.querySelectorAll('#snapTable [data-snap]').forEach(function(el){ el.checked = all.checked; });
+    });
+  }).catch(function(){});
+}
+document.getElementById('jiraSnapshotsBtn').addEventListener('click', openJiraSnapshots);
+
 /* Burn-up с прогнозом: факт по срезам и пунктир до точки, где «Выполнено» догонит «Объём» */
 function drawBurnup(key, canvasId, legendId, noteId, hist){
   destroyChart(key);
+  hist = measuredHistory(hist);
   var single = hist.length === 1;
   var f = burnupForecast(hist);
   var datasets = [
@@ -4597,7 +4651,8 @@ function openJiraIssues(sid){
     var link = function(key){ return jiraIssueLink(data.baseUrl, key); };
     var badgeClass = CATEGORY_BADGE;
     var deltaHtml = function(i, m){
-      if(!data.prevDate || !i.prev || !isNum(i[m])) return '';
+      /* в прошлом срезе значения не было (показатель ещё не настроен) — это не изменение */
+      if(!data.prevDate || !i.prev || !isNum(i[m]) || !isNum(i.prev[m])) return '';
       var d = Math.round(((i[m] || 0) - (i.prev[m] || 0)) * 100) / 100;
       return d ? '<div class="cell-delta '+(d > 0 ? 'delta-up' : 'delta-down')+'">'+(d > 0 ? '+' : '')+fmtNum(d)+'</div>' : '';
     };
@@ -5735,6 +5790,7 @@ var auditActionLabels = { create: 'Создание', update: 'Изменени�
   sync: 'Синхронизация с Jira', writeback: 'Запись в Jira', publish: 'Публикация' };
 var auditEntityLabels = { project: 'Проект', service: 'Эпик', entry: 'Замер', user: 'Пользователь', stage_target: 'Цель этапа', settings: 'Настройки',
   jira_connection: 'Подключение к Jira', jira_button: 'Кнопка среза', jira_schedule: 'Расписание автозаполнения',
+  jira_snapshot: 'Срезы задач Jira',
   notify_settings: 'Почта и Telegram', org_calendar: 'Производственный календарь', admin_alerts: 'Оповещения администратору' };
 var auditFieldLabels = {
   name: 'Название', description: 'Описание', etap: 'Этап', targetDate: 'Целевая дата', isDone: 'Сдано', stageGroup: 'Группа в своде',
