@@ -2005,6 +2005,11 @@ def test_quick_search_and_collapsible_panels(admin_ui):
     page.wait_for_selector('#view-integrations.active')
     page.fill('#quickSearch', 'нет такого')
     assert 'Ничего не найдено' in admin_ui.text('#quickSearchResults')
+    # ушли из поля и сразу вернулись: отложенное скрытие не прячет новые результаты
+    page.evaluate("""() => { const q = document.getElementById('quickSearch');
+        q.blur(); q.focus(); q.value = 'ЕИО'; q.dispatchEvent(new Event('input')); }""")
+    page.wait_for_timeout(300)
+    assert page.is_visible('#quickSearchResults .search-result')
     page.keyboard.press('Escape')
     admin_ui.go('dashboard')
     panel = '#view-dashboard [data-block="summary"]'

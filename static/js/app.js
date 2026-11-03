@@ -2713,7 +2713,11 @@ quickResults.addEventListener('mousedown', function(e){
   e.preventDefault();  /* до потери фокуса полем */
   runQuickResult(parseInt(b.dataset.i, 10));
 });
-quickSearch.addEventListener('blur', function(){ setTimeout(function(){ quickResults.hidden = true; }, 120); });
+/* после ухода из поля список прячется с задержкой (щелчок по результату успевает сработать), но не если поле
+   уже снова в фокусе — иначе старая задержка скрыла бы новые результаты */
+quickSearch.addEventListener('blur', function(){
+  setTimeout(function(){ if(document.activeElement !== quickSearch) quickResults.hidden = true; }, 120);
+});
 document.addEventListener('keydown', function(e){
   var t = e.target, typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
   if(((e.key === '/' && !typing) || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k')) && !confirmModal.classList.contains('show')){
