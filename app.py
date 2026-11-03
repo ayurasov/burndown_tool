@@ -2093,6 +2093,7 @@ def api_jira_onboard(pid):
 
 
 VOLUME_SQL = 'COALESCE(estimate, COALESCE(spent, 0) + COALESCE(remaining, 0))'
+MEASURED_SQL = 'CASE WHEN remaining IS NOT NULL OR spent IS NOT NULL OR estimate IS NOT NULL THEN 1 ELSE 0 END'
 
 
 @app.route('/api/projects/<int:pid>/jira/composition')
@@ -2205,17 +2206,19 @@ def jira_composition(db, pid):
 
 
 def snapshots_version(db, pid):
-    """Версия состава задач: только срезы Jira (добавляются, id растут) и набор эпиков проекта."""
+    """Версия состава задач: срезы Jira (добавляются — растут id; ошибочные можно удалить — меняется число строк)
+    и набор эпиков проекта."""
     row = db.execute('SELECT group_concat(s.id), MAX((SELECT MAX(j.id) FROM jira_issue_snapshots j '
+                     'WHERE j.service_id = s.id)), SUM((SELECT COUNT(*) FROM jira_issue_snapshots j '
                      'WHERE j.service_id = s.id)) FROM services s WHERE s.project_id = ?', (pid,)).fetchone()
-    return f'{row[0]}|{row[1]}'
+    return f'{row[0]}|{row[1]}|{row[2]}'
 
 
 def _jira_composition(db, pid):
     rows = db.execute(
         f'''SELECT s.service_id, s.snap_date, s.category,
                    SUM(CASE WHEN s.container THEN 0 ELSE 1 END) AS cnt,
-                   SUM({VOLUME_SQL}) AS volume, SUM(COALESCE(s.remaining, 0)) AS rem
+                   SUM({VOLUME_SQL}) AS volume, SUM(COALESCE(s.remaining, 0)) AS rem, SUM({MEASURED_SQL}) AS measured
             FROM jira_issue_snapshots s JOIN services v ON v.id = s.service_id
             WHERE v.project_id = ? GROUP BY s.service_id, s.snap_date, s.category
             ORDER BY s.service_id, s.snap_date''', (pid,)).fetchall()
@@ -2224,7 +2227,7 @@ def _jira_composition(db, pid):
         sid = r['service_id']
         points = history.setdefault(sid, [])
         if not points or points[-1]['date'] != r['snap_date']:
-            points.append({'date': r['snap_date'], 'scope': 0.0, 'done': 0.0, 'total': 0, 'doneCount': 0,
+            points.append({'date': r['snap_date'], 'scope': 0.0, 'done': 0.0, 'total': 0, 'doneCount': 0, 'measured': 0,
                            'counts': {c: 0 for c in jira.STATUS_CATEGORIES},
                            'volume': {c: 0.0 for c in jira.STATUS_CATEGORIES}})
         p = points[-1]
@@ -2232,6 +2235,7 @@ def _jira_composition(db, pid):
         p['counts'][cat] += r['cnt']
         p['volume'][cat] = round(p['volume'][cat] + (r['volume'] or 0), 2)
         p['total'] += r['cnt']
+        p['measured'] += r['measured'] or 0  # задач с часами: срез без часов — не «нулевой объём», а нет данных
         p['scope'] = round(p['scope'] + (r['volume'] or 0), 2)
         if cat == 'done':
             p['doneCount'] += r['cnt']
@@ -2269,6 +2273,84 @@ def api_jira_service_issues(sid):
     issues.sort(key=lambda i: jira.issue_sort_key(i['key']))
     return jsonify({'date': snap_date, 'prevDate': prev_date, 'baseUrl': _jira_base_url(db, svc['project_id']),
                     'issues': issues, 'problemLabels': jira.PROBLEMS})
+
+
+SNAPSHOT_SUSPICIOUS_RATIO = 50  # средние часы задачи в срезе во столько раз больше обычного — похоже на ошибку единиц
+
+
+@app.route('/api/projects/<int:pid>/jira/snapshots')
+@login_required
+def api_jira_snapshots(pid):
+    """Срезы задач проекта по датам — чтобы найти и удалить ошибочные (неверные единицы, срез без часов):
+    эпиков, задач, задач с часами, объём, замеров на эту дату и подозрительные признаки."""
+    db = get_db()
+    if not db.execute('SELECT 1 FROM projects WHERE id = ?', (pid,)).fetchone():
+        return jsonify({'error': 'Проект не найден'}), 404
+    if not can_view_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет доступа'}), 403
+    rows = db.execute(
+        f'''SELECT j.snap_date, COUNT(DISTINCT j.service_id) AS epics, SUM(CASE WHEN j.container THEN 0 ELSE 1 END) AS issues,
+                   SUM({VOLUME_SQL}) AS volume, SUM({MEASURED_SQL}) AS measured, MAX(j.restored) AS restored,
+                   MAX(j.captured_at) AS captured,
+                   (SELECT COUNT(*) FROM entries e WHERE e.date = j.snap_date AND e.service_id IN
+                      (SELECT DISTINCT k.service_id FROM jira_issue_snapshots k JOIN services t ON t.id = k.service_id
+                       WHERE t.project_id = :p AND k.snap_date = j.snap_date)) AS entries
+            FROM jira_issue_snapshots j JOIN services s ON s.id = j.service_id
+            WHERE s.project_id = :p GROUP BY j.snap_date ORDER BY j.snap_date DESC''', {'p': pid}).fetchall()
+    out = [{'date': r['snap_date'], 'epics': r['epics'], 'issues': r['issues'], 'measured': r['measured'] or 0,
+            'volume': round(r['volume'] or 0, 2), 'restored': bool(r['restored']), 'capturedAt': r['captured'],
+            'entries': r['entries']} for r in rows]
+    # ошибка единиц только завышает часы (секунды как часы — ×3600), и ошибочных срезов может быть больше, чем верных,
+    # поэтому образец — срез с наименьшими средними часами задачи, а не медиана
+    per_issue = [x['volume'] / x['measured'] for x in out if x['measured'] and x['volume'] > 0]
+    typical = min(per_issue) if per_issue else 0
+    for x in out:
+        x['noHours'] = x['measured'] == 0
+        x['suspicious'] = bool(typical and x['measured'] and
+                               x['volume'] / x['measured'] > typical * SNAPSHOT_SUSPICIOUS_RATIO)
+    return jsonify(out)
+
+
+@app.route('/api/projects/<int:pid>/jira/snapshots/delete', methods=['POST'])
+@login_required
+def api_jira_snapshots_delete(pid):
+    """Удалить ошибочные срезы задач за выбранные даты (состав эпиков, история burn-up, «что изменилось»);
+    measurements — и замеры эпиков за эти даты, записанные такими срезами. Сравнение и прогноз по задачам
+    пересчитываются по оставшимся срезам; выводы по неделям — по оставшимся замерам."""
+    db = get_db()
+    if not db.execute('SELECT 1 FROM projects WHERE id = ?', (pid,)).fetchone():
+        return jsonify({'error': 'Проект не найден'}), 404
+    if not can_edit_project(session['user_id'], pid):
+        return jsonify({'error': 'Нет прав на редактирование'}), 403
+    data = json_body()
+    raw = data.get('dates')
+    if not isinstance(raw, list) or not raw or len(raw) > 366:
+        return jsonify({'error': 'Выберите даты срезов'}), 400
+    dates = sorted({parse_date(d, 'Дата среза') for d in raw})
+    with_entries = bool(data.get('measurements'))
+    issues = entries = 0
+    changes = []
+    for d in dates:
+        sids = [r[0] for r in db.execute('SELECT DISTINCT j.service_id FROM jira_issue_snapshots j JOIN services s '
+                                         'ON s.id = j.service_id WHERE s.project_id = ? AND j.snap_date = ?', (pid, d))]
+        if not sids:
+            continue
+        marks = ','.join('?' * len(sids))
+        issues += db.execute(f'DELETE FROM jira_issue_snapshots WHERE snap_date = ? AND service_id IN ({marks})',
+                             (d, *sids)).rowcount
+        removed = 0
+        if with_entries:
+            removed = db.execute(f'DELETE FROM entries WHERE date = ? AND service_id IN ({marks})', (d, *sids)).rowcount
+            entries += removed
+        changes.append({'field': 'date', 'old': d + (f' (замеров: {removed})' if removed else ''), 'new': None})
+    if not changes:
+        return jsonify({'error': 'За выбранные даты срезов задач нет'}), 404
+    if entries:
+        # недельная лента выводов пересоберётся по оставшимся замерам
+        db.execute('DELETE FROM insight_snapshots WHERE project_id = ? AND snap_date >= ?', (pid, dates[0]))
+    audit_log('jira', 'delete', 'jira_snapshot', None, pid, changes, entity_name='Срезы задач Jira', commit=False)
+    db.commit()
+    return jsonify({'dates': [c['old'][:10] for c in changes], 'issues': issues, 'entries': entries})
 
 
 def _jira_base_url(db, pid=None):
@@ -2309,9 +2391,11 @@ def scope_changes(before, after):
     added = [brief(i) for k, i in after.items() if k not in before]
     removed = [brief(i) for k, i in before.items() if k not in after]
     reestimated, closed, reopened = [], [], []
+    measured = jira.issue_measured
     for key in before.keys() & after.keys():
         a, b = before[key], after[key]
-        delta = round(vol(b) - vol(a), 2)
+        # часы появились там, где их не было (сменили настройки среза) — это не переоценка
+        delta = round(vol(b) - vol(a), 2) if measured(a) and measured(b) else 0
         if delta:
             reestimated.append(brief(b, before=round(vol(a), 2), delta=delta))
         if b['category'] == 'done' and a['category'] != 'done':

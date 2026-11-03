@@ -1395,6 +1395,11 @@ def issue_problems(issue, field_map, derived=()):
     return out
 
 
+def issue_measured(issue):
+    """Есть ли у задачи в срезе хоть один показатель (часы): без них объём задачи — не 0, а «нет данных»."""
+    return any(issue.get(m) is not None for m in METRICS)
+
+
 def issue_volume(issue):
     """Объём задачи для burn-up: оценка, а если её нет — затрачено + остаток."""
     if issue.get('estimate') is not None:
