@@ -2,7 +2,7 @@
 
     python3 tools/docs/shots.py
 
-Скрипт сам поднимает демо-стенд: временную базу init_db (проекты АИСУЗ и ИСУП), приложение
+Скрипт сам поднимает демо-стенд: временную базу init_db (проекты Орбита и Полюс), приложение
 и учебную Jira со Structure (tests/fake_jira.py с демо-задачами). Рабочая база не затрагивается.
 Снимки кладутся в docs/manuals/images/{user,admin}. Нужен Playwright с Chromium
 (путь к другому Chromium — в CHROMIUM_PATH).
@@ -64,15 +64,15 @@ HISTORY = ['2026-07-17', '2026-07-24', '2026-07-28', '2026-07-29']  # срезы
 
 
 def demo_jira(step=3):
-    """Учебная Jira: структура «АИСУЗ — релиз 4.0», у каждого эпика — задача-эпик с задачами.
+    """Учебная Jira: структура «Орбита — релиз 4.0», у каждого эпика — задача-эпик с задачами.
 
-    step 0…3 — состояние задач на даты HISTORY: задачи закрываются, в эпик «Работа с жалобами» добавляется
+    step 0…3 — состояние задач на даты HISTORY: задачи закрываются, в эпик «Обращения клиентов» добавляется
     задача (рост объёма); к последнему срезу появляются задачи с неполными данными для примера проверок.
     """
     totals = {  # эпик проекта: (ключ, остаток, затрачено, оценка), ч
-        1: ('AISUZ-100', 330, 272, 410), 2: ('AISUZ-200', 198, 266, 330), 3: ('AISUZ-300', 96, 610, 526),
-        4: ('AISUZ-400', 186, 2016, 1312), 5: ('AISUZ-500', 262, 2330, 1694), 6: ('AISUZ-600', 78, 377, 420)}
-    names = ['Анализ требований', 'Разработка API', 'Интерфейс пользователя', 'Интеграция с ЕИС', 'Миграция данных']
+        1: ('DEMO-100', 330, 272, 410), 2: ('DEMO-200', 198, 266, 330), 3: ('DEMO-300', 96, 610, 526),
+        4: ('DEMO-400', 186, 2016, 1312), 5: ('DEMO-500', 262, 2330, 1694), 6: ('DEMO-600', 78, 377, 420)}
+    names = ['Анализ требований', 'Разработка API', 'Интерфейс пользователя', 'Интеграция с CRM', 'Миграция данных']
     issues, formula, row = {}, [], 1
     for epic, (key, rem, spent, est) in totals.items():
         root = epic * 100
@@ -89,7 +89,7 @@ def demo_jira(step=3):
             done_at = {1: 1 + epic % 2, 2: 3, 3: 9, 4: 9, 5: 9}[i]
             category = 'done' if step >= done_at else ('indeterminate' if step >= i - 1 else 'new')
             left = 0 if category == 'done' else rem * share
-            issue = {'key': f'AISUZ-{root + i}', 'parent': key, 'summary': names[i - 1], 'category': category,
+            issue = {'key': f'DEMO-{root + i}', 'parent': key, 'summary': names[i - 1], 'category': category,
                      'timeestimate': int(left * H), 'timespent': int(spent * share * H),
                      'timeoriginalestimate': int(est * share * H), 'customfield_10050': round(est * share / 8, 1)}
             if share == 0:
@@ -104,7 +104,7 @@ def demo_jira(step=3):
     fake_jira.ISSUES = issues
     fake_jira.CREATED_DEFAULT = '2026-07-01T10:00:00.000+0300'  # задачи заведены до первых замеров
     fake_jira.FORMULA = ','.join(formula)
-    fake_jira.STRUCTURES = [{'id': 7, 'name': 'АИСУЗ — релиз 4.0'}, {'id': 8, 'name': 'Портфель проектов 2026'},
+    fake_jira.STRUCTURES = [{'id': 7, 'name': 'Орбита — релиз 4.0'}, {'id': 8, 'name': 'Портфель проектов 2026'},
                             {'id': 9, 'name': 'Бэклог сопровождения'}]
     fake_jira.FIELDS = fake_jira.FIELDS[:6] + [
         {'id': 'customfield_10051', 'name': 'Трудозатраты по плану, ч', 'custom': True, 'schema': {'type': 'number'}},
@@ -121,8 +121,8 @@ def jira_history(api, base, jira_url):
     api.put(base + '/api/admin/jira-connection', json={'baseUrl': jira_url, 'instanceType': 'server_basic',
                                                        'login': JIRA_LOGIN, 'token': JIRA_PASSWORD})
     bid = api.post(base + '/api/projects/1/jira/buttons', json={
-        'name': 'история', 'structureId': 7, 'structureName': 'АИСУЗ — релиз 4.0',
-        'mappings': [{'serviceId': sid, 'issueKeys': f'AISUZ-{sid}00', 'includeSubtree': True}
+        'name': 'история', 'structureId': 7, 'structureName': 'Орбита — релиз 4.0',
+        'mappings': [{'serviceId': sid, 'issueKeys': f'DEMO-{sid}00', 'includeSubtree': True}
                      for sid in range(1, 7)]}).json()['id']
     for step, date in enumerate(HISTORY):
         demo_jira(step)
@@ -155,6 +155,8 @@ def prepare(base, jira_url):
                                                          'email': login + '@example.ru', 'position': pos,
                                                          'role': 'user'}).json()['id']
         s.post(f'{base}/api/users/{users[login]}/projects', json={'projectId': 1, 'role': role})
+    # руководитель ведёт оба проекта: снимки руководства пользователя — от его имени, без разделов администратора
+    s.post(f'{base}/api/users/{users["ivanov"]}/projects', json={'projectId': 2, 'role': 'manager'})
     s.put(base + '/api/projects/1/stage_targets', json={'stageName': 'Этап 4', 'targetDate': '2026-08-31'})
     s.put(base + '/api/projects/1/stage_targets', json={'stageName': 'Этап 3', 'targetDate': '2026-08-28'})
     s.put(base + '/api/entries/24', json={'date': '2026-07-29', 'remaining': 86, 'spent': 370, 'estimate': 416})
@@ -166,7 +168,7 @@ def main():
     jira = fake_jira.FakeJira(mode='server_basic', login=JIRA_LOGIN, token=JIRA_PASSWORD)  # Server/DC, логин и пароль
     # почта и Telegram — учебные: письма складываются в память, бот отвечает локально
     notify.smtplib.SMTP = notify.smtplib.SMTP_SSL = FakeSMTP
-    telegram = FakeTelegram(username='burndown_vector_bot')
+    telegram = FakeTelegram(username='burndown_demo_bot')
     app_module.app.config['TELEGRAM_API'] = telegram.url
     base = start_app()
     api = prepare(base, jira.url)
@@ -197,9 +199,15 @@ def main():
             pg.wait_for_selector('#summaryTable tbody tr')
             pg.wait_for_timeout(800)
 
+        # две вкладки: руководитель проекта (снимки руководства пользователя) и администратор (настройка стенда
+        # и снимки руководства администратора); помощники ниже работают с текущей — pg
+        actx = context()
+        apg = actx.new_page()
+        apg.on('pageerror', lambda e: print('PAGEERR admin', e))
         ctx = context()
-        pg = ctx.new_page()
-        pg.on('pageerror', lambda e: print('PAGEERR', e))
+        upg = ctx.new_page()
+        upg.on('pageerror', lambda e: print('PAGEERR', e))
+        pg = upg
 
         def tab(view, key, wait=None):
             pg.click(f'[data-tabs="{view}"] [data-tab="{key}"]')
@@ -227,7 +235,8 @@ def main():
         pg.goto(base + '/login')
         pg.wait_for_timeout(300)
         shot(pg, 'user/01-login.png')
-        login(pg, 'admin', ADMIN_PASSWORD)
+        login(apg, 'admin', ADMIN_PASSWORD)
+        login(pg, 'ivanov', 'Demo-2026')
         pg.wait_for_selector('#insightsBody:not(.insight-loading) .insight-headline')
         pg.wait_for_timeout(300)
         shot(pg, 'user/02-dashboard.png')
@@ -336,6 +345,7 @@ def main():
         shot(pg.locator('#view-portfolio'), 'user/53-portfolio.png')
 
         # ── Рассылки (администратор) и уведомления по проекту
+        pg = apg
         go('integrations')
         tab('integrations', 'notify', '#naHost')
         pg.wait_for_function("document.getElementById('naBotStatus').textContent !== ''")
@@ -349,6 +359,7 @@ def main():
         pg.click('#naSave')
         pg.wait_for_function("document.getElementById('naBotStatus').textContent.includes('@')")
         hide_toast()
+        pg = upg
         go('notify', '#nfDays [data-day]')
         pg.click('#nfTelegramLink')
         pg.wait_for_selector('.telegram-steps a')
@@ -372,12 +383,14 @@ def main():
         pg.wait_for_timeout(500)
         shot(pg.locator('#confirmModal .modal'), 'user/46-digest-preview.png')
         pg.keyboard.press('Escape')
+        pg = apg
         go('integrations')
         tab('integrations', 'notify', '#naTestTo')
         pg.fill('#naTestTo', 'ivanov@example.ru')
         shot(pg.locator('#notifyAdminForm'), 'admin/10-notify-admin.png')
         tab('integrations', 'log', '#notifyLogTable tbody tr')
         shot(pg.locator('#view-integrations > .panel').last, 'admin/12-notify-log.png')
+        pg = upg
         # ── Данные по датам
         go('data', '#entriesTable tbody tr')
         shot(pg.locator('#view-data .panel'), 'user/14-data.png')
@@ -433,6 +446,7 @@ def main():
         go('dashboard', '#summaryTable tbody tr')
 
         # ── Интеграции (администратор): общее подключение к Jira — Server/DC, логин и пароль (Basic)
+        pg = apg
         go('integrations')
         tab('integrations', 'jira', '#jiraUrl')
         pg.wait_for_function("document.getElementById('jiraStatus').textContent !== ''")
@@ -452,12 +466,14 @@ def main():
         pg.click('#jiraSave')
         pg.wait_for_timeout(600)
         hide_toast()
+        pg = upg
+        pg.reload()  # состояние подключения проект загружает при открытии — перечитываем после настройки администратором
+        pg.wait_for_load_state('networkidle')
 
         # ── Связь с Jira в проекте: состояние общего подключения (так его видит руководитель проекта) и кнопки
         go('jira')
         tab('jira', 'buttons')
         pg.wait_for_selector('#jiraProjectStatus.ok')
-        pg.evaluate("document.getElementById('jiraOpenIntegrations').hidden = true")  # кнопка видна только администратору
         shot(pg.locator('#view-jira .panel').first, 'user/24-jira-connection.png')
 
         # ── Редактор кнопки
@@ -467,7 +483,7 @@ def main():
         pg.wait_for_selector('#jbStructure option[value="7"]', state='attached')
         pg.select_option('#jbStructure', '7')
         for sid in range(1, 7):
-            pg.fill(f'#jbTable tr[data-sid="{sid}"] input[data-field="keys"]', f'AISUZ-{sid}00')
+            pg.fill(f'#jbTable tr[data-sid="{sid}"] input[data-field="keys"]', f'DEMO-{sid}00')
         pg.click('#jbLoadFields')
         pg.wait_for_timeout(500)
         hide_toast()
@@ -506,7 +522,7 @@ def main():
         # ── Автозаполнение: до первого среза (вторая кнопка) и настроенное расписание
         bid2 = api.post(base + '/api/projects/1/jira/buttons', json={
             'name': 'Срез сопровождения', 'structureId': None,
-            'mappings': [{'serviceId': 3, 'issueKeys': 'AISUZ-301, AISUZ-302', 'includeSubtree': True}]}).json()['id']
+            'mappings': [{'serviceId': 3, 'issueKeys': 'DEMO-301, DEMO-302', 'includeSubtree': True}]}).json()['id']
         bid1 = api.get(base + '/api/projects/1/jira').json()['buttons'][0]['id']
         api.put(f'{base}/api/jira/buttons/{bid1}/schedule', json={
             'enabled': True, 'days': [1, 2, 3, 4, 5], 'time': '09:00', 'timezone': 'Europe/Moscow', 'overwrite': True,
@@ -525,7 +541,8 @@ def main():
         # ── Запись в Jira и вебхук (администратор), подключение к Confluence
         api.put(base + '/api/admin/jira-options', json={'writebackAllowed': True, 'webhook': True})
         api.post(api.get(base + '/api/admin/jira-options').json()['webhook']['url'].replace('https://burndown.example.ru', base),
-                 json={'webhookEvent': 'jira:issue_updated', 'issue': {'key': 'AISUZ-100', 'fields': {}}})
+                 json={'webhookEvent': 'jira:issue_updated', 'issue': {'key': 'DEMO-100', 'fields': {}}})
+        pg = apg
         go('integrations')
         tab('integrations', 'jira', '#joWebhookUrl')
         pg.wait_for_function("document.getElementById('joWebhookStatus').textContent.includes('Последнее событие')")
@@ -546,6 +563,9 @@ def main():
         pg.evaluate('document.activeElement.blur()')
         shot(pg.locator('#confForm').locator('xpath=ancestor::div[contains(@class,"panel")]'), 'admin/16-confluence.png')
         pg.fill('#confUrl', confluence.url)
+        pg = upg
+        pg.reload()  # разрешение записи в Jira и подключение к Confluence — после настройки администратором
+        pg.wait_for_load_state('networkidle')
 
         # ── Прогноз в Jira и отчёт в Confluence (проект)
         go('jira')
@@ -591,15 +611,15 @@ def main():
         modal('user/41-history-done.png')
         pg.click('#confirmOk')
 
-        # ── Мастер подключения: пустой проект ИСУП подключается к своей структуре (эпики верхнего уровня)
-        for root, (name, due) in {100: ('Реестр закупок', '2026-12-18'), 200: ('Личный кабинет поставщика', '2026-12-25'),
-                                  300: ('Интеграция с ЕИС', '2027-01-29'), 400: ('Отчётность', '2027-02-26'),
-                                  500: ('Миграция НСИ', '2026-12-11'), 600: ('Мобильное приложение', None)}.items():
+        # ── Мастер подключения: пустой проект Полюс подключается к своей структуре (эпики верхнего уровня)
+        for root, (name, due) in {100: ('Реестр заказов', '2026-12-18'), 200: ('Личный кабинет клиента', '2026-12-25'),
+                                  300: ('Интеграция с CRM', '2027-01-29'), 400: ('Отчётность', '2027-02-26'),
+                                  500: ('Миграция справочников', '2026-12-11'), 600: ('Мобильное приложение', None)}.items():
             fake_jira.ISSUES[root].update(summary=name, duedate=due)
         fake_jira.ISSUES[600]['category'] = 'new'
-        fake_jira.STRUCTURES[0] = {'id': 7, 'name': 'ИСУП — релиз 2.0'}
+        fake_jira.STRUCTURES[0] = {'id': 7, 'name': 'Полюс — релиз 2.0'}
         pg.click('.nav-project[data-pid="2"]')
-        pg.wait_for_function('document.getElementById("pageSub").textContent.endsWith(" · ИСУП")')
+        pg.wait_for_function('document.getElementById("pageSub").textContent.endsWith(" · Полюс")')
         go('jira')
         pg.wait_for_selector('#jiraWizardCallout:not([hidden])')
         pg.click('#jiraWizardBtn')
@@ -609,7 +629,7 @@ def main():
         modal('user/55-wizard-source.png')
         pg.click('#confirmOk')
         pg.wait_for_selector('#wzAll')
-        pg.uncheck('#confirmBody [data-key="AISUZ-600"]')
+        pg.uncheck('#confirmBody [data-key="DEMO-600"]')
         modal('user/56-wizard-epics.png')
         pg.click('#confirmOk')
         pg.wait_for_selector('#wzWeeks')
@@ -632,9 +652,12 @@ def main():
         modal('user/58-epic-sync.png')
         pg.keyboard.press('Escape')
         pg.click('.nav-project[data-pid="1"]')
-        pg.wait_for_function('document.getElementById("pageSub").textContent.endsWith(" · АИСУЗ")')
+        pg.wait_for_function('document.getElementById("pageSub").textContent.endsWith(" · Орбита")')
 
         # ── Администрирование
+        pg = apg
+        pg.reload()  # кнопки среза и расписания создал руководитель — перечитываем данные проекта
+        pg.wait_for_load_state('networkidle')
         go('users', '#usersTable tbody tr')
         pg.click('#usersTable tr:has-text("petrova") td:first-child')
         pg.wait_for_selector('#userProjectsMgmt select[data-pid="1"]')
@@ -673,6 +696,7 @@ def main():
         shot(pg.locator('#view-health'), 'admin/14-health.png')
         os.environ['BURNDOWN_SCHEDULER'] = '0'
 
+        actx.close()
         ctx.close()
 
         # ── Режим просмотра (роль «Пользователь»)
@@ -688,7 +712,7 @@ def main():
         # ── Телефон
         ctx = context(viewport={'width': 390, 'height': 844}, is_mobile=True, has_touch=True)
         pg = ctx.new_page()
-        login(pg, 'admin', ADMIN_PASSWORD)
+        login(pg, 'ivanov', 'Demo-2026')
         shot(pg, 'user/22-mobile.png')
         pg.click('#sidebarToggle')
         pg.wait_for_timeout(400)

@@ -298,7 +298,7 @@ def test_epic_filter_and_hide_done(admin_ui):
     admin_ui.go('dashboard')
     page.check('#dashHideDone')
     assert admin_ui.cells('#kpiGrid .kpi-value')[0] == '5'
-    assert 'Работа с жалобами' not in admin_ui.text('#summaryTable')
+    assert 'Обращения клиентов' not in admin_ui.text('#summaryTable')
 
 
 def test_edge_cases_render_with_sensible_statuses(ui, admin):
@@ -461,7 +461,7 @@ def test_viewer_readonly_mode(ui, make_user):
 def test_readonly_is_lifted_after_switching_project(ui, make_user, admin):
     viewer = make_user('mixed', project_id=1, project_role='user')
     admin.post(f'/api/users/{viewer.user_id}/projects', json={'projectId': 2, 'role': 'manager'})
-    admin.post('/api/projects/2/services', json={'etap': 'Этап 1', 'name': 'Эпик ИСУП', 'targetDate': '2026-12-01'})
+    admin.post('/api/projects/2/services', json={'etap': 'Этап 1', 'name': 'Эпик Полюс', 'targetDate': '2026-12-01'})
     ui.login('mixed', 'pw-12345')
     page = ui.page
     ui.go('services')
@@ -577,13 +577,13 @@ def test_audit_log_shows_changes(admin_ui):
     page = admin_ui.page
     admin_ui.go('services')
     name = '#servicesTable tr[data-id="3"] input[data-field="name"]'
-    page.fill(name, 'КСБО-2')
+    page.fill(name, 'Склад-2')
     page.dispatch_event(name, 'change')
     admin_ui.expect_toast('Сохранено')
     admin_ui.go('audit')
     row = admin_ui.text('#auditLogTable tbody tr:first-child')
-    assert 'Изменение' in row and 'КСБО-2' in row and 'Эпики' in row
-    assert 'Эпик «КСБО»' in row and 'Название' in row  # тип записи и поле — по-русски
+    assert 'Изменение' in row and 'Склад-2' in row and 'Эпики' in row
+    assert 'Эпик «Склад»' in row and 'Название' in row  # тип записи и поле — по-русски
     assert re.match(r'\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}', admin_ui.cells('#auditLogTable tbody tr:first-child td')[0])
     page.select_option('#auditFilterPage', 'services')
     page.wait_for_function("""() => {
@@ -598,15 +598,15 @@ def test_status_without_target_and_non_burning_epic(admin_ui, admin):
     admin.put('/api/services/3', json={'targetDate': ''})
     admin_ui.page.reload()
     admin_ui.page.wait_for_selector('#summaryTable tbody tr')
-    ksbo = admin_ui.cells('#summaryTable tbody tr:has-text("КСБО") td')
-    assert ksbo[-1] == 'Нет цели' and ksbo[-2] == '—'  # без цели нет и шанса успеть
-    # остаток «Планирования закупок» растёт (55 → 86) — прогноз не достигает нуля, шанса успеть нет
-    plan = admin_ui.cells('#summaryTable tbody tr:has-text("Планирование закупок") td')
+    sklad = admin_ui.cells('#summaryTable tbody tr:has-text("Склад") td')
+    assert sklad[-1] == 'Нет цели' and sklad[-2] == '—'  # без цели нет и шанса успеть
+    # остаток «Планирования поставок» растёт (55 → 86) — прогноз не достигает нуля, шанса успеть нет
+    plan = admin_ui.cells('#summaryTable tbody tr:has-text("Планирование поставок") td')
     assert plan[-3] == 'не сгорает' and plan[-2] == '0%' and plan[-1] == '✗ Не успеваем'
 
 
 def test_scope_change_and_negative_burn_highlight(admin_ui):
-    row = '#summaryTable tbody tr:has-text("Работа с жалобами")'
+    row = '#summaryTable tbody tr:has-text("Обращения клиентов")'
     scope = admin_ui.page.locator(f'{row} td:nth-child(5)')
     assert scope.text_content() == '+251 ч'  # оценка 150 → 401
     assert 'scope-up' in scope.get_attribute('class')
@@ -626,7 +626,7 @@ def test_stage_sum_carries_forward_last_values(admin_ui, admin):
     admin_ui.page.wait_for_selector('#summaryTable tbody tr')
     admin_ui.go('stages')
     stage4 = admin_ui.cells('#stageSummaryTable tbody tr:has-text("Этап 4") td')
-    assert stage4[2] == '514,34 ч'  # 300 + 214,34 (последний остаток КЦД), а не 300
+    assert stage4[2] == '514,34 ч'  # 300 + 214,34 (последний остаток «Каталога товаров»), а не 300
 
 
 # ─── Данные: новый замер, клавиатура, откат ──────────────────────
@@ -949,6 +949,7 @@ def test_manager_sees_connection_but_cannot_change_it(ui, make_user, admin, fake
     ui.login('mgr', 'pw-12345')
     page = ui.page
     assert not page.is_visible('#navIntegrations')
+    assert ui.text('#userInfo .role-badge') == 'Руководитель'  # в меню — роль в открытом проекте
     ui.go('jira')
     assert ui.text('#jiraProjectStatus') == '✓ Подключение к Jira настроено'  # только факт, без адреса и учётной записи
     assert fake_jira.url not in page.content() and 'svc' not in ui.text('#view-jira')
@@ -1157,7 +1158,7 @@ def test_jira_composition_on_dashboard(admin_ui, fake_jira, admin):
     assert 'tf-invalid' in page.get_attribute('#jiTable .tf-row input[data-col="3"]', 'class') and shown() == ['ABC-1', 'ABC-3']
     page.click('#confirmModal .tf-reset')
     assert len(shown()) == 3 and page.input_value('#jiTable .tf-row input[data-col="3"]') == ''
-    page.fill('#confirmModal .tf-search', 'еис')  # поиск по всем колонкам — тема ABC-2
+    page.fill('#confirmModal .tf-search', 'crm')  # поиск по всем колонкам — тема ABC-2
     assert shown() == ['ABC-2']
     page.fill('#confirmModal .tf-search', '')
     # сортировка по щелчку на заголовок: «Остаток, ч» — по возрастанию, затем по убыванию
@@ -1395,7 +1396,7 @@ def test_notify_project_view_ui(admin_ui, admin, fake_mail, fake_tg):
     admin.put('/api/profile', json={'displayName': 'Администратор', 'email': 'admin@example.ru', 'position': 'Админ'})
     page.reload()
     page.wait_for_selector('#summaryTable tbody tr')
-    ui_chance = admin_ui.cells('#summaryTable tbody tr:has-text("Работа с жалобами") td')[7]
+    ui_chance = admin_ui.cells('#summaryTable tbody tr:has-text("Обращения клиентов") td')[7]
     admin_ui.go('notify')
     page.wait_for_selector('#nfDays [data-day]')
     assert admin_ui.text('#nfEmailState') == 'admin@example.ru' and admin_ui.text('#nfTelegramState') == 'Не привязан'
@@ -1427,7 +1428,7 @@ def test_notify_project_view_ui(admin_ui, admin, fake_mail, fake_tg):
     page.click('#nfPreview')
     page.wait_for_selector('#confirmModal.show iframe.digest-preview')
     frame = page.frame_locator('iframe.digest-preview')
-    row = frame.locator('tr:has-text("Работа с жалобами")').inner_text()
+    row = frame.locator('tr:has-text("Обращения клиентов")').inner_text()
     assert ui_chance in row
     page.click('#confirmOk')
     page.wait_for_selector('#confirmModal:not(.show)', state='attached')
@@ -1510,10 +1511,10 @@ def test_portfolio_switches_project(admin_ui):
     assert page.is_visible('#navPortfolio')
     admin_ui.go('portfolio')
     rows = page.locator('#portfolioBody tr[data-project]')
-    assert rows.count() == 2 and 'АИСУЗ' in rows.first.text_content()
+    assert rows.count() == 2 and 'Орбита' in rows.first.text_content()
     assert admin_ui.text('#pageSub') == 'Сводка по всем доступным проектам'
     page.click('#portfolioBody tr[data-project="2"]')
-    page.wait_for_function('document.getElementById("pageSub").textContent.endsWith(" · ИСУП")')
+    page.wait_for_function('document.getElementById("pageSub").textContent.endsWith(" · Полюс")')
     assert page.is_visible('#view-dashboard.active, #view-empty.active') or page.is_visible('#view-dashboard')
 
 
@@ -1817,7 +1818,7 @@ def test_table_filter_survives_rerender(admin_ui):
     rows = lambda: page.locator('#summaryTable tbody tr:not(.tf-hidden):not(.total-row)').count()
     assert rows() == 2 and bar.locator('.tf-count').text_content() == 'Показано 2 из 6'
     page.select_option('#summaryTable .tf-row select[data-col="0"]', 'Этап 4')
-    assert rows() == 1 and 'Работа с жалобами' in admin_ui.text('#summaryTable tbody tr:not(.tf-hidden)')
+    assert rows() == 1 and 'Обращения клиентов' in admin_ui.text('#summaryTable tbody tr:not(.tf-hidden)')
     assert page.locator('#summaryTable tbody tr.total-row').is_visible()  # «Итого» не скрывается
     page.click('#summaryTable th[data-sort="remaining"]')  # таблица перерисована — фильтр на месте
     assert rows() == 1 and page.input_value('#summaryTable .tf-row input[data-col="2"]') == '>250'
@@ -1834,7 +1835,7 @@ def test_table_filter_survives_rerender(admin_ui):
     page.click('#burnResetRange')  # перерисовка — сортировка на месте
     assert 'sorted-desc' in page.get_attribute(f'{head} >> nth=1', 'class')
     admin_ui.go('services')
-    page.locator('.tf-bar:near(#servicesTable)').first.locator('.tf-search').fill('ЕИО')  # значения полей ввода
+    page.locator('.tf-bar:near(#servicesTable)').first.locator('.tf-search').fill('Портал')  # значения полей ввода
     assert page.locator('#servicesTable tbody tr:not(.tf-hidden)').count() == 1
     assert 'sortable' in page.get_attribute('#servicesTable th[data-sort="isDone"]', 'class')  # «Сдано» тоже сортируется
     assert not admin_ui.errors
@@ -1993,12 +1994,12 @@ def test_quick_search_and_collapsible_panels(admin_ui):
     admin_ui.go('services')
     page.keyboard.press('/')  # «/» — к поиску
     assert page.evaluate('document.activeElement.id') == 'quickSearch'
-    page.keyboard.type('ЕИО')
+    page.keyboard.type('Портал')
     page.wait_for_selector('#quickSearchResults .search-result')
-    assert 'ЕИО' in admin_ui.text('#quickSearchResults .search-result.active')
+    assert 'Портал' in admin_ui.text('#quickSearchResults .search-result.active')
     page.keyboard.press('Enter')  # эпик — на дашборде, выбран в графиках
     page.wait_for_selector('#view-dashboard.active')
-    page.wait_for_function("document.getElementById('chartServiceSelect').selectedOptions[0].textContent.indexOf('ЕИО') !== -1")
+    page.wait_for_function("document.getElementById('chartServiceSelect').selectedOptions[0].textContent.indexOf('Портал') !== -1")
     page.fill('#quickSearch', 'интегр')
     page.wait_for_selector('#quickSearchResults .search-result:has-text("Интеграции")')
     page.click('#quickSearchResults .search-result:has-text("Интеграции")')
@@ -2007,7 +2008,7 @@ def test_quick_search_and_collapsible_panels(admin_ui):
     assert 'Ничего не найдено' in admin_ui.text('#quickSearchResults')
     # ушли из поля и сразу вернулись: отложенное скрытие не прячет новые результаты
     page.evaluate("""() => { const q = document.getElementById('quickSearch');
-        q.blur(); q.focus(); q.value = 'ЕИО'; q.dispatchEvent(new Event('input')); }""")
+        q.blur(); q.focus(); q.value = 'Портал'; q.dispatchEvent(new Event('input')); }""")
     page.wait_for_timeout(300)
     assert page.is_visible('#quickSearchResults .search-result')
     page.keyboard.press('Escape')

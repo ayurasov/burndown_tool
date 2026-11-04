@@ -99,7 +99,7 @@ def test_issue_list_for_epic(admin, button):
     assert data['date'] == '2026-11-02'
     assert [i['key'] for i in data['issues']] == ['ABC-1', 'ABC-2', 'ABC-3']
     abc2 = data['issues'][1]
-    assert abc2 == {'key': 'ABC-2', 'summary': 'Интеграция с ЕИС', 'status': 'Готово', 'category': 'done',
+    assert abc2 == {'key': 'ABC-2', 'summary': 'Интеграция с CRM', 'status': 'Готово', 'category': 'done',
                     'remaining': 2.0, 'spent': 1.0, 'estimate': 3.0, 'container': False,
                     'problems': ['done_with_remaining'], 'prev': None}
     assert data['issues'][0]['container'] is True

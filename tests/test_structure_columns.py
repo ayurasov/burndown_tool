@@ -573,7 +573,7 @@ def test_row_titles_tolerate_errors(fake, monkeypatch):
 # ─── Показатели задач в составе эпика (1.9.4) ────────────────────
 
 def structure_only_map():
-    """Как в АИСУЗ: показатели из колонок Structure, поле Jira для состава задач не задано."""
+    """Как в демо-проекте: показатели из колонок Structure, поле Jira для состава задач не задано."""
     return jira.normalize_field_map({
         'remaining': {'field': '', 'structure': {'editor': {'mode': 'formula', 'formula': USER_FORMULA, 'variables': USER_VARS,
                                                             'sum': True}, 'unit': 'ms'}},

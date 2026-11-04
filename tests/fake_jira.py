@@ -25,7 +25,7 @@ H = 3600
 ISSUES = {
     101: {'key': 'ABC-1', 'category': 'indeterminate', 'timeestimate': 10 * H, 'timespent': 5 * H, 'timeoriginalestimate': 12 * H,
           'customfield_10050': 20, 'customfield_10060': 'текст'},
-    102: {'key': 'ABC-2', 'category': 'done', 'summary': 'Интеграция с ЕИС', 'timeestimate': 2 * H, 'timespent': 1 * H, 'timeoriginalestimate': 3 * H},
+    102: {'key': 'ABC-2', 'category': 'done', 'summary': 'Интеграция с CRM', 'timeestimate': 2 * H, 'timespent': 1 * H, 'timeoriginalestimate': 3 * H},
     103: {'key': 'ABC-3', 'category': 'indeterminate', 'timeestimate': H // 2, 'timespent': None, 'timeoriginalestimate': 1 * H},
     104: {'key': 'ABC-4', 'timeestimate': 10 * H, 'timespent': 0, 'timeoriginalestimate': 10 * H},
     105: {'key': 'ABC-9', 'hidden': True, 'timeestimate': 100 * H},

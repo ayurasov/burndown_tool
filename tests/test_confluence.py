@@ -113,19 +113,19 @@ def test_publish_creates_then_updates_single_page(admin, conf):
     r = admin.post('/api/projects/1/confluence/publish')
     assert r.status_code == 200
     data = r.get_json()
-    assert data['result']['status'] == 'ok' and data['result']['message'] == 'Создана страница «Burndown — АИСУЗ»'
+    assert data['result']['status'] == 'ok' and data['result']['message'] == 'Создана страница «Burndown — Орбита»'
     page = next(iter(conf.state['pages'].values()))
-    assert page['title'] == 'Burndown — АИСУЗ' and page['space'] == 'PROJ'
+    assert page['title'] == 'Burndown — Орбита' and page['space'] == 'PROJ'
     body = page['body']
     assert 'ac:name="status"' in body and '<h2>Эпики</h2>' in body and '<h2>Этапы</h2>' in body
     assert 'Главные риски' in body and 'https://burndown.example.ru/?project=1' in body
     assert data['pageId'] == page['id'] and data['pageUrl'].endswith(f"pageId={page['id']}")
     again = admin.post('/api/projects/1/confluence/publish').get_json()
-    assert again['result']['message'] == 'Обновлена страница «Burndown — АИСУЗ»' and len(conf.state['pages']) == 1
+    assert again['result']['message'] == 'Обновлена страница «Burndown — Орбита»' and len(conf.state['pages']) == 1
     assert page['version'] == 2
     configure(admin, title='Сроки: {project}')  # переименование — та же страница (по id)
     admin.post('/api/projects/1/confluence/publish')
-    assert len(conf.state['pages']) == 1 and page['title'] == 'Сроки: АИСУЗ'
+    assert len(conf.state['pages']) == 1 and page['title'] == 'Сроки: Орбита'
     audit = admin.get('/api/audit?page=confluence').get_json()['entries']
     assert any(a['action'] == 'publish' for a in audit)
 
@@ -133,7 +133,7 @@ def test_publish_creates_then_updates_single_page(admin, conf):
 def test_publish_finds_existing_page_by_title(admin, conf, flask_app):
     connect(admin, conf)
     configure(admin)
-    conf.state['pages']['77'] = {'id': '77', 'title': 'Burndown — АИСУЗ', 'space': 'PROJ', 'version': 5, 'body': '',
+    conf.state['pages']['77'] = {'id': '77', 'title': 'Burndown — Орбита', 'space': 'PROJ', 'version': 5, 'body': '',
                                  'parent': None}
     assert admin.post('/api/projects/1/confluence/publish').get_json()['pageId'] == '77'
     assert conf.state['pages']['77']['version'] == 6
@@ -148,7 +148,7 @@ def test_weekly_mode_creates_page_per_week_under_parent(admin, conf):
     data = admin.post('/api/projects/1/confluence/publish').get_json()
     week = datetime.now().date().isocalendar()[1]
     created = [p for p in conf.state['pages'].values() if p['parent'] == '500']
-    assert len(created) == 1 and created[0]['title'].startswith(f'Burndown — АИСУЗ — неделя {week} (')
+    assert len(created) == 1 and created[0]['title'].startswith(f'Burndown — Орбита — неделя {week} (')
     assert data['pageId'] is None  # в режиме «каждую неделю» страница не запоминается
     assert admin.post('/api/projects/1/confluence/publish').get_json()['result']['message'].startswith('Обновлена')
     assert app_module.report_page_title({'title': '{project}', 'mode': 'weekly'}, 'П', '2026-11-04') == \
