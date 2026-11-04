@@ -949,6 +949,7 @@ def test_manager_sees_connection_but_cannot_change_it(ui, make_user, admin, fake
     ui.login('mgr', 'pw-12345')
     page = ui.page
     assert not page.is_visible('#navIntegrations')
+    assert ui.text('#userInfo .role-badge') == 'Руководитель'  # в меню — роль в открытом проекте
     ui.go('jira')
     assert ui.text('#jiraProjectStatus') == '✓ Подключение к Jira настроено'  # только факт, без адреса и учётной записи
     assert fake_jira.url not in page.content() and 'svc' not in ui.text('#view-jira')
@@ -1157,7 +1158,7 @@ def test_jira_composition_on_dashboard(admin_ui, fake_jira, admin):
     assert 'tf-invalid' in page.get_attribute('#jiTable .tf-row input[data-col="3"]', 'class') and shown() == ['ABC-1', 'ABC-3']
     page.click('#confirmModal .tf-reset')
     assert len(shown()) == 3 and page.input_value('#jiTable .tf-row input[data-col="3"]') == ''
-    page.fill('#confirmModal .tf-search', 'еис')  # поиск по всем колонкам — тема ABC-2
+    page.fill('#confirmModal .tf-search', 'crm')  # поиск по всем колонкам — тема ABC-2
     assert shown() == ['ABC-2']
     page.fill('#confirmModal .tf-search', '')
     # сортировка по щелчку на заголовок: «Остаток, ч» — по возрастанию, затем по убыванию

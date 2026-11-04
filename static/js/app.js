@@ -2307,7 +2307,7 @@ function updateRoleUI(){
   document.getElementById('defaultPwWarning').hidden = !(currentUser && currentUser.defaultPassword);
   if(currentUser){
     document.getElementById('userInfo').innerHTML = userAvatarHtml(currentUser, 'avatar')+
-      '<div class="user-info-text"><span class="user-info-name">'+escapeHtml(currentUser.displayName||currentUser.username)+'</span>'+roleBadge(currentUser.role)+'</div>';
+      '<div class="user-info-text"><span class="user-info-name">'+escapeHtml(currentUser.displayName||currentUser.username)+'</span>'+roleBadge(admin || !currentProjectRole ? currentUser.role : currentProjectRole)+'</div>';  /* роль в открытом проекте */
   }
 }
 
