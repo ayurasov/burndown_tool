@@ -656,6 +656,8 @@ def main():
 
         # ── Администрирование
         pg = apg
+        pg.reload()  # кнопки среза и расписания создал руководитель — перечитываем данные проекта
+        pg.wait_for_load_state('networkidle')
         go('users', '#usersTable tbody tr')
         pg.click('#usersTable tr:has-text("petrova") td:first-child')
         pg.wait_for_selector('#userProjectsMgmt select[data-pid="1"]')
