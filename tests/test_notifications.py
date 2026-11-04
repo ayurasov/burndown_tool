@@ -172,8 +172,8 @@ def test_digest_preview_matches_forecast(admin, mail_ready):
     expected = forecast.compute_status([e['date'] for e in rows], [e['remaining'] for e in rows], '2026-08-31',
                                        forecast.settings_dict(None))
     assert epic['status'] == expected['status'] and epic['probability'] == expected['mc']['probability']
-    assert ov['kpi']['epics'] == 6 and data['subject'].startswith('Burndown · АИСУЗ: ')
-    assert 'Работа с жалобами' in data['html'] and 'Открыть Burndown' in data['html']
+    assert ov['kpi']['epics'] == 6 and data['subject'].startswith('Burndown · Орбита: ')
+    assert 'Обращения клиентов' in data['html'] and 'Открыть Burndown' in data['html']
 
 
 def test_digest_test_send_with_pdf_and_telegram(admin, telegram, fake_smtp, mail_ready):
@@ -186,11 +186,11 @@ def test_digest_test_send_with_pdf_and_telegram(admin, telegram, fake_smtp, mail
     r = admin.post('/api/projects/1/notifications/test')
     assert r.status_code == 200 and [x['status'] for x in r.get_json()['results']] == ['ok', 'ok']
     msg = fake_smtp.sent[-1]
-    assert msg['To'] == 'admin@example.ru' and msg['Subject'].startswith('Burndown · АИСУЗ')
+    assert msg['To'] == 'admin@example.ru' and msg['Subject'].startswith('Burndown · Орбита')
     names = [a.get_filename() for a in msg.iter_attachments()]
     assert len(names) == 1 and names[0].endswith('.pdf')
     assert 'Сервис' in msg.get_body(('html',)).get_content()
-    assert telegram.state['messages'][-1]['chat_id'] == '42' and 'АИСУЗ' in telegram.state['messages'][-1]['text']
+    assert telegram.state['messages'][-1]['chat_id'] == '42' and 'Орбита' in telegram.state['messages'][-1]['text']
     assert telegram.state['documents'][-1]['name'].endswith('.pdf')
     sub = admin.get('/api/projects/1/notifications').get_json()['digest']
     assert sub['lastStatus'] == 'ok' and 'почта: отправлено; Telegram: отправлено' == sub['lastMessage']
@@ -230,11 +230,11 @@ def test_alerts_on_status_and_chance(admin, flask_app, fake_smtp, mail_ready):
     subscribe(admin, digest={'enabled': False})
     assert run(flask_app, app_module.run_alert_checks) == 0      # первая проверка — только запоминает состояние
     assert run(flask_app, app_module.run_alert_checks) == 0      # без изменений проект не пересчитывается
-    admin.put('/api/services/1', json={'etap': 'Этап 4', 'name': 'Сервис "Работа с жалобами"', 'targetDate': '2026-08-01'})
+    admin.put('/api/services/1', json={'etap': 'Этап 4', 'name': 'Сервис "Обращения клиентов"', 'targetDate': '2026-08-01'})
     assert run(flask_app, app_module.run_alert_checks) == 1
     assert run(flask_app, app_module.deliver_outbox) == 1
     text = fake_smtp.sent[-1].get_body(('plain',)).get_content()
-    assert 'Эпик «Сервис "Работа с жалобами"»: Успеваем → Не успеваем' in text
+    assert 'Эпик «Сервис "Обращения клиентов"»: Успеваем → Не успеваем' in text
     assert re.search(r'шанс успеть \d+% → 0% \(порог 50%\)', text)
     assert run(flask_app, app_module.deliver_outbox) == 0
 

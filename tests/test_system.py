@@ -102,7 +102,7 @@ def test_health_overview_and_rights(admin, make_user):
     assert list(items) == ['app', 'scheduler', 'jira', 'autofill', 'history', 'email', 'telegram', 'outbox', 'data']
     assert items['app']['status'] == 'ok' and items['app']['summary'].startswith(f'Версия {app_module.APP_VERSION}')
     assert items['scheduler']['status'] == 'off' and items['jira']['status'] == 'off'
-    assert items['data']['status'] == 'warn' and 'АИСУЗ' in items['data']['details'][0]  # демо-замеры старше 10 дней
+    assert items['data']['status'] == 'warn' and 'Орбита' in items['data']['details'][0]  # демо-замеры старше 10 дней
     assert data['status'] == 'warn' and data['alerts'] == {'enabled': True, 'email': True, 'telegram': True}
     user = make_user('ivanov', project_id=1, project_role='manager')
     for method, url in (('get', '/api/admin/health'), ('put', '/api/admin/health/alerts'), ('post', '/api/admin/health/check-jira'),

@@ -36,17 +36,17 @@ def test_dashboard_burn_rate_values(admin):
 
 def test_dashboard_respects_selected_epics(admin):
     text = pdf_text(admin, page='dashboard', epics='3,6')
-    assert 'КСБО' in text and 'Планирование закупок' in text
-    assert 'ЦЗК' not in text
+    assert 'Склад' in text and 'Планирование поставок' in text
+    assert 'Биллинг' not in text
     assert '195.0' in text  # 109 + 86
 
 
 def test_stages_exclude_done_epics_by_default(admin):
     admin.put('/api/services/1', json={'isDone': True})
     text = pdf_text(admin, page='stages')
-    assert 'Работа с жалобами' not in text
+    assert 'Обращения клиентов' not in text
     text_all = pdf_text(admin, page='stages', showDone='1')
-    assert 'Работа с жалобами' in text_all
+    assert 'Обращения клиентов' in text_all
 
 
 def test_stages_use_stage_group(admin):

@@ -47,7 +47,7 @@ def test_logout(admin):
 
 def test_admin_sees_all_projects(admin):
     projects = admin.get('/api/projects').get_json()
-    assert [p['name'] for p in projects] == ['АИСУЗ', 'ИСУП']
+    assert [p['name'] for p in projects] == ['Орбита', 'Полюс']
     assert all(p['role'] == 'admin' for p in projects)
 
 
@@ -128,14 +128,14 @@ def test_service_crud_and_audit(admin):
 def test_service_update_keeps_unsent_fields(admin):
     """Изменение только целевой даты (как с дашборда) не сбрасывает признак «сдано» и группу."""
     admin.put('/api/services/1', json={'isDone': True, 'stageGroup': 'G'})
-    admin.put('/api/services/1', json={'etap': 'Этап 4', 'name': 'Сервис "Работа с жалобами"', 'targetDate': '2026-09-15'})
+    admin.put('/api/services/1', json={'etap': 'Этап 4', 'name': 'Сервис "Обращения клиентов"', 'targetDate': '2026-09-15'})
     svc = admin.get('/api/projects/1/data').get_json()['services'][0]
     assert (svc['targetDate'], svc['isDone'], svc['stageGroup']) == ('2026-09-15', True, 'G')
 
 
 def test_service_update_no_spurious_stage_group_audit(admin):
     """Пустая группа ('' против NULL в БД) не создаёт лишних записей в реестре."""
-    admin.put('/api/services/1', json={'name': 'Сервис "Работа с жалобами"', 'stageGroup': ''})
+    admin.put('/api/services/1', json={'name': 'Сервис "Обращения клиентов"', 'stageGroup': ''})
     assert audit(admin, page='services') == []
 
 
@@ -177,7 +177,7 @@ def test_entry_crud_and_audit(admin):
     assert admin.delete(f'/api/entries/{eid}').status_code == 200
     log = audit(admin, page='data')
     assert {e['action'] for e in log} == {'create', 'update', 'delete'}
-    assert all(e['entityName'] == 'Сервис "Работа с жалобами"' for e in log)
+    assert all(e['entityName'] == 'Сервис "Обращения клиентов"' for e in log)
 
 
 def test_entry_requires_date(admin):
@@ -259,7 +259,7 @@ def test_project_assignment_roles(admin):
     assert admin.post(f'/api/users/{uid}/projects', json={'projectId': 1, 'role': 'admin'}).status_code == 400
     assert admin.post(f'/api/users/{uid}/projects', json={'projectId': 1, 'role': 'manager'}).status_code == 200
     assert admin.post(f'/api/users/{uid}/projects', json={'projectId': 1, 'role': 'user'}).status_code == 200
-    assert admin.get(f'/api/users/{uid}/projects').get_json() == [{'projectId': 1, 'projectName': 'АИСУЗ', 'role': 'user'}]
+    assert admin.get(f'/api/users/{uid}/projects').get_json() == [{'projectId': 1, 'projectName': 'Орбита', 'role': 'user'}]
     assert admin.delete(f'/api/users/{uid}/projects/1').status_code == 200
     assert admin.get(f'/api/users/{uid}/projects').get_json() == []
 
@@ -290,7 +290,7 @@ def test_export_json(admin):
     assert r.status_code == 200 and r.mimetype == 'application/json'
     assert 'attachment' in r.headers['Content-Disposition']
     data = r.get_json()
-    assert data['project']['name'] == 'АИСУЗ' and len(data['services']) == 6 and len(data['entries']) == 24
+    assert data['project']['name'] == 'Орбита' and len(data['services']) == 6 and len(data['entries']) == 24
 
 
 def test_audit_filters(admin):

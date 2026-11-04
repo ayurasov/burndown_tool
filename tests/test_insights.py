@@ -225,7 +225,7 @@ def test_insights_api_and_access(admin, make_user):
     r = admin.get('/api/projects/1/insights')
     assert r.status_code == 200
     data = r.get_json()
-    assert {e['name'] for e in data['epics']} >= {'КСБО', 'ЦЗК'} and {s['name'] for s in data['stages']} == {'Этап 3', 'Этап 4'}
+    assert {e['name'] for e in data['epics']} >= {'Склад', 'Биллинг'} and {s['name'] for s in data['stages']} == {'Этап 3', 'Этап 4'}
     assert data['summary']['headline'] and data['settings']['units'] == 'hours'
     assert all(e['headline'] for e in data['epics'])
     admin.put('/api/services/1', json={'isDone': True})  # сданный эпик в выводы не попадает
@@ -239,7 +239,7 @@ def test_insights_api_and_access(admin, make_user):
 
 def test_portfolio_api_for_admin(admin):
     data = admin.get('/api/portfolio').get_json()
-    assert [p['name'] for p in data['projects']] == ['АИСУЗ', 'ИСУП']  # проект с рисками — первым
+    assert [p['name'] for p in data['projects']] == ['Орбита', 'Полюс']  # проект с рисками — первым
     first = data['projects'][0]
     assert first['epics'] == 6 and first['stages'] == 2 and len(first['summary']['top']) <= 3
     assert data['projects'][1]['summary']['status'] == 'unknown'
@@ -293,7 +293,7 @@ def test_digest_starts_with_insights(admin, mail_ready, fake_smtp):
     subscribe(admin, digest={'enabled': True, 'days': [1], 'time': '09:00', 'timezone': 'Europe/Moscow', 'pdf': False})
     assert admin.post('/api/projects/1/notifications/test').status_code == 200
     text = fake_smtp.sent[-1].get_body(('plain',)).get_content()
-    assert 'Главное: Сроки под угрозой' in text and text.index('Главное:') < text.index('• Сервис "Работа с жалобами" —')
+    assert 'Главное: Сроки под угрозой' in text and text.index('Главное:') < text.index('• Сервис "Обращения клиентов" —')
 
 
 def test_digest_in_person_days(admin, mail_ready):
@@ -314,7 +314,7 @@ def test_pdf_dashboard_has_insights_and_deadlines(admin):
     assert 'Выводы' in text and 'Главные риски' in text and 'Сроки по эпикам' in text
     assert 'Не успеваем' in text and 'не сгорает' in text
     selected = pdf_text(admin, page='dashboard', epics='3,6')
-    assert 'Выводы по выбранным эпикам' in selected and 'ЦЗК' not in selected and 'Главные риски' not in selected
+    assert 'Выводы по выбранным эпикам' in selected and 'Биллинг' not in selected and 'Главные риски' not in selected
 
 
 def test_pdf_stages_insights_and_units(admin):

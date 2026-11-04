@@ -117,7 +117,7 @@ def test_weekly_feed_api(admin, flask_app, make_user):
     today = date.today().isoformat()
     assert weeks[0]['to'] == today and weeks[0]['from'] == (date.today() - timedelta(days=7)).isoformat()
     assert all(w['from'] == n['to'] for w, n in zip(weeks, weeks[1:]))  # недели идут подряд
-    epic_name = 'Сервис "Работа с жалобами"'
+    epic_name = 'Сервис "Обращения клиентов"'
     latest = [f for f in weeks[0]['items'] if f['subject'] == epic_name]
     assert latest and latest[0]['severity'] != 'ok'  # работа встала — прогноз хуже
     assert len(weeks) <= app_module.CHANGES_WEEKS

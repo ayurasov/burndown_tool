@@ -5204,7 +5204,7 @@ def telegram_help():
             '/week — что изменилось за неделю (/неделя)\n'
             '/projects — ваши проекты (/проекты)\n\n'
             'После команды можно указать проект — номером из /projects или частью названия: <code>/risks 2</code>, '
-            '<code>/status АИСУЗ</code>.')
+            '<code>/status Орбита</code>.')
 
 
 def _tg_subject(f):

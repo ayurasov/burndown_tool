@@ -69,7 +69,7 @@ def test_status_risks_week_for_single_project(admin, flask_app, bot, make_user):
     user = make_user('ivan', project_id=1)
     link(flask_app, user, bot, 777)
     status = reply(flask_app, '/status')
-    assert '<b>АИСУЗ</b>' in status and 'Эпики: успевают' in status and 'Открыть в Burndown' not in status
+    assert '<b>Орбита</b>' in status and 'Эпики: успевают' in status and 'Открыть в Burndown' not in status
     admin.put('/api/admin/notify-settings', json={'publicUrl': 'https://burndown.example.ru/'})
     app_module._RESULT_CACHE.clear()
     assert 'href="https://burndown.example.ru/?project=1"' in reply(flask_app, '/статус')
@@ -82,13 +82,13 @@ def test_status_risks_week_for_single_project(admin, flask_app, bot, make_user):
 def test_project_choice_by_number_and_name(admin, flask_app, bot):
     link(flask_app, admin, bot, 777)
     listing = reply(flask_app, '/projects')
-    assert listing.startswith('<b>Ваши проекты</b>') and '1. ' in listing and '2. ' in listing and 'ИСУП' in listing
+    assert listing.startswith('<b>Ваши проекты</b>') and '1. ' in listing and '2. ' in listing and 'Полюс' in listing
     assert reply(flask_app, '/status') == listing  # несколько проектов: статус — по всем
-    assert '<b>ИСУП</b>' in reply(flask_app, '/status 2') and '<b>АИСУЗ</b>' in reply(flask_app, '/risks аисуз')
+    assert '<b>Полюс</b>' in reply(flask_app, '/status 2') and '<b>Орбита</b>' in reply(flask_app, '/risks орбита')
     assert 'не найден' in reply(flask_app, '/status Нет такого')
     assert 'не найден' in reply(flask_app, '/status 9')
-    admin.post('/api/projects', json={'name': 'АИСУЗ-2'})
-    assert 'несколько проектов' in reply(flask_app, '/status АИСУЗ')
+    admin.post('/api/projects', json={'name': 'Орбита-2'})
+    assert 'несколько проектов' in reply(flask_app, '/status Орбита')
     many = reply(flask_app, '/week')
     assert many.count('за неделю') == 3  # по каждому проекту
     assert reply(flask_app, '/risks').count('главные риски') == 3
