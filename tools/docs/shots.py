@@ -467,6 +467,8 @@ def main():
         pg.wait_for_timeout(600)
         hide_toast()
         pg = upg
+        pg.reload()  # состояние подключения проект загружает при открытии — перечитываем после настройки администратором
+        pg.wait_for_load_state('networkidle')
 
         # ── Связь с Jira в проекте: состояние общего подключения (так его видит руководитель проекта) и кнопки
         go('jira')
@@ -562,6 +564,8 @@ def main():
         shot(pg.locator('#confForm').locator('xpath=ancestor::div[contains(@class,"panel")]'), 'admin/16-confluence.png')
         pg.fill('#confUrl', confluence.url)
         pg = upg
+        pg.reload()  # разрешение записи в Jira и подключение к Confluence — после настройки администратором
+        pg.wait_for_load_state('networkidle')
 
         # ── Прогноз в Jira и отчёт в Confluence (проект)
         go('jira')
