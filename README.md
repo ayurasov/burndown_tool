@@ -187,6 +187,22 @@ sudo apt install -y certbot python3-certbot-nginx
 sudo certbot --nginx -d ваш-домен-или-ip
 ```
 
+## Развёртывание в Docker (прод-стенд сервера 192.168.2.129)
+
+Развёртывание одной командой: база SQLite — в именованном томе `burndown_data`, приложение — Gunicorn
+в контейнере, порт стенда — `39667`.
+
+```bash
+cp .env.example .env       # задать SECRET_KEY: openssl rand -hex 32
+docker compose up -d --build
+```
+
+На сервере стенд разворачивается конвейером Gitea Actions (`.gitea/workflows/ci.yml`):
+тесты → сборка образа → deploy (`docker compose -p burndown up -d --build`) → дымовые пробы
+(`/healthz` и экран входа). Секреты стенда (`SECRET_KEY` и пр.) приходят из секрета репозитория
+`DEPLOY_ENV`, в git их нет. Живость стенда: `GET /healthz` — без авторизации, для healthcheck
+контейнера и мониторинга.
+
 ## Управление
 
 ### Перезапуск приложения

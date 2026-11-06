@@ -1,0 +1,17 @@
+# В образ не попадают: локальная база, окружение, тесты и артефакты сборки
+burndown.db*
+.env
+.venv
+venv
+__pycache__
+.git
+.gitea
+.github
+tests
+tools
+*.md
+!docs/manuals/*.md
+htmlcov
+.coverage
+Dockerfile
+docker-compose.yml

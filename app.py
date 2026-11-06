@@ -549,6 +549,12 @@ def login_page():
     return render_template('login.html')
 
 
+@app.route('/healthz')
+def healthz():
+    """Живость приложения без авторизации — для healthcheck контейнера и мониторинга."""
+    return {'ok': True}
+
+
 # ─── О программе: версия, история версий, руководства ───────────
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))

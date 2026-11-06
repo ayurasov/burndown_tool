@@ -1,0 +1,83 @@
+# Серверная копия .github/workflows/tests.yml для локального Gitea + прод-стенд сервера.
+# Отличия от GitHub-версии (общий хост, джобы в контейнерах раннеров):
+#  - тесты идут в образе метки ubuntu-latest (node:20-bookworm): actions/checkout
+#    требует node, python ставится в джобу (как в todo-planner);
+#  - после тестов джоба deploy (метка deploy, alpine) собирает образ и поднимает
+#    прод-стенд docker compose (проект burndown, порт 39667) + дымовые пробы по HTTP.
+# Готовность стенда проверяется по HTTP (не по docker-health контейнеров).
+# Секреты стенда приходят из секрета репозитория DEPLOY_ENV, в git их нет.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: 'Тесты: серверные (API, PDF, Jira, аналитика) + браузерные (e2e)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python и зависимости
+        run: |
+          apt-get update -qq && apt-get install -y -qq python3 python3-venv >/dev/null
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install --quiet --no-cache-dir --timeout 60 --retries 5 -r requirements-dev.txt
+      - name: Браузер для e2e (Playwright chromium)
+        run: /opt/venv/bin/python -m playwright install --with-deps chromium
+      - name: Серверные тесты (API, PDF, Jira, аналитика, уведомления)
+        timeout-minutes: 15
+        run: /opt/venv/bin/python -m coverage run -m pytest tests/ --ignore=tests/test_e2e.py -v
+      - name: Браузерные тесты (e2e)
+        timeout-minutes: 15
+        run: /opt/venv/bin/python -m coverage run -a -m pytest tests/test_e2e.py -v
+      - name: Покрытие кода тестами (порог — в .coveragerc)
+        run: /opt/venv/bin/python -m coverage report
+
+  deploy:
+    name: 'Deploy прод-стенда + smoke'
+    runs-on: deploy
+    needs: tests
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Docker CLI и compose
+        run: apk add --no-cache docker-cli docker-cli-compose curl
+      - name: Получить код (tarball из Gitea — в образе deploy нет node для actions/checkout)
+        run: |
+          curl -sfSL -H "Authorization: token ${{ secrets.GITEA_TOKEN }}" \
+            "http://gitea:3000/${{ github.repository }}/archive/${{ github.sha }}.tar.gz" \
+            | tar xz --strip-components=1
+      - name: Восстановить .env из секрета репозитория
+        env:
+          DEPLOY_ENV: ${{ secrets.DEPLOY_ENV }}
+        run: printf '%s\n' "$DEPLOY_ENV" | tr -d '\r' > .env
+      - name: Сборка образа и развёртывание (проект burndown)
+        # Пост-квантовый ClientHello Go (ML-KEM/Kyber) не проходит до auth.docker.io —
+        # TLS handshake timeout; отключаем его, как и у dockerd на сервере.
+        env:
+          GODEBUG: tlsmlkem=0,tlskyber=0
+        run: docker compose -p burndown up -d --build
+      - name: Готовность и smoke-пробы по HTTP
+        run: |
+          GW=$(ip route | awk '/default/ {print $3}')
+          echo "Прод-стенд через шлюз $GW"
+          # Ждём готовности: контейнер стартует с gunicorn, первая база создаётся при старте
+          for i in $(seq 1 40); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://$GW:39667/healthz 2>/dev/null)
+            [ "$CODE" = "200" ] && break
+            sleep 5
+          done
+          if [ "$CODE" != "200" ]; then
+            echo 'Приложение не ответило на /healthz за ~3 минуты'; docker compose -p burndown logs web --tail 40; exit 1
+          fi
+          curl -fsS http://$GW:39667/healthz | grep -q '"ok": *true'
+          curl -fsS http://$GW:39667/login | grep -qi '<!DOCTYPE html>'
+          echo 'Дымовой прогон прод-стенда пройден: /healthz отвечает, экран входа отдаётся'

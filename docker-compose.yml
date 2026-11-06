@@ -1,0 +1,25 @@
+# Burndown Tracker — прод-стенд сервера (192.168.2.129:39667).
+#   cp .env.example .env   # задайте SECRET_KEY (openssl rand -hex 32)
+#   docker compose up -d --build
+# Разворачивается конвейером .gitea/workflows/ci.yml (тест → сборка → deploy → smoke);
+# секреты стенда приходят из секрета репозитория DEPLOY_ENV, в git их нет.
+name: burndown
+
+services:
+  web:
+    image: burndown
+    build: .
+    restart: unless-stopped
+    environment:
+      SECRET_KEY: ${SECRET_KEY:?Задайте SECRET_KEY в .env (openssl rand -hex 32)}
+      TZ: ${TZ:-Europe/Moscow}
+      # БД SQLite — в томе /data (переживает пересборки); SECRET_KEY фиксированный,
+      # чтобы сессии не сбрасывались при каждом деплое
+      DB_PATH: /data/burndown.db
+    ports:
+      - "${HTTP_BIND:-0.0.0.0}:${HTTP_PORT:-39667}:5000"
+    volumes:
+      - burndown_data:/data
+
+volumes:
+  burndown_data:
