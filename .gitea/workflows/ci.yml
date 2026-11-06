@@ -74,9 +74,10 @@ jobs:
         run: |
           GW=$(ip route | awk '/default/ {print $3}')
           echo "Прод-стенд через шлюз $GW"
-          # Ждём готовности: контейнер стартует с gunicorn, первая база создаётся при старте
+          # Ждём готовности: контейнер стартует с gunicorn, первая база создаётся при старте.
+          # || true обязательно: sh -e убивает скрипт на connection refused первых секунд
           for i in $(seq 1 40); do
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://$GW:39667/healthz 2>/dev/null)
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://$GW:39667/healthz 2>/dev/null || true)
             [ "$CODE" = "200" ] && break
             sleep 5
           done
