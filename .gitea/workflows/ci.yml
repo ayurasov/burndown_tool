@@ -19,6 +19,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Раннер выполняет шаги через bash, которого нет в alpine-образе deploy
+defaults:
+  run:
+    shell: sh
+
 jobs:
   tests:
     name: 'Тесты: серверные (API, PDF, Jira, аналитика) + браузерные (e2e)'
