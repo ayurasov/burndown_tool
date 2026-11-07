@@ -150,8 +150,11 @@ def test_health_jira_autofill_history(admin, flask_app, fake, monkeypatch):
     assert admin.post('/api/admin/health/check-jira', json={}).get_json()['status'] in ('ok', 'warn')
     with flask_app.app_context():
         db = app_module.get_db()
+        # просроченным расписание считается спустя час после run_time (system_health);
+        # в первый час UTC-суток UTC-расписание просроченным быть не может — считаем по Москве
+        schedule_tz, run_time = ('UTC', '00:00') if datetime.now(timezone.utc).hour >= 1 else ('Europe/Moscow', '00:00')
         db.execute("INSERT INTO jira_schedules (button_id, enabled, days, run_time, timezone, last_status, last_message) "
-                   "VALUES (?, 1, '1,2,3,4,5,6,7', '00:00', 'UTC', 'error', 'Jira не отвечает')", (bid,))
+                   "VALUES (?, 1, '1,2,3,4,5,6,7', ?, ?, 'error', 'Jira не отвечает')", (bid, run_time, schedule_tz))
         db.execute("INSERT INTO jira_history_jobs (button_id, status, message, created_at, updated_at) "
                    "VALUES (?, 'error', 'сбой', ?, ?)", (bid, app_module._utc_now_iso(), app_module._utc_now_iso()))
         db.commit()
